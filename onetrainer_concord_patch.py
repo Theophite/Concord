@@ -247,8 +247,13 @@ def _patch_concord_linear_forward():
         v_step = int(getattr(self, "v_step", 0))
         v_slow_buf = getattr(self, "v_slow", None)
         v_scale = float(getattr(self, "v_scale", 1.0))
-        drift_cancel_C = float(getattr(self, "drift_cancel_C", 0.1))
         alpha_v_fast = float(getattr(self, "alpha_v_fast", 0.001))
+        # drift_cancel_C: prefer layer attr; else compute C* from rates.
+        _C = getattr(self, "drift_cancel_C", None)
+        if _C is None:
+            from concord_triton_fused import compute_drift_cancel_C
+            _C = compute_drift_cancel_C(self.alpha, alpha_v_fast)
+        drift_cancel_C = float(_C)
         # Int8 v_slow accumulator + knobs; None when enable_v_slow_i8
         # hasn't been called on this layer.
         v_slow_i8_buf = getattr(self, "v_slow_i8", None)

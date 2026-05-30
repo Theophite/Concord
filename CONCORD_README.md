@@ -92,15 +92,26 @@ constant; subtracting `C` times it removes the drift from velocity,
 leaving the high-frequency *noise* component. `noise²` is then the
 unbiased per-element second-moment estimator.
 
-`C` is auto-derived from the steady-state drift balance:
+`C` is auto-derived from the steady-state drift balance. Let
+`L = (1−α)/α` (the d_fs drift-lag ratio) and `ρ = α_v_fast + α_v_slow/T_r`
+(effective per-step v-leak). Solving E[noise]=0 under pure drift:
 
 ```
-C = (T_r · α_v_fast + α_v_slow) / (α_chase − T_r · α_v_fast)
-  ≈ 0.196 at defaults (T_r=8, α_v_fast=0.001, α_v_slow=0.01, α=0.1)
+C* = L·ρ / (1 − L·α_v_fast)
+   = (1−α)·ρ / (α − (1−α)·α_v_fast)
+   ≈ 0.0204 at canonical OneTrainer defaults (T_r=8, α_v_fast=0.001,
+                                                α_v_slow=0.01, α=0.1)
+   ≈ 0.0091 at prototype-B defaults (α_v_slow=0, α_v_fast=0.001, α=0.1)
 ```
 
-(The shipped default is 0.1, conservatively lower than the formula's
-0.196 — empirically a bit safer.)
+(Previous shipped default 0.1 was 5×–11× too large depending on whether
+the periodic v-refit was active. The previous README formula above had
+`T_r·α_v_fast` in both numerator and denominator where it should have
+`(1−α)` and `(1−α)·α_v_fast` respectively, which produced ≈ 0.196 —
+10× too large. With C off, drift-cancel fails: the noise estimate
+picks up the signal as well, flattening the per-weight variance map
+and breaking the "is this weight converged?" diagnostic the estimator
+is structurally capable of producing.)
 
 ## Two flavours of weight decay
 
@@ -198,8 +209,8 @@ wrapped Linear/Conv2d:
 m.enable_v_slow_i8()
 m.set_optimizer_kind("adamw", weight_decay=0.01, eps=1.0)
 # set_optimizer_kind installs the canonical three-accumulator defaults
-# (v_scale=1, drift_cancel_C=0.1, alpha_v_fast=0.001, alpha_v_slow=0.01,
-# wd_sv=wd_sf=1e-5).
+# (v_scale=1, drift_cancel_C=C* via compute_drift_cancel_C,
+# alpha_v_fast=0.001, alpha_v_slow=0.01, wd_sv=wd_sf=1e-5).
 ```
 
 For OneTrainer with TrainConfig:
@@ -229,7 +240,7 @@ Defaults shown are the empirical champion on bigger CIFAR.
 | `concord_refit_target` | 16384 | target |mantissa| for refit |
 | `concord_alpha_v_fast` | 0.001 | per-step v_slow ← s_fast leak rate |
 | `concord_alpha_v_slow` | 0.01 | per-rebalance v_slow ← s_slow leak |
-| `concord_drift_cancel_C` | 0.1 | high-pass coefficient (auto: ≈0.196 at defaults) |
+| `concord_drift_cancel_C` | auto (C*) | high-pass coefficient. Auto = compute_drift_cancel_C from rates (≈0.0204 at OneTrainer defaults, ≈0.0091 at prototype-B defaults). Pass an explicit float to override. |
 | `concord_v_scale` | 1.0 | temperature on the preconditioner |
 | `concord_v_lr_scale` | 0.2 | lr multiplier for AdamW linears (per-layer) |
 | `concord_v_eps` | 1.0 | denominator floor; O(1) is the mantissa-units natural floor |

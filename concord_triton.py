@@ -199,6 +199,7 @@ def _sync_weight_bf16_pair_kernel(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     USE_V_SLOW: tl.constexpr,
     V_SLOW_FACTOR: tl.constexpr,
+    SLOW_SCALE: tl.constexpr = 1,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -216,7 +217,12 @@ def _sync_weight_bf16_pair_kernel(
 
     s_slow = tl.load(s_slow_ptr + s_off, mask=mask, other=0).to(tl.int32)
     s_fast = tl.load(s_fast_ptr + s_off, mask=mask, other=0).to(tl.int32)
-    m = s_slow + s_fast
+    # SLOW_SCALE=1 default reproduces the canonical live = s_slow + s_fast
+    # formula. SLOW_SCALE=2 ("double slow" experiment) makes each s_slow
+    # mantissa unit contribute twice to the live weight; equilibrium then
+    # has |s_slow| settle at ~half its single-scale value while v_slow
+    # absorbs the rest of the position.
+    m = SLOW_SCALE * s_slow + s_fast
     if USE_V_SLOW:
         v_slow = tl.load(v_slow_ptr + s_off, mask=mask, other=0).to(tl.int32)
         m = m + v_slow * V_SLOW_FACTOR
@@ -275,6 +281,7 @@ def _rebalance_decide_apply_kernel(
     stride_n, stride_k,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    S_FAST_IS_INT8: tl.constexpr,
 ):
     """Decide per-row/col exponent tick-ups from row_max/col_max and apply
     the right-shift to s_slow + s_fast.
@@ -293,7 +300,11 @@ def _rebalance_decide_apply_kernel(
     value without any rebalance intervention. Removing tick-down also
     removes the left-shift saturation guard, the do_tickdown / dn_axis
     parameters, the row_dn / col_dn logic, and the alternation parity
-    that was needed to prevent the -2 row×col exponent collision."""
+    that was needed to prevent the -2 row×col exponent collision.
+
+    S_FAST_IS_INT8: when True, s_fast is stored as int8 (delta-storage
+    path); the store narrows to int8 instead of int16. The arithmetic
+    is identical -- right-shift of a bounded int8 stays in int8 range."""
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -338,7 +349,12 @@ def _rebalance_decide_apply_kernel(
     # No left-shift now, so no saturation guard is needed — the right-
     # shift can only bring magnitudes down, never up.
     tl.store(s_slow_ptr + s_off, s_slow_new.to(tl.int16), mask=nk_mask)
-    tl.store(s_fast_ptr + s_off, s_fast_new.to(tl.int16), mask=nk_mask)
+    if S_FAST_IS_INT8:
+        # Bounded int8 delta. The SR-right-shift can only shrink
+        # magnitude, so an int8-fitting input stays int8-fitting.
+        tl.store(s_fast_ptr + s_off, s_fast_new.to(tl.int8), mask=nk_mask)
+    else:
+        tl.store(s_fast_ptr + s_off, s_fast_new.to(tl.int16), mask=nk_mask)
 
     if pid_k == 0:
         tl.store(row_exp_ptr + offs_n, row_exp + row_t, mask=n_mask)
@@ -360,8 +376,17 @@ def rebalance_fused_triton(s_slow, s_fast, row_exp, col_exp,
 
     `seed` keys the stochastic rounding of the tick-up right-shift; pass
     a fresh value per call so repeated tick-ups round independently.
+
+    s_fast may be int16 (classic absolute-storage path) or int8
+    (delta-storage path). The reduce kernel auto-widens via .to(int32);
+    the apply kernel narrows the store to int16 or int8 based on the
+    S_FAST_IS_INT8 constexpr (Triton compiles a separate specialization
+    per dtype).
     """
     N, K = s_slow.shape
+    assert s_fast.dtype in (torch.int16, torch.int8), \
+        f"s_fast must be int16 or int8, got {s_fast.dtype}"
+    s_fast_is_int8 = s_fast.dtype == torch.int8
     row_max = torch.zeros(N, dtype=torch.int32, device=s_slow.device)
     col_max = torch.zeros(K, dtype=torch.int32, device=s_slow.device)
 
@@ -381,21 +406,32 @@ def rebalance_fused_triton(s_slow, s_fast, row_exp, col_exp,
             int(seed) * max_iters + it,
             s_slow.stride(0), s_slow.stride(1),
             BLOCK_N=block_n, BLOCK_K=block_k,
+            S_FAST_IS_INT8=s_fast_is_int8,
         )
 
 
 def sync_weight_bf16_pair_triton(weight, s_slow, s_fast, row_exp, col_exp,
                                  mantissa_bias,
                                  v_slow=None, v_slow_factor=128,
+                                 slow_scale=1,
                                  block_m=32, block_n=64):
     """Materialise live bf16 weight from concord int state into ``weight``
     (must be pre-allocated bf16, same shape as s_slow). When ``v_slow``
     is passed (int8, same shape as s_slow), it adds additively at
-    shifted scale ``v_slow_factor``."""
+    shifted scale ``v_slow_factor``.
+
+    s_fast may be int16 (classic absolute-storage path) or int8
+    (delta-storage path, where s_fast holds (s_fast_logical - s_slow)).
+    The kernel is dtype-polymorphic on s_fast: Triton compiles a
+    separate specialization for each dtype seen, and the load expression
+    `tl.load(s_fast_ptr).to(tl.int32)` sign-extends correctly from
+    either width. The math `m = s_slow + s_fast` is identical in both
+    storage conventions -- in the int8 case s_slow has absorbed the
+    full position so the sum still gives the live mantissa."""
     M, N = s_slow.shape
     assert weight.dtype == torch.bfloat16
     assert s_slow.dtype == torch.int16
-    assert s_fast.dtype == torch.int16
+    assert s_fast.dtype in (torch.int16, torch.int8)
     assert s_slow.shape == s_fast.shape
     use_v_slow = v_slow is not None
     v_slow_ptr = v_slow if use_v_slow else s_slow
@@ -408,4 +444,5 @@ def sync_weight_bf16_pair_triton(weight, s_slow, s_fast, row_exp, col_exp,
         s_slow.stride(0), s_slow.stride(1),
         BLOCK_M=block_m, BLOCK_N=block_n,
         USE_V_SLOW=use_v_slow, V_SLOW_FACTOR=int(v_slow_factor),
+        SLOW_SCALE=int(slow_scale),
     )

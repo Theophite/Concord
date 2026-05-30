@@ -167,11 +167,11 @@ def main():
 
     # Three-accumulator + int8 v_slow on every wrapped Linear and Conv2d.
     # set_optimizer_kind('adamw') plants the canonical three-accumulator
-    # defaults (v_scale=1, drift_cancel_C=0.1, etc.); we only override
-    # wd / wd_sv / wd_sf here from CLI. The optimizer_v_kind line is
-    # explicit so the example self-documents the variance source —
-    # 'three_accum' is the default; 'v_rank1' is the lower-memory
-    # alternative (don't combine it with enable_v_slow_i8).
+    # defaults (v_scale=1, drift_cancel_C=C* via compute_drift_cancel_C,
+    # etc.); we only override wd / wd_sv / wd_sf here from CLI. The
+    # optimizer_v_kind line is explicit so the example self-documents the
+    # variance source — 'three_accum' is the default; 'v_rank1' is the
+    # lower-memory alternative (don't combine it with enable_v_slow_i8).
     n_adamw = 0
     for m in concord:
         if isinstance(m, ConcordLinearFused):

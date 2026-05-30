@@ -340,10 +340,21 @@ class ConcordLinearFused(nn.Module):
             # Tunable knobs on the layer (passed through to the kernel
             # by forward()).
             self.v_scale = float(getattr(self, 'v_scale', 1.0))
-            self.drift_cancel_C = float(
-                getattr(self, 'drift_cancel_C', 0.1))
             self.alpha_v_fast = float(getattr(self, 'alpha_v_fast', 0.001))
             self.alpha_v_slow = float(getattr(self, 'alpha_v_slow', 0.01))
+            # drift_cancel_C auto-computed from rates if not already set.
+            # Assumes no periodic v-refit (refit_period=1, alpha_v_slow=0
+            # effectively); the optimizer wrapper should override this
+            # with the C* that includes alpha_v_slow/T_r when it runs
+            # refit_envelope periodically. See compute_drift_cancel_C
+            # in concord_triton_fused for the analytic formula.
+            existing_C = getattr(self, 'drift_cancel_C', None)
+            if existing_C is None:
+                from concord_triton_fused import compute_drift_cancel_C
+                self.drift_cancel_C = compute_drift_cancel_C(
+                    self.alpha, self.alpha_v_fast)
+            else:
+                self.drift_cancel_C = float(existing_C)
             # Bayesian-anchored decay: small pull of s_fast and s_slow
             # toward v_slow_full each step. Damps the "unconfirmed"
             # transient (the part of the weight not yet supported by
@@ -665,8 +676,16 @@ class ConcordLinearFused(nn.Module):
 
         v_slow_buf = getattr(self, 'v_slow', None)
         v_scale = float(getattr(self, 'v_scale', 1.0))
-        drift_cancel_C = float(getattr(self, 'drift_cancel_C', 0.1))
         alpha_v_fast = float(getattr(self, 'alpha_v_fast', 0.001))
+        # drift_cancel_C: prefer layer attr (set by set_optimizer_kind or
+        # the optimizer wrapper), else compute C* from rates as a safe
+        # fallback. Defaulting to the analytic value here protects against
+        # callers that bypass set_optimizer_kind.
+        _C = getattr(self, 'drift_cancel_C', None)
+        if _C is None:
+            from concord_triton_fused import compute_drift_cancel_C
+            _C = compute_drift_cancel_C(self.alpha, alpha_v_fast)
+        drift_cancel_C = float(_C)
         # Int8 v_slow accumulator for the SGD three-accumulator path.
         # Allocated lazily via enable_v_slow_i8(); when unset, the kernel
         # behaviour is identical to the classic two-accumulator chase.
@@ -999,6 +1018,371 @@ class ConcordConv2dFused(ConcordLinearFused):
             grad_W_buf, row_max_buf, col_max_buf)
         return y.to(in_dtype)
 
+
+# ============================================================
+# ConcordLinearFusedInt8 / ConcordConv2dFusedInt8: int8 s_fast
+# (delta-storage) variants of the int16 layers above.
+#
+# Storage difference: s_fast is int8 and holds the DELTA from s_slow
+# (s_fast_logical - s_slow), bounded to [-128, 127] by clamp in the
+# apply kernel. s_slow remains int16. Total persistent state:
+#   without v_slow_i8: 24 bits/param (vs 32 bits/param int16 s_fast)
+#   with    v_slow_i8: 32 bits/param (vs 40 bits/param int16 s_fast)
+#
+# Dynamic difference: mass-preserving chase is baked into the int8
+# apply kernels (the delta dynamic requires it). Forward
+# materialization uses the same kernel as the int16 path (it is
+# dtype-polymorphic on s_fast). The live weight in the int8
+# convention is s_slow + s_fast_delta + v_slow_full = s_fast_logical
+# + v_slow_full -- one fast tracker plus the long-time-mean anchor,
+# vs the int16 path's two-posterior-sample sum.
+#
+# Optimizer support:
+#   - SGD (default)
+#   - AdamW with optimizer_v_kind='three_accum'
+#   - AdamW with v_rank1 is NOT supported (would need a separate
+#     int8-compatible kernel). The forward call raises NotImplementedError
+#     if v_rank1 is selected.
+# ============================================================
+
+
+class ConcordLinearFusedInt8(ConcordLinearFused):
+    """int8 s_fast (delta storage) variant of ConcordLinearFused.
+
+    Override points:
+      * __init__: register s_fast as int8 buffer (instead of int16).
+      * load_weights: put full mantissa in s_slow, s_fast_delta = 0.
+      * load_weights_finetune: same as load_weights but also seeds
+        v_slow_i8 to 1/3 of the mantissa, s_slow to the remaining 2/3,
+        s_fast_delta = 0. This is the zero-gradient steady state in
+        the delta convention.
+      * forward: dispatch to FusedConcordLinearInt8 (different arg list
+        from FusedConcordLinear -- v_rank1 / v_diag args removed).
+    """
+
+    INT8_MIN = -128
+    INT8_MAX = 127
+
+    def __init__(self, in_features, out_features, bias=True,
+                 device='cuda', max_iters=2, alpha=0.1, beta1=0.0,
+                 lr=0.05):
+        # Skip the parent constructor's s_fast int16 buffer creation by
+        # calling nn.Module.__init__ directly and replicating the parent
+        # setup minus the s_fast int16 path.
+        nn.Module.__init__(self)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.max_iters = max_iters
+        self.alpha = alpha
+        self.beta1 = beta1
+        self.lr = lr
+        self.optimizer_kind = 'sgd'
+        self.weight_decay = 0.0
+        self.eps = 1e-8
+        self.register_buffer('discount_row', None)
+        self.register_buffer('discount_col', None)
+        self.register_buffer('_W_init_row', None)
+        self.register_buffer('_W_init_col', None)
+        self._discount_power_exp = 1.0
+        self._discount_min = 0.01
+        self._discount_max = 10.0
+
+        self.register_buffer('s_slow',
+                             torch.zeros(out_features, in_features,
+                                         dtype=torch.int16, device=device))
+        # KEY DIFFERENCE: s_fast is int8 (the delta).
+        self.register_buffer('s_fast',
+                             torch.zeros(out_features, in_features,
+                                         dtype=torch.int8, device=device))
+        self.register_buffer('row_exp',
+                             torch.zeros(out_features, dtype=torch.int8,
+                                         device=device))
+        self.register_buffer('col_exp',
+                             torch.zeros(in_features, dtype=torch.int8,
+                                         device=device))
+        self.register_buffer('vsign', None)
+
+        # Garbage-fraction trust region (lazy — call enable_gf_trust()
+        # to allocate). When gf_trust_delta_sq > 0 and v_row/v_col exist,
+        # the AdamW kernel adds δ²·v̂ to v_proxy and drops the step_cap
+        # clamp.
+        self.gf_trust_delta_sq = 0.0
+        self.adafactor_beta2 = 0.999
+        self.v_row = None
+        self.v_col = None
+        self._sum_v_inv = None
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features,
+                                                  dtype=torch.bfloat16,
+                                                  device=device))
+        else:
+            self.register_parameter('bias', None)
+
+        self._init_concord()
+
+    @torch.no_grad()
+    def enable_gf_trust(self, delta_sq=None, step_cap=10.0, beta2=0.999):
+        """Allocate the Adafactor row/col EMA buffers and turn on the
+        garbage-fraction trust region. δ² defaults to 1/step_cap² so
+        the soft step bound (~1/δ) matches the previous hard step_cap."""
+        if delta_sq is None:
+            delta_sq = 1.0 / (float(step_cap) ** 2)
+        self.gf_trust_delta_sq = float(delta_sq)
+        self.adafactor_beta2 = float(beta2)
+        N, K = self.s_slow.shape
+        dev = self.s_slow.device
+        self.v_row = torch.zeros(N, dtype=torch.float32, device=dev)
+        self.v_col = torch.zeros(K, dtype=torch.float32, device=dev)
+        self._sum_v_inv = torch.zeros(1, dtype=torch.float32, device=dev)
+
+    @torch.no_grad()
+    def load_weights(self, W):
+        """From-scratch decomposition for int8 delta storage. Puts the
+        FULL mantissa in s_slow (within int16 range) and zeros
+        s_fast_delta. Equivalent to the int16 path's 50/50 split
+        re-expressed in delta variables: if the int16 path stored
+        (s_slow, s_fast_logical) = (W/2, W/2), the delta-equivalent
+        is (s_slow_new, s_fast_delta) = (W/2, 0) -- but in the int8
+        formulation the live weight is s_slow + delta, so to match
+        the same live weight we put W in s_slow and 0 in delta.
+
+        Leaves v_slow_i8 untouched. For pre-trained weights, use
+        load_weights_finetune which puts the weight in the
+        zero-gradient steady state of the three-accumulator delta
+        dynamic.
+        """
+        W = W.to(device=self.s_slow.device, dtype=torch.float32)
+        assert W.shape == (self.out_features, self.in_features), (
+            f'{tuple(W.shape)} != {(self.out_features, self.in_features)}')
+        max_abs_row = W.abs().max(dim=1).values.clamp(min=1e-30)
+        self.row_exp.copy_(
+            torch.ceil(torch.log2(max_abs_row) + 1.0)
+            .clamp(self.EXP_MIN, self.EXP_MAX).to(torch.int8))
+        self.col_exp.zero_()
+        exp = (self.row_exp[:, None] + self.col_exp[None, :]
+               - self.MANTISSA_BIAS).float()
+        scale = torch.pow(2.0, exp)
+        m_total = (W / scale).round().to(torch.int32).clamp(
+            self.INT16_MIN, self.INT16_MAX)
+        # Full mantissa in s_slow (the int16 position-bearing
+        # accumulator), delta starts at zero.
+        self.s_slow.copy_(m_total)
+        self.s_fast.zero_()
+        if self.vsign is not None:
+            # vsign tracks (s_fast - s_slow) sign in the int16 path; in
+            # delta convention the sign is just sign(s_fast_delta).
+            self.vsign.copy_(self.s_fast >= 0)
+
+    @torch.no_grad()
+    def load_weights_finetune(self, W):
+        """Bayesian-prior decomposition for fine-tuning in the int8
+        delta-storage convention.
+
+        Live weight = s_slow + s_fast_delta + v_slow_full. We want all
+        three accumulators at their zero-gradient steady state so the
+        drift-cancel noise estimator and Bayesian-anchored wd_sv / wd_sf
+        regularizers are physically meaningful from step 1.
+
+        In the delta convention the equilibrium is:
+          v_slow_full ≈ s_slow (the long-time mean of the position).
+          s_fast_delta ≈ 0 (no recent gradient signal).
+        So we put 1/2 of the mantissa in v_slow_i8 and 1/2 in s_slow,
+        delta = 0. The live weight = s_slow + 0 + v_slow_full = W.
+        At this point d_sv = s_slow - v_slow_full = 0 (up to int8 quant)
+        and d_fs = s_fast_delta = 0, so the noise residual is zero
+        modulo quantisation -- the right starting condition for
+        fine-tuning.
+        """
+        if getattr(self, 'v_slow_i8', None) is None:
+            self.enable_v_slow_i8()
+        W = W.to(device=self.s_slow.device, dtype=torch.float32)
+        assert W.shape == (self.out_features, self.in_features), (
+            f'{tuple(W.shape)} != {(self.out_features, self.in_features)}')
+        max_abs_row = W.abs().max(dim=1).values.clamp(min=1e-30)
+        self.row_exp.copy_(
+            torch.ceil(torch.log2(max_abs_row) + 1.0)
+            .clamp(self.EXP_MIN, self.EXP_MAX).to(torch.int8))
+        self.col_exp.zero_()
+        exp = (self.row_exp[:, None] + self.col_exp[None, :]
+               - self.MANTISSA_BIAS).float()
+        scale = torch.pow(2.0, exp)
+        m_total = (W / scale).round().to(torch.int32)
+
+        # Half goes to v_slow_i8 at shifted scale.
+        target_v_full = (m_total.float() / 2.0).round().to(torch.int32)
+        v_slow_int = (target_v_full.float() / float(self.v_slow_factor)
+                       ).round().to(torch.int32).clamp(-128, 127)
+        actual_v_full = v_slow_int * self.v_slow_factor
+
+        # Remaining mantissa goes into s_slow; s_fast_delta = 0.
+        remaining = (m_total - actual_v_full).clamp(
+            self.INT16_MIN, self.INT16_MAX)
+        self.s_slow.copy_(remaining)
+        self.s_fast.zero_()
+        self.v_slow_i8.copy_(v_slow_int.to(torch.int8))
+        if self.vsign is not None:
+            self.vsign.copy_(self.s_fast >= 0)
+
+    def forward(self, x):
+        from concord_triton_fused import FusedConcordLinearInt8
+        in_dtype = x.dtype
+        if x.dtype != torch.bfloat16:
+            x = x.to(torch.bfloat16)
+        orig_shape = None
+        if x.dim() > 2:
+            orig_shape = x.shape
+            x = x.view(-1, self.in_features).contiguous()
+        else:
+            x = x.contiguous()
+
+        optimizer_v_kind = getattr(self, 'optimizer_v_kind', 'three_accum')
+        v_slow_buf = getattr(self, 'v_slow', None)
+        v_scale = float(getattr(self, 'v_scale', 1.0))
+        alpha_v_fast = float(getattr(self, 'alpha_v_fast', 0.001))
+        # drift_cancel_C: prefer layer attr (set by set_optimizer_kind or
+        # the optimizer wrapper), else compute C* from rates as a safe
+        # fallback. Defaulting to the analytic value here protects against
+        # callers that bypass set_optimizer_kind.
+        _C = getattr(self, 'drift_cancel_C', None)
+        if _C is None:
+            from concord_triton_fused import compute_drift_cancel_C
+            _C = compute_drift_cancel_C(self.alpha, alpha_v_fast)
+        drift_cancel_C = float(_C)
+        v_slow_i8_buf = getattr(self, 'v_slow_i8', None)
+        v_slow_factor = int(getattr(self, 'v_slow_factor', 128))
+        wd_sv = float(getattr(self, 'wd_sv', 0.0))
+        wd_sf = float(getattr(self, 'wd_sf', 0.0))
+        wbuf = getattr(self, '_bf16_weight_buf', None)
+        if (wbuf is None or wbuf.shape != self.s_slow.shape
+                or wbuf.device != self.s_slow.device):
+            wbuf = torch.empty(self.s_slow.shape, dtype=torch.bfloat16,
+                                device=self.s_slow.device)
+            self._bf16_weight_buf = wbuf
+        grad_W_buf, row_max_buf, col_max_buf = self._ensure_backward_buffers()
+        y = FusedConcordLinearInt8.apply(
+            x, self.s_slow, self.s_fast, self.row_exp, self.col_exp,
+            self.bias, self.MANTISSA_BIAS, self.lr, self.alpha, self.beta1,
+            self.optimizer_kind,
+            self.weight_decay, self.eps,
+            float(getattr(self, 'step_cap', 10.0)),
+            optimizer_v_kind,
+            v_slow_buf, v_scale, drift_cancel_C, alpha_v_fast,
+            v_slow_i8_buf, v_slow_factor,
+            wbuf, wd_sv, wd_sf,
+            bool(getattr(self, '_apply_chase', True)),
+            grad_W_buf, row_max_buf, col_max_buf,
+            int(getattr(self, 'slow_scale', 1)),
+            getattr(self, 'v_row', None),
+            getattr(self, 'v_col', None),
+            getattr(self, '_sum_v_inv', None),
+            float(getattr(self, 'gf_trust_delta_sq', 0.0)),
+            float(getattr(self, 'adafactor_beta2', 0.999)),
+        )
+
+        if orig_shape is not None:
+            y = y.view(*orig_shape[:-1], self.out_features)
+        return y.to(in_dtype)
+
+    @torch.no_grad()
+    def rebalance(self):
+        """int8-aware rebalance. The rebalance_fused_triton kernel is
+        dtype-polymorphic via S_FAST_IS_INT8 constexpr; the only thing
+        we need to override is the post-rebalance clamp range on
+        s_fast (int8 vs int16).
+
+        The body is otherwise the int16 path verbatim — kept in sync
+        with ConcordLinearFused.rebalance by re-using the parent's
+        v_slow rescale + three-accumulator leak logic below."""
+        ConcordLinearFused._reb_seed += 1
+        v_slow_i8_present = getattr(self, 'v_slow_i8', None) is not None
+        if v_slow_i8_present:
+            row_exp_pre = self.row_exp.clone()
+            col_exp_pre = self.col_exp.clone()
+        rebalance_fused_triton(
+            self.s_slow, self.s_fast, self.row_exp, self.col_exp,
+            MAX_M=self.MAX_M, EXP_MAX=self.EXP_MAX,
+            max_iters=self.max_iters,
+            seed=ConcordLinearFused._reb_seed)
+        self.s_slow.clamp_(self.INT16_MIN, self.INT16_MAX)
+        # s_fast is int8 here -- use int8 range.
+        self.s_fast.clamp_(self.INT8_MIN, self.INT8_MAX)
+        if v_slow_i8_present:
+            d_row = self.row_exp.to(torch.int32) - row_exp_pre.to(torch.int32)
+            d_col = self.col_exp.to(torch.int32) - col_exp_pre.to(torch.int32)
+            self._v_slow_apply_exp_shift(d_row, d_col)
+            self._v_slow_i8_rebalance()
+        # Three-accumulator: per-rebalance v_slow leak toward s_slow.
+        # In the delta convention s_slow is the position bearer, so
+        # this leak target is the same as in the int16 path.
+        if getattr(self, 'optimizer_v_kind', None) == 'three_accum' \
+                and self.v_slow is not None:
+            alpha_v_slow = float(getattr(self, 'alpha_v_slow', 0.01))
+            gap = (self.s_slow.to(torch.float32)
+                   - self.v_slow.to(torch.float32))
+            delta_f = alpha_v_slow * gap
+            floor = torch.floor(delta_f)
+            frac = delta_f - floor
+            u = torch.rand(gap.shape, device=gap.device,
+                           dtype=torch.float32)
+            tick = (floor + (u < frac).to(torch.float32)).to(torch.int32)
+            new_v = (self.v_slow.to(torch.int32) + tick).clamp(
+                self.INT16_MIN, self.INT16_MAX).to(torch.int16)
+            self.v_slow.copy_(new_v)
+
+
+class ConcordConv2dFusedInt8(ConcordLinearFusedInt8):
+    """int8 s_fast Conv2d variant. Forward dispatches to
+    FusedConcordConv2dInt8 (which uses cuDNN for fwd/grad_x and the
+    int8 apply kernel for the state update)."""
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1,
+                 padding=0, bias=True, device='cuda', max_iters=2,
+                 alpha=0.1, beta1=0.0, lr=0.05):
+        if isinstance(kernel_size, int):
+            kh = kw = kernel_size
+        else:
+            kh, kw = kernel_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kh, self.kw = kh, kw
+        self.stride = stride
+        self.padding = padding
+        super().__init__(in_features=in_channels * kh * kw,
+                         out_features=out_channels,
+                         bias=bias, device=device, max_iters=max_iters,
+                         alpha=alpha, beta1=beta1, lr=lr)
+
+    @property
+    def weight(self):
+        w2d = ConcordLinearFused.weight.fget(self)
+        return w2d.view(self.out_channels, self.in_channels,
+                         self.kh, self.kw)
+
+    def forward(self, x):
+        from concord_triton_fused import FusedConcordConv2dInt8
+        in_dtype = x.dtype
+        v_slow_i8_buf = getattr(self, 'v_slow_i8', None)
+        v_slow_factor = int(getattr(self, 'v_slow_factor', 128))
+        alpha_v_fast = float(getattr(self, 'alpha_v_fast', 0.001))
+        wbuf = getattr(self, '_bf16_weight_buf', None)
+        if (wbuf is None or wbuf.shape != self.s_slow.shape
+                or wbuf.device != self.s_slow.device):
+            wbuf = torch.empty(self.s_slow.shape, dtype=torch.bfloat16,
+                                device=self.s_slow.device)
+            self._bf16_weight_buf = wbuf
+        grad_W_buf, row_max_buf, col_max_buf = self._ensure_backward_buffers()
+        y = FusedConcordConv2dInt8.apply(
+            x, self.s_slow, self.s_fast, self.row_exp, self.col_exp,
+            self.bias,
+            self.in_channels, self.out_channels, self.kh, self.kw,
+            self.stride, self.padding,
+            self.MANTISSA_BIAS, self.lr, self.alpha, self.beta1,
+            v_slow_i8_buf, v_slow_factor, alpha_v_fast,
+            wbuf, bool(getattr(self, '_apply_chase', True)),
+            grad_W_buf, row_max_buf, col_max_buf,
+            int(getattr(self, 'slow_scale', 1)))
+        return y.to(in_dtype)
 
 
 # ============================================================

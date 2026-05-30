@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# Datasets (downloaded, ~340MB)
+cifar_data/
+data/
+
+# Model / optimizer checkpoints + resume state (large, regenerable)
+*.pt
+*.pt.tmp
+*.tmp
+
+# Figures (regenerable from the analysis scripts)
+*.png
+
+# Training logs (transient; the curated record is in SESSION_NOTES_*.md)
+*.log

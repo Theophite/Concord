@@ -20,6 +20,28 @@ from triton.language.extra import libdevice
 from fused_profiler import PROFILER
 
 
+def compute_drift_cancel_C(alpha, alpha_v_fast,
+                              alpha_v_slow=0.0, refit_period=1):
+    """Analytic drift-cancellation coefficient.
+
+    C* = L·ρ / (1 − L·α_vf)
+       = (1−α)·ρ / (α − (1−α)·α_vf)
+    where L = (1−α)/α and ρ = α_vf + α_vs/T_r.
+
+    At OneTrainer defaults (α=0.1, α_vf=0.001, α_vs=0.01, T_r=8):
+        L=9, ρ=0.00225, L·α_vf=0.009  →  C* ≈ 0.0204.
+
+    The previous shipped 0.1 was ≈5× too large; the README's 0.196
+    formula had T_r·α_vf in places where it should have (1−α)·α_vf,
+    over-shooting by ≈10×. With C wrong, drift cancellation fails and
+    the residual noise² picks up the signal as well as the noise,
+    flattening the per-weight variance map.
+    """
+    L = (1.0 - alpha) / max(alpha, 1e-12)
+    rho = alpha_v_fast + alpha_v_slow / max(refit_period, 1)
+    return L * rho / (1.0 - L * alpha_v_fast)
+
+
 # ============================================================
 # FORWARD: y = x @ W.T  where W is bf16-reconstructed on the fly
 # ============================================================
@@ -1604,6 +1626,7 @@ def fused_conv2d_grad_W_and_update(grad_y, x, s_slow, s_fast, row_exp, col_exp,
 def materialize_bf16_weight(s_slow, s_fast, row_exp, col_exp,
                               mantissa_bias=15,
                               v_slow=None, v_slow_factor=128,
+                              slow_scale=1,
                               out=None):
     """Reconstruct the live bf16 weight from concord int state. If
     ``out`` is given (must match s_slow.shape, bf16), the recon writes
@@ -1611,7 +1634,12 @@ def materialize_bf16_weight(s_slow, s_fast, row_exp, col_exp,
     is safe because forward and backward of the same step run between
     consecutive forward calls — no other code reads the buffer during
     the window. (Gradient checkpointing recomputes forward; if you mix
-    that with weight reuse, allocate per-checkpoint instead.)"""
+    that with weight reuse, allocate per-checkpoint instead.)
+
+    ``slow_scale`` is the multiplier on s_slow in the live formula
+    (default 1 = canonical s_slow + s_fast (+ v_slow*factor); 2 = the
+    "double slow" experiment where s_slow contributes 2× per mantissa
+    unit)."""
     from concord_triton import sync_weight_bf16_pair_triton
     if out is None:
         weight = torch.empty(s_slow.shape, dtype=torch.bfloat16,
@@ -1620,7 +1648,8 @@ def materialize_bf16_weight(s_slow, s_fast, row_exp, col_exp,
         weight = out
     sync_weight_bf16_pair_triton(weight, s_slow, s_fast, row_exp, col_exp,
                                   mantissa_bias=mantissa_bias,
-                                  v_slow=v_slow, v_slow_factor=v_slow_factor)
+                                  v_slow=v_slow, v_slow_factor=v_slow_factor,
+                                  slow_scale=slow_scale)
     return weight
 
 
@@ -1838,7 +1867,7 @@ def fused_grad_W_and_adamw_three_accum_update(
     grad_y, x, s_slow, s_fast, v_slow, row_exp, col_exp,
     lr, mantissa_bias=15, alpha=0.1, beta1=0.0,
     weight_decay=0.0, eps=1.0, step_cap=10.0,
-    v_scale=1.0, drift_cancel_C=0.1, alpha_v_fast=0.001,
+    v_scale=1.0, drift_cancel_C=None, alpha_v_fast=0.001,
     v_slow_factor=128, mass_preserve=False,
     wd_sv=0.0, wd_sf=0.0,
     apply_chase=True,
@@ -1874,6 +1903,8 @@ def fused_grad_W_and_adamw_three_accum_update(
     M2, K = x.shape
     assert M == M2
     assert v_slow.shape == s_slow.shape and v_slow.dtype == torch.int8
+    if drift_cancel_C is None:
+        drift_cancel_C = compute_drift_cancel_C(alpha, alpha_v_fast)
 
     step_counter = _get_step_counter(grad_y.device)
     step_counter.add_(1)
@@ -2264,7 +2295,7 @@ def apply_adamw_three_accum_from_grad_W(
     row_max, col_max,
     lr, mantissa_bias=15, alpha=0.1, beta1=0.0,
     weight_decay=0.0, eps=1.0, step_cap=10.0,
-    v_scale=1.0, drift_cancel_C=0.1, alpha_v_fast=0.001,
+    v_scale=1.0, drift_cancel_C=None, alpha_v_fast=0.001,
     v_slow_factor=128, mass_preserve=False,
     wd_sv=0.0, wd_sf=0.0,
     apply_chase=True,
@@ -2278,6 +2309,8 @@ def apply_adamw_three_accum_from_grad_W(
     that caused silent hangs on big SDXL FFN shapes."""
     N, K = grad_W.shape
     assert v_slow.shape == s_slow.shape and v_slow.dtype == torch.int8
+    if drift_cancel_C is None:
+        drift_cancel_C = compute_drift_cancel_C(alpha, alpha_v_fast)
     step_counter = _get_step_counter(grad_W.device)
     step_counter.add_(1)
     grid = (triton.cdiv(N, block_n), triton.cdiv(K, block_k))
@@ -2297,6 +2330,494 @@ def apply_adamw_three_accum_from_grad_W(
         MASS_PRESERVE=bool(mass_preserve),
         APPLY_CHASE=bool(apply_chase),
         MASS_PRESERVE_CHASE=bool(mass_preserve_chase),
+    )
+
+
+# ============================================================
+# INT8 s_fast (delta storage) apply kernels.
+#
+# In the delta-storage convention, s_fast holds (s_fast_logical - s_slow)
+# rather than s_fast_logical absolute. This gives a small-magnitude
+# quantity (range ~ 1/alpha + noise = O(10)) that fits trivially in
+# int8. s_slow absorbs the cumulative position and stays int16. The
+# forward materialization formula is unchanged: live = s_slow + s_fast
+# (+ v_slow * factor) -- the math is identical after the variable
+# substitution.
+#
+# The dynamic that produces a bounded delta IS mass-preserving chase:
+# whatever flows into s_slow (the chase tick) exits s_fast in the same
+# step. So mass-preserve is BAKED INTO these kernels (not a constexpr
+# toggle like in the int16 path -- you can't run the int8 path without
+# it because non-mass-preserving chase would unbound the delta).
+#
+# Range guard: s_fast is clamped to [-128, 127] on every write. In
+# pathological gradient spikes the clamp can lose information, but at
+# alpha=0.1 the equilibrium delta is ~10x typical grad-tick so a 10+
+# x grad spike is needed to hit the wall.
+# ============================================================
+
+@triton.jit
+def _apply_update_kernel_int8(
+    grad_W_ptr,      # [N, K] bf16
+    s_slow_ptr,      # [N, K] int16
+    s_fast_ptr,      # [N, K] int8 (DELTA from s_slow)
+    row_exp_ptr, col_exp_ptr,
+    row_max_ptr,     # [N] int32, pre-zeroed
+    col_max_ptr,     # [K] int32, pre-zeroed
+    v_slow_ptr,      # [N, K] int8 (gated by USE_V_SLOW)
+    N, K,
+    lr, mantissa_bias, alpha, beta1, step_salt_ptr,
+    alpha_v_fast,
+    stride_gn, stride_gk,
+    stride_sn, stride_sk,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    USE_V_SLOW: tl.constexpr,
+    V_SLOW_FACTOR: tl.constexpr,
+    MASS_PRESERVE: tl.constexpr,
+    APPLY_CHASE: tl.constexpr,
+    SLOW_SCALE: tl.constexpr = 1,
+):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    step_salt = tl.load(step_salt_ptr).to(tl.int32)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    n_mask = offs_n < N
+    k_mask = offs_k < K
+    nk_mask = n_mask[:, None] & k_mask[None, :]
+
+    s_off = offs_n[:, None] * stride_sn + offs_k[None, :] * stride_sk
+    s_slow = tl.load(s_slow_ptr + s_off, mask=nk_mask, other=0).to(tl.int32)
+    # int8 load auto-sign-extends to int32 via .to(tl.int32).
+    s_fast_delta = tl.load(s_fast_ptr + s_off, mask=nk_mask,
+                            other=0).to(tl.int32)
+
+    gW_off = offs_n[:, None] * stride_gn + offs_k[None, :] * stride_gk
+    grad_W = tl.load(grad_W_ptr + gW_off, mask=nk_mask, other=0.0).to(tl.float32)
+
+    row_e = tl.load(row_exp_ptr + offs_n, mask=n_mask, other=0).to(tl.float32)
+    col_e = tl.load(col_exp_ptr + offs_k, mask=k_mask, other=0).to(tl.float32)
+    inv_exp = mantissa_bias - row_e[:, None] - col_e[None, :]
+    scale_inv = tl.exp2(inv_exp)
+    delta_grad = -lr * grad_W * scale_inv
+
+    # In the delta convention, s_fast_delta IS the velocity. beta1
+    # damping uses it directly without the (s_fast - s_slow) subtraction.
+    v_prev = s_fast_delta.to(tl.float32)
+    delta_t = delta_grad - beta1 * v_prev
+
+    # SR tick: increment the delta.
+    pos_hash = (offs_n[:, None] << 16) ^ offs_k[None, :]
+    r1 = _hash_uniform(s_fast_delta, pos_hash, step_salt)
+    floor_t = tl.floor(delta_t)
+    frac_t = delta_t - floor_t
+    tick_fast = (floor_t + (r1 < frac_t).to(tl.float32)).to(tl.int32)
+    s_fast_delta = s_fast_delta + tick_fast
+
+    if APPLY_CHASE:
+        # Chase: tick_slow = alpha * s_fast_delta (delta is already
+        # the gap, no subtraction needed). Mass-preserve baked in:
+        # tick_slow goes INTO s_slow and OUT of s_fast_delta.
+        delta_slow_f = alpha * s_fast_delta.to(tl.float32)
+        r2 = _hash_uniform(s_fast_delta, pos_hash, step_salt ^ 0x5A5A5A5A)
+        floor_s = tl.floor(delta_slow_f)
+        frac_s = delta_slow_f - floor_s
+        tick_slow = (floor_s + (r2 < frac_s).to(tl.float32)).to(tl.int32)
+        s_slow = s_slow + tick_slow
+        s_fast_delta = s_fast_delta - tick_slow
+
+        # v_slow leak (same math as int16 path; v_slow_full target is
+        # the long-time-mean of s_slow + s_fast_delta = s_slow logical
+        # position, which equals s_slow in this convention).
+        if USE_V_SLOW:
+            v_slow_old = tl.load(v_slow_ptr + s_off,
+                                 mask=nk_mask, other=0).to(tl.int32)
+            v_slow_full = v_slow_old * V_SLOW_FACTOR
+            # In delta convention, the leak target for v_slow is the
+            # absolute position in live-weight units = SLOW_SCALE*s_slow
+            # (since s_fast_delta is tiny and doesn't carry position).
+            # The drift signal for v_slow is SLOW_SCALE*s_slow itself.
+            # For SLOW_SCALE=1 this reduces to the canonical form.
+            gap_v_full = (SLOW_SCALE * s_slow - v_slow_full).to(tl.float32)
+            delta_v8 = alpha_v_fast * gap_v_full / V_SLOW_FACTOR
+            r3 = _hash_uniform(s_fast_delta, pos_hash,
+                                step_salt ^ 0x33335555)
+            floor_v = tl.floor(delta_v8)
+            frac_v = delta_v8 - floor_v
+            tick_v8 = (floor_v + (r3 < frac_v).to(tl.float32)).to(tl.int32)
+            new_v_int32 = v_slow_old + tick_v8
+            new_v_int8 = tl.minimum(tl.maximum(new_v_int32, -128), 127)
+            if MASS_PRESERVE:
+                actual_tick_v8 = new_v_int8 - v_slow_old
+                actual_tick_full = actual_tick_v8 * V_SLOW_FACTOR
+                s_slow = s_slow - actual_tick_full
+            tl.store(v_slow_ptr + s_off, new_v_int8.to(tl.int8),
+                       mask=nk_mask)
+
+        s_slow = tl.minimum(tl.maximum(s_slow, -32768), 32767)
+        tl.store(s_slow_ptr + s_off, s_slow.to(tl.int16), mask=nk_mask)
+
+    # Clamp delta to int8 range BEFORE storing. In practice the
+    # equilibrium delta is far inside [-128, 127] but a gradient spike
+    # can transiently overshoot; saturating-clamp prevents silent
+    # wraparound on the int8 store.
+    s_fast_delta = tl.minimum(tl.maximum(s_fast_delta, -128), 127)
+    tl.store(s_fast_ptr + s_off, s_fast_delta.to(tl.int8), mask=nk_mask)
+
+    # Per-tile atomic-max for rebalance bookkeeping. The relevant
+    # quantity for rebalance is |s_slow + s_fast_delta| ~= |s_slow|
+    # (since delta is small) -- this matches the int16 path's
+    # |s_slow + s_fast| reduction.
+    abs_eff = tl.abs(s_slow + s_fast_delta)
+    abs_eff = tl.where(nk_mask, abs_eff, 0)
+    tile_row_max = tl.max(abs_eff, axis=1)
+    tile_col_max = tl.max(abs_eff, axis=0)
+    tl.atomic_max(row_max_ptr + offs_n, tile_row_max, mask=n_mask)
+    tl.atomic_max(col_max_ptr + offs_k, tile_col_max, mask=k_mask)
+
+
+def apply_update_from_grad_W_int8(grad_W, s_slow, s_fast_delta, row_exp,
+                                    col_exp, row_max, col_max,
+                                    lr, mantissa_bias=15, alpha=0.1,
+                                    beta1=0.0,
+                                    v_slow=None, v_slow_factor=128,
+                                    alpha_v_fast=0.001,
+                                    apply_chase=True,
+                                    slow_scale=1,
+                                    block_n=64, block_k=64):
+    """SGD apply kernel for the int8 delta-storage path. s_fast must
+    be int8 (the delta from s_slow). Mass-preserving chase is implicit
+    (the math IS the mass-preserving form -- the delta dynamic doesn't
+    work without it)."""
+    N, K = grad_W.shape
+    assert s_fast_delta.dtype == torch.int8, \
+        f"int8 path requires s_fast int8, got {s_fast_delta.dtype}"
+    step_counter = _get_step_counter(grad_W.device)
+    step_counter.add_(1)
+    use_v_slow = v_slow is not None
+    v_slow_ptr = v_slow if use_v_slow else s_slow
+    if use_v_slow:
+        assert v_slow.shape == s_slow.shape and v_slow.dtype == torch.int8
+    grid = (triton.cdiv(N, block_n), triton.cdiv(K, block_k))
+    _apply_update_kernel_int8[grid](
+        grad_W, s_slow, s_fast_delta, row_exp, col_exp,
+        row_max, col_max, v_slow_ptr,
+        N, K,
+        float(lr), int(mantissa_bias), float(alpha), float(beta1),
+        step_counter,
+        float(alpha_v_fast),
+        grad_W.stride(0), grad_W.stride(1),
+        s_slow.stride(0), s_slow.stride(1),
+        BLOCK_N=block_n, BLOCK_K=block_k,
+        USE_V_SLOW=use_v_slow, V_SLOW_FACTOR=int(v_slow_factor),
+        MASS_PRESERVE=False,
+        APPLY_CHASE=bool(apply_chase),
+        SLOW_SCALE=int(slow_scale),
+    )
+
+
+# ============================================================
+# INT8 three-accum AdamW apply kernel (delta storage).
+#
+# Counterpart of _apply_adamw_three_accum_kernel for the int8 s_fast
+# (delta) storage convention. Key differences from the int16 path:
+#
+#  * s_fast holds (s_fast_logical - s_slow), int8.
+#  * d_fs in the drift-cancel variance term is just s_fast_delta -- the
+#    gap IS the storage, no subtraction needed.
+#  * The chase tick is mass-preserved by construction (delta dynamic
+#    requires it). MASS_PRESERVE_CHASE is no longer a toggle; it's
+#    always on.
+#  * MASS_PRESERVE for the v_slow leak still toggles, but the pulled
+#    mass comes out of s_slow (the absolute position) rather than out
+#    of s_fast (which is now a tiny delta).
+#  * wd_sv applies to s_slow as in the int16 path (same gap, same target).
+#  * wd_sf gap is computed against s_fast_logical_post = s_slow +
+#    s_fast_delta, and the resulting tick is applied to s_fast_delta.
+#    This preserves the int16 dynamic of "pull s_fast toward
+#    v_slow_full at rate wd_sf" while keeping the position bookkeeping
+#    in s_slow.
+#  * s_fast clamp on store is [-128, 127] (int8 range) instead of
+#    int16. In equilibrium the delta is far inside this range.
+# ============================================================
+
+
+@triton.jit
+def _apply_adamw_three_accum_kernel_int8(
+    grad_W_ptr,      # [N, K] bf16 -- precomputed by cuBLAS matmul
+    s_slow_ptr,      # [N, K] int16, mutated
+    s_fast_ptr,      # [N, K] int8 (DELTA from s_slow), mutated
+    v_slow_ptr,      # [N, K] int8, mutated
+    row_exp_ptr,     # [N] int8
+    col_exp_ptr,     # [K] int8
+    row_max_ptr,     # [N] int32, pre-zeroed (atomic-max sink)
+    col_max_ptr,     # [K] int32, pre-zeroed (atomic-max sink)
+    v_row_ptr,       # [N] fp32 -- Adafactor row second-moment EMA (g²);
+                      # read-only here, updated by Python before kernel call.
+                      # Used iff USE_GF_TRUST_REGION.
+    v_col_ptr,       # [K] fp32 -- Adafactor col second-moment EMA (g²).
+    sum_v_inv_ptr,   # [1] fp32 -- 1 / Σ_n v_row_n, precomputed by caller.
+    N, K,
+    lr, mantissa_bias, alpha, beta1,
+    weight_decay, eps, step_cap,
+    v_scale, drift_cancel_C, alpha_v_fast,
+    wd_sv, wd_sf,
+    gf_trust_delta_sq,   # fp32: δ² in step = grad/√(Var + δ²·v̂). When
+                          # USE_GF_TRUST_REGION is True, this replaces the
+                          # step_cap clamp with a smooth SNR gate.
+    step_salt_ptr,
+    stride_gn, stride_gk,
+    stride_sn, stride_sk,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    V_SLOW_FACTOR: tl.constexpr,
+    MASS_PRESERVE: tl.constexpr,
+    APPLY_CHASE: tl.constexpr,
+    SLOW_SCALE: tl.constexpr = 1,
+    USE_GF_TRUST_REGION: tl.constexpr = False,
+):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    step_salt = tl.load(step_salt_ptr).to(tl.int32)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    n_mask = offs_n < N
+    k_mask = offs_k < K
+    nk_mask = n_mask[:, None] & k_mask[None, :]
+
+    # Load precomputed grad_W from HBM.
+    gW_off = offs_n[:, None] * stride_gn + offs_k[None, :] * stride_gk
+    grad_W = tl.load(grad_W_ptr + gW_off, mask=nk_mask, other=0.0).to(tl.float32)
+
+    # Load state. s_fast is int8 delta; auto sign-extends via .to(int32).
+    s_off = offs_n[:, None] * stride_sn + offs_k[None, :] * stride_sk
+    s_slow = tl.load(s_slow_ptr + s_off, mask=nk_mask, other=0).to(tl.int32)
+    s_fast_delta = tl.load(s_fast_ptr + s_off, mask=nk_mask,
+                            other=0).to(tl.int32)
+    v_slow_i8 = tl.load(v_slow_ptr + s_off, mask=nk_mask, other=0).to(tl.int32)
+    v_slow_full = v_slow_i8 * V_SLOW_FACTOR
+    row_e = tl.load(row_exp_ptr + offs_n, mask=n_mask, other=0).to(tl.int32)
+    col_e = tl.load(col_exp_ptr + offs_k, mask=k_mask, other=0).to(tl.int32)
+
+    # Live weight: SLOW_SCALE*s_slow + s_fast_delta + v_slow_full.
+    # SLOW_SCALE=1 is the canonical s_slow + s_fast_delta + v_slow_full
+    # (delta convention: s_slow + s_fast_delta = s_fast_logical, so live
+    # = s_fast_logical + v_slow_full -- one fast tracker plus the
+    # long-time-mean anchor). SLOW_SCALE=2 is the "double slow" probe:
+    # each s_slow mantissa unit contributes 2× to live, so equilibrium
+    # has s_slow at half-magnitude and v_slow absorbs the rest. d_fs /
+    # d_sv and the wd_sf logical-position are left in bare-s_slow
+    # units intentionally — testing how miscalibrated drift-cancel +
+    # bayesian-wd react to asymmetric live composition is part of the
+    # experiment.
+    m_eff = SLOW_SCALE * s_slow + s_fast_delta + v_slow_full
+    total_exp = (row_e[:, None] + col_e[None, :] - mantissa_bias).to(tl.float32)
+    scale_inv = tl.exp2(-total_exp)
+    scale_fwd = tl.exp2(total_exp)
+    current_weight = m_eff.to(tl.float32) * scale_fwd
+
+    # Drift-cancelled noise residual. d_fs IS s_fast_delta in delta
+    # convention (the gap from s_fast_logical to s_slow in live-weight
+    # units; s_fast_delta * 1 = live contribution, so the gap = delta
+    # for any SLOW_SCALE). d_sv is the slow-to-anchor gap in live-
+    # weight units: live_slow_contribution = SLOW_SCALE * s_slow, so
+    # d_sv = SLOW_SCALE * s_slow - v_slow_full. For SLOW_SCALE=1 this
+    # reduces to the canonical form.
+    d_fs = s_fast_delta.to(tl.float32)
+    d_sv = (SLOW_SCALE * s_slow - v_slow_full).to(tl.float32)
+    noise = d_fs - drift_cancel_C * d_sv
+    noise_in_w = noise * scale_fwd
+    v_proxy = noise_in_w * noise_in_w * v_scale
+
+    # Garbage-fraction trust region: add δ²·v̂ floor to v_proxy so the
+    # implied step is bounded by ~1/δ at gf→0 and decays to 0 at gf→1
+    # (no spurious noise-floor motion on converged weights). v̂ is
+    # Adafactor rank-1 in g² units, matching grad_W²; this term is what
+    # actually shapes the step in the signal→noise transition. The
+    # step_cap clamp below is retained as a cold-start backstop (the v̂
+    # EMA warms from zero), not as the primary bound.
+    if USE_GF_TRUST_REGION:
+        v_row_tile = tl.load(v_row_ptr + offs_n,
+                              mask=n_mask, other=0.0).to(tl.float32)
+        v_col_tile = tl.load(v_col_ptr + offs_k,
+                              mask=k_mask, other=0.0).to(tl.float32)
+        sum_v_inv = tl.load(sum_v_inv_ptr).to(tl.float32)
+        v_hat = v_row_tile[:, None] * v_col_tile[None, :] * sum_v_inv
+        v_proxy = v_proxy + gf_trust_delta_sq * v_hat
+
+    # AdamW step (same formula on current_weight as int16 path).
+    step_live = grad_W / tl.sqrt(v_proxy + eps) + weight_decay * current_weight
+    # Hard step_cap clamp is ALWAYS applied as a safety backstop. When
+    # gf-trust is on it governs the steady-state step shape (smoothly
+    # decaying as SNR drops), and the clamp essentially never fires once
+    # the Adafactor v̂ EMA has warmed. But the EMA starts at ZERO (no
+    # bias correction), so for the first ~1/(1-β2) steps v̂≈0 and, with a
+    # tiny eps, the denominator is unfloored — an unclamped step would
+    # explode on the cold start. The clamp at step_cap caps those cold
+    # ticks harmlessly. step_cap should be set to ~1/δ so the backstop
+    # and the gf-trust bound agree.
+    step_live = tl.minimum(tl.maximum(step_live, -step_cap), step_cap)
+    delta_grad = -lr * step_live * scale_inv
+    delta_t = delta_grad - beta1 * d_fs
+
+    # SR tick on s_fast_delta.
+    pos_hash = (offs_n[:, None] << 16) ^ offs_k[None, :]
+    r1 = _hash_uniform(s_fast_delta, pos_hash, step_salt)
+    floor_t = tl.floor(delta_t)
+    frac_t = delta_t - floor_t
+    tick_fast = (floor_t + (r1 < frac_t).to(tl.float32)).to(tl.int32)
+    s_fast_delta = s_fast_delta + tick_fast
+
+    if APPLY_CHASE:
+        # Chase: tick_slow = SR(alpha * s_fast_delta). Mass-preserve
+        # baked in (delta dynamic requires it): tick INTO s_slow and
+        # OUT of s_fast_delta.
+        delta_slow_f = alpha * s_fast_delta.to(tl.float32)
+        r2 = _hash_uniform(s_fast_delta, pos_hash, step_salt ^ 0x5A5A5A5A)
+        floor_s = tl.floor(delta_slow_f)
+        frac_s = delta_slow_f - floor_s
+        tick_slow = (floor_s + (r2 < frac_s).to(tl.float32)).to(tl.int32)
+        s_slow = s_slow + tick_slow
+        s_fast_delta = s_fast_delta - tick_slow
+
+        # v_slow leak target: SLOW_SCALE*s_slow (the absolute position
+        # in live-weight units). After the mass-preserve chase, s_slow
+        # has absorbed the cumulative weight, so it's the natural anchor
+        # target; s_fast_delta is a small gap and doesn't carry the
+        # position signal. For SLOW_SCALE=1 this reduces to the
+        # canonical s_slow leak target.
+        gap_v_full = (SLOW_SCALE * s_slow - v_slow_full).to(tl.float32)
+        delta_v8 = alpha_v_fast * gap_v_full / V_SLOW_FACTOR
+        r3 = _hash_uniform(s_fast_delta, pos_hash, step_salt ^ 0x33335555)
+        floor_v = tl.floor(delta_v8)
+        frac_v = delta_v8 - floor_v
+        tick_v8 = (floor_v + (r3 < frac_v).to(tl.float32)).to(tl.int32)
+        new_v_int32 = v_slow_i8 + tick_v8
+        new_v_int8 = tl.minimum(tl.maximum(new_v_int32, -128), 127)
+        if MASS_PRESERVE:
+            # The mass that flowed into v_slow comes out of s_slow
+            # (which has the position), not out of s_fast_delta
+            # (which is bounded near zero).
+            actual_tick_v8 = new_v_int8 - v_slow_i8
+            actual_tick_full = actual_tick_v8 * V_SLOW_FACTOR
+            s_slow = s_slow - actual_tick_full
+
+        # Bayesian-anchored weight decay.
+        v_slow_full_post = new_v_int8 * V_SLOW_FACTOR
+        # wd_sv: pull live slow-contribution (SLOW_SCALE*s_slow) toward
+        # v_slow_full. The tick is applied to s_slow, so the effective
+        # rate of pull in s_slow units is SLOW_SCALE*wd_sv; in live units
+        # the pull rate equals wd_sv (independent of SLOW_SCALE).
+        d_sv_full_post = (SLOW_SCALE * s_slow - v_slow_full_post).to(tl.float32)
+        wd_sv_delta = lr * wd_sv * d_sv_full_post
+        r4 = _hash_uniform(s_fast_delta, pos_hash, step_salt ^ 0x66665555)
+        floor_wd_sv = tl.floor(wd_sv_delta)
+        frac_wd_sv = wd_sv_delta - floor_wd_sv
+        tick_wd_sv = (floor_wd_sv + (r4 < frac_wd_sv).to(tl.float32)).to(tl.int32)
+        s_slow = s_slow - tick_wd_sv
+
+        # wd_sf: pull s_fast_logical (in live-weight units) toward
+        # v_slow_full. In delta convention, the live fast-logical is
+        # SLOW_SCALE*s_slow + s_fast_delta (live - v_slow_full). We
+        # compute the gap against the logical value and apply the tick
+        # to s_fast_delta -- this drains the gap while leaving s_slow
+        # (the position) alone, matching the int16 dynamic of decaying
+        # s_fast independently.
+        s_fast_logical_post = SLOW_SCALE * s_slow + s_fast_delta
+        d_sf_full_post = (s_fast_logical_post - v_slow_full_post).to(tl.float32)
+        wd_sf_delta = lr * wd_sf * d_sf_full_post
+        r5 = _hash_uniform(s_fast_delta, pos_hash, step_salt ^ 0x77770000)
+        floor_wd_sf = tl.floor(wd_sf_delta)
+        frac_wd_sf = wd_sf_delta - floor_wd_sf
+        tick_wd_sf = (floor_wd_sf + (r5 < frac_wd_sf).to(tl.float32)).to(tl.int32)
+        s_fast_delta = s_fast_delta - tick_wd_sf
+
+        s_slow = tl.minimum(tl.maximum(s_slow, -32768), 32767)
+        tl.store(s_slow_ptr + s_off, s_slow.to(tl.int16), mask=nk_mask)
+        tl.store(v_slow_ptr + s_off, new_v_int8.to(tl.int8), mask=nk_mask)
+
+    # Clamp delta to int8 range before storing. In practice the
+    # equilibrium delta is far inside [-128, 127], but a transient
+    # gradient spike can overshoot; saturating-clamp prevents silent
+    # int8 wraparound. Repeated clamps in a hot region indicate
+    # alpha / lr / step_cap need retuning.
+    s_fast_delta = tl.minimum(tl.maximum(s_fast_delta, -128), 127)
+    tl.store(s_fast_ptr + s_off, s_fast_delta.to(tl.int8), mask=nk_mask)
+
+    # Per-tile atomic-max into row_max / col_max for the rebalance
+    # pass. The relevant quantity is |s_slow + s_fast_delta| ~
+    # |s_fast_logical|, the live mantissa magnitude.
+    abs_eff = tl.abs(s_slow + s_fast_delta)
+    abs_eff = tl.where(nk_mask, abs_eff, 0)
+    tile_row_max = tl.max(abs_eff, axis=1)
+    tile_col_max = tl.max(abs_eff, axis=0)
+    tl.atomic_max(row_max_ptr + offs_n, tile_row_max, mask=n_mask)
+    tl.atomic_max(col_max_ptr + offs_k, tile_col_max, mask=k_mask)
+
+
+def apply_adamw_three_accum_from_grad_W_int8(
+    grad_W, s_slow, s_fast_delta, v_slow, row_exp, col_exp,
+    row_max, col_max,
+    lr, mantissa_bias=15, alpha=0.1, beta1=0.0,
+    weight_decay=0.0, eps=1.0, step_cap=10.0,
+    v_scale=1.0, drift_cancel_C=None, alpha_v_fast=0.001,
+    v_slow_factor=128, mass_preserve=False,
+    wd_sv=0.0, wd_sf=0.0,
+    apply_chase=True,
+    slow_scale=1,
+    v_row=None, v_col=None, sum_v_inv=None, gf_trust_delta_sq=0.0,
+    block_n=64, block_k=64,
+):
+    """Three-accumulator AdamW apply kernel for the int8 delta-storage
+    path. s_fast must be int8 (the delta s_fast_logical - s_slow).
+    Mass-preserving chase is BAKED IN (the delta dynamic requires it);
+    the ``mass_preserve`` kwarg toggles only the v_slow leak's
+    interaction with s_slow.
+
+    Apply-only sibling of apply_adamw_three_accum_from_grad_W -- the
+    int16 version's full chase / wd / v_slow dynamic is reproduced in
+    delta-storage form, with the only semantic shift being that the
+    live weight is s_slow + s_fast_delta + v_slow_full (where the
+    first two sum to s_fast_logical)."""
+    N, K = grad_W.shape
+    assert s_fast_delta.dtype == torch.int8, \
+        f"int8 path requires s_fast int8, got {s_fast_delta.dtype}"
+    assert v_slow.shape == s_slow.shape and v_slow.dtype == torch.int8
+    if drift_cancel_C is None:
+        drift_cancel_C = compute_drift_cancel_C(alpha, alpha_v_fast)
+    use_gf_trust = gf_trust_delta_sq > 0
+    if use_gf_trust:
+        assert v_row is not None and v_col is not None \
+            and sum_v_inv is not None, \
+            "gf_trust_delta_sq > 0 requires v_row, v_col, sum_v_inv"
+    else:
+        # Stub pointers — the kernel branch that reads them is dead at
+        # USE_GF_TRUST_REGION=False, but Triton still wants a real ptr.
+        v_row = v_row if v_row is not None else s_slow
+        v_col = v_col if v_col is not None else s_slow
+        sum_v_inv = sum_v_inv if sum_v_inv is not None else s_slow
+    step_counter = _get_step_counter(grad_W.device)
+    step_counter.add_(1)
+    grid = (triton.cdiv(N, block_n), triton.cdiv(K, block_k))
+    _apply_adamw_three_accum_kernel_int8[grid](
+        grad_W, s_slow, s_fast_delta, v_slow, row_exp, col_exp,
+        row_max, col_max,
+        v_row, v_col, sum_v_inv,
+        N, K,
+        float(lr), int(mantissa_bias), float(alpha), float(beta1),
+        float(weight_decay), float(eps), float(step_cap),
+        float(v_scale), float(drift_cancel_C), float(alpha_v_fast),
+        float(wd_sv), float(wd_sf),
+        float(gf_trust_delta_sq),
+        step_counter,
+        grad_W.stride(0), grad_W.stride(1),
+        s_slow.stride(0), s_slow.stride(1),
+        BLOCK_N=block_n, BLOCK_K=block_k,
+        V_SLOW_FACTOR=int(v_slow_factor),
+        MASS_PRESERVE=bool(mass_preserve),
+        APPLY_CHASE=bool(apply_chase),
+        SLOW_SCALE=int(slow_scale),
+        USE_GF_TRUST_REGION=bool(use_gf_trust),
     )
 
 
@@ -2921,7 +3442,7 @@ class FusedConcordLinear(torch.autograd.Function):
                     weight_decay=ctx.weight_decay, eps=ctx.eps,
                     step_cap=ctx.step_cap,
                     v_scale=getattr(ctx, 'v_scale', 1.0),
-                    drift_cancel_C=getattr(ctx, 'drift_cancel_C', 0.1),
+                    drift_cancel_C=getattr(ctx, 'drift_cancel_C', None),
                     alpha_v_fast=getattr(ctx, 'alpha_v_fast', 0.001),
                     v_slow_factor=ctx.v_slow_factor,
                     wd_sv=getattr(ctx, 'wd_sv', 0.0),
@@ -2970,3 +3491,300 @@ class FusedConcordLinear(torch.autograd.Function):
                 None, None,
                 None, None, None, None,
                 None, None, None)
+
+
+# =====================================================================
+# INT8 s_fast (delta storage) autograd Functions.
+#
+# Layer-class-facing entry points for the int8 delta-storage path.
+# Forward arg lists differ from the int16 variants only by what's
+# dropped: v_rank1 buffers (v_row/v_col/g2_row/g2_col/v_beta2/v_step)
+# and the v_diag observation channel are removed -- the int8 path
+# supports SGD + AdamW three_accum only. Forward materialization is
+# unchanged (sync_weight_bf16_pair_triton is dtype-polymorphic on
+# s_fast); backward routes to apply_update_from_grad_W_int8 (SGD) or
+# apply_adamw_three_accum_from_grad_W_int8 (AdamW three_accum).
+#
+# The materialized weight reflects live = s_slow + s_fast_delta +
+# v_slow_full. In the delta convention, s_slow + s_fast_delta =
+# s_fast_logical -- one fast tracker plus the v_slow_full anchor.
+# This differs from the int16 path's live = s_slow + s_fast + v
+# (which sums TWO posterior samples) but the dynamics are
+# well-defined and Bayesian-anchored.
+# =====================================================================
+
+
+class FusedConcordConv2dInt8(torch.autograd.Function):
+    """int8 s_fast variant of FusedConcordConv2d. Same forward + grad_x
+    path; backward routes to apply_update_from_grad_W_int8 instead of
+    apply_update_from_grad_W."""
+
+    @staticmethod
+    def forward(ctx, x, s_slow, s_fast, row_exp, col_exp, bias,
+                in_channels, out_channels, kh, kw, stride, padding,
+                mantissa_bias, lr, alpha, beta1,
+                v_slow_i8_buf, v_slow_factor, alpha_v_fast,
+                weight_buf, apply_chase,
+                grad_W_buf, row_max_buf, col_max_buf,
+                slow_scale=1):
+        assert s_fast.dtype == torch.int8, \
+            f"int8 path requires s_fast int8, got {s_fast.dtype}"
+        x_bf16 = x.to(torch.bfloat16) if x.dtype != torch.bfloat16 else x
+        if not x_bf16.is_contiguous():
+            x_bf16 = x_bf16.contiguous()
+        weight_2d = materialize_bf16_weight(
+            s_slow, s_fast, row_exp, col_exp,
+            mantissa_bias=mantissa_bias,
+            v_slow=v_slow_i8_buf, v_slow_factor=v_slow_factor,
+            slow_scale=slow_scale,
+            out=weight_buf)
+        weight_4d = weight_2d.view(out_channels, in_channels, kh, kw)
+        bias_bf16 = (bias.to(torch.bfloat16)
+                     if bias is not None and bias.dtype != torch.bfloat16
+                     else bias)
+        y = torch.nn.functional.conv2d(x_bf16, weight_4d, bias=bias_bf16,
+                                         stride=stride, padding=padding)
+        ctx.save_for_backward(x_bf16, weight_4d)
+        ctx.s_slow = s_slow
+        ctx.s_fast = s_fast
+        ctx.row_exp = row_exp
+        ctx.col_exp = col_exp
+        ctx.in_channels = in_channels
+        ctx.out_channels = out_channels
+        ctx.kh, ctx.kw = kh, kw
+        ctx.stride = stride
+        ctx.padding = padding
+        ctx.mantissa_bias = mantissa_bias
+        ctx.lr = lr
+        ctx.alpha = alpha
+        ctx.beta1 = beta1
+        ctx.has_bias = bias is not None
+        ctx.v_slow_i8_buf = v_slow_i8_buf
+        ctx.v_slow_factor = v_slow_factor
+        ctx.alpha_v_fast = alpha_v_fast
+        ctx.apply_chase = apply_chase
+        ctx.grad_W_buf = grad_W_buf
+        ctx.row_max_buf = row_max_buf
+        ctx.col_max_buf = col_max_buf
+        ctx.slow_scale = slow_scale
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_y):
+        x_bf16, weight_4d = ctx.saved_tensors
+        if grad_y.dtype != torch.bfloat16:
+            grad_y = grad_y.to(torch.bfloat16)
+        if not grad_y.is_contiguous():
+            grad_y = grad_y.contiguous()
+
+        # grad_x via cuDNN against the materialised bf16 weight.
+        grad_x = torch.nn.grad.conv2d_input(
+            x_bf16.shape, weight_4d, grad_y,
+            stride=ctx.stride, padding=ctx.padding)
+
+        # grad_W via cuDNN, then int8 apply kernel.
+        with PROFILER.time(
+                f'conv_gW_int8_{ctx.in_channels}x{ctx.out_channels}'):
+            grad_W_4d = torch.nn.grad.conv2d_weight(
+                x_bf16,
+                (ctx.out_channels, ctx.in_channels, ctx.kh, ctx.kw),
+                grad_y,
+                stride=ctx.stride, padding=ctx.padding,
+            )
+            grad_W_2d = grad_W_4d.reshape(ctx.out_channels, -1).contiguous()
+            if grad_W_2d.dtype != torch.bfloat16:
+                grad_W_2d = grad_W_2d.to(torch.bfloat16)
+            ctx.row_max_buf.zero_()
+            ctx.col_max_buf.zero_()
+            apply_update_from_grad_W_int8(
+                grad_W_2d, ctx.s_slow, ctx.s_fast,
+                ctx.row_exp, ctx.col_exp,
+                ctx.row_max_buf, ctx.col_max_buf,
+                lr=ctx.lr, mantissa_bias=ctx.mantissa_bias,
+                alpha=ctx.alpha, beta1=ctx.beta1,
+                v_slow=ctx.v_slow_i8_buf,
+                v_slow_factor=ctx.v_slow_factor,
+                alpha_v_fast=ctx.alpha_v_fast,
+                apply_chase=ctx.apply_chase,
+                slow_scale=ctx.slow_scale,
+            )
+
+        grad_bias = None
+        if ctx.has_bias:
+            grad_bias = grad_y.sum(dim=(0, 2, 3))
+
+        # 25 forward args (added slow_scale); only x and bias have grads.
+        return (grad_x, None, None, None, None, grad_bias,
+                None, None, None, None, None, None,
+                None, None, None, None,
+                None, None, None,
+                None, None,
+                None, None, None,
+                None)
+
+
+class FusedConcordLinearInt8(torch.autograd.Function):
+    """int8 s_fast variant of FusedConcordLinear. Same forward + grad_x
+    path; backward routes to the int8 apply kernels. v_rank1 is not
+    supported in the int8 path (would need a separate kernel); use
+    'three_accum' for AdamW or the SGD path."""
+
+    @staticmethod
+    def forward(ctx, x, s_slow, s_fast, row_exp, col_exp, bias,
+                mantissa_bias, lr, alpha, beta1,
+                optimizer_kind,
+                weight_decay, eps, step_cap,
+                optimizer_v_kind,
+                v_slow_buf, v_scale, drift_cancel_C, alpha_v_fast,
+                v_slow_i8_buf, v_slow_factor,
+                weight_buf, wd_sv, wd_sf, apply_chase,
+                grad_W_buf, row_max_buf, col_max_buf,
+                slow_scale=1,
+                v_row=None, v_col=None, sum_v_inv=None,
+                gf_trust_delta_sq=0.0, adafactor_beta2=0.999):
+        assert s_fast.dtype == torch.int8, \
+            f"int8 path requires s_fast int8, got {s_fast.dtype}"
+        if optimizer_kind == 'adamw' and optimizer_v_kind != 'three_accum':
+            raise NotImplementedError(
+                "int8 s_fast path only supports optimizer_v_kind="
+                f"'three_accum', got {optimizer_v_kind!r}. v_rank1 + int8 "
+                "would need a separate kernel.")
+        weight = materialize_bf16_weight(
+            s_slow, s_fast, row_exp, col_exp,
+            mantissa_bias=mantissa_bias,
+            v_slow=v_slow_i8_buf, v_slow_factor=v_slow_factor,
+            slow_scale=slow_scale,
+            out=weight_buf)
+        bias_bf16 = (bias.to(torch.bfloat16)
+                     if bias is not None and bias.dtype != torch.bfloat16
+                     else bias)
+        y = torch.nn.functional.linear(x, weight, bias_bf16)
+        ctx.save_for_backward(x, weight)
+        ctx.s_slow = s_slow
+        ctx.s_fast = s_fast
+        ctx.row_exp = row_exp
+        ctx.col_exp = col_exp
+        ctx.mantissa_bias = mantissa_bias
+        ctx.lr = lr
+        ctx.alpha = alpha
+        ctx.beta1 = beta1
+        ctx.has_bias = bias is not None
+        ctx.optimizer_kind = optimizer_kind
+        ctx.weight_decay = weight_decay
+        ctx.eps = eps
+        ctx.step_cap = step_cap
+        ctx.v_scale = v_scale
+        ctx.drift_cancel_C = drift_cancel_C
+        ctx.alpha_v_fast = alpha_v_fast
+        ctx.v_slow_i8_buf = v_slow_i8_buf
+        ctx.v_slow_factor = v_slow_factor
+        ctx.wd_sv = wd_sv
+        ctx.wd_sf = wd_sf
+        ctx.apply_chase = apply_chase
+        ctx.grad_W_buf = grad_W_buf
+        ctx.row_max_buf = row_max_buf
+        ctx.col_max_buf = col_max_buf
+        ctx.slow_scale = slow_scale
+        ctx.v_row = v_row
+        ctx.v_col = v_col
+        ctx.sum_v_inv = sum_v_inv
+        ctx.gf_trust_delta_sq = gf_trust_delta_sq
+        ctx.adafactor_beta2 = adafactor_beta2
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_y):
+        x, weight = ctx.saved_tensors
+        s_slow, s_fast = ctx.s_slow, ctx.s_fast
+        row_exp, col_exp = ctx.row_exp, ctx.col_exp
+
+        if grad_y.dtype != torch.bfloat16:
+            grad_y = grad_y.to(torch.bfloat16)
+        if not grad_y.is_contiguous():
+            grad_y = grad_y.contiguous()
+
+        grad_x = torch.matmul(grad_y, weight)
+
+        if ctx.optimizer_kind == 'adamw':
+            # AdamW three_accum int8: cuBLAS matmul + int8 apply kernel.
+            grad_W = torch.matmul(grad_y.transpose(-1, -2), x)
+            if grad_W.dtype != torch.bfloat16:
+                grad_W = grad_W.to(torch.bfloat16)
+            if not grad_W.is_contiguous():
+                grad_W = grad_W.contiguous()
+            ctx.row_max_buf.zero_()
+            ctx.col_max_buf.zero_()
+            # Adafactor row/col second-moment EMA update — done BEFORE
+            # apply so the kernel sees this step's freshest v̂ when the
+            # gf-trust region floor is active. β2=adafactor_beta2.
+            if (ctx.gf_trust_delta_sq > 0
+                    and ctx.v_row is not None
+                    and ctx.v_col is not None
+                    and ctx.sum_v_inv is not None):
+                with torch.no_grad():
+                    g2 = grad_W.float() ** 2
+                    g2_row = g2.sum(dim=1)
+                    g2_col = g2.sum(dim=0)
+                    b2 = ctx.adafactor_beta2
+                    ctx.v_row.mul_(b2).add_(g2_row, alpha=1.0 - b2)
+                    ctx.v_col.mul_(b2).add_(g2_col, alpha=1.0 - b2)
+                    sum_v = ctx.v_row.sum().clamp(min=1e-30)
+                    ctx.sum_v_inv.fill_(0).add_(1.0 / sum_v)
+            apply_adamw_three_accum_from_grad_W_int8(
+                grad_W, s_slow, s_fast, ctx.v_slow_i8_buf,
+                row_exp, col_exp,
+                ctx.row_max_buf, ctx.col_max_buf,
+                lr=ctx.lr, mantissa_bias=ctx.mantissa_bias,
+                alpha=ctx.alpha, beta1=ctx.beta1,
+                weight_decay=ctx.weight_decay, eps=ctx.eps,
+                step_cap=ctx.step_cap,
+                v_scale=ctx.v_scale,
+                drift_cancel_C=ctx.drift_cancel_C,
+                alpha_v_fast=ctx.alpha_v_fast,
+                v_slow_factor=ctx.v_slow_factor,
+                wd_sv=ctx.wd_sv, wd_sf=ctx.wd_sf,
+                apply_chase=ctx.apply_chase,
+                slow_scale=ctx.slow_scale,
+                v_row=ctx.v_row, v_col=ctx.v_col,
+                sum_v_inv=ctx.sum_v_inv,
+                gf_trust_delta_sq=ctx.gf_trust_delta_sq,
+            )
+        else:
+            # SGD int8: cuBLAS matmul + int8 apply kernel.
+            grad_W = torch.matmul(grad_y.transpose(-1, -2), x)
+            if grad_W.dtype != torch.bfloat16:
+                grad_W = grad_W.to(torch.bfloat16)
+            if not grad_W.is_contiguous():
+                grad_W = grad_W.contiguous()
+            ctx.row_max_buf.zero_()
+            ctx.col_max_buf.zero_()
+            apply_update_from_grad_W_int8(
+                grad_W, s_slow, s_fast, row_exp, col_exp,
+                ctx.row_max_buf, ctx.col_max_buf,
+                lr=ctx.lr, mantissa_bias=ctx.mantissa_bias,
+                alpha=ctx.alpha, beta1=ctx.beta1,
+                v_slow=ctx.v_slow_i8_buf,
+                v_slow_factor=ctx.v_slow_factor,
+                alpha_v_fast=ctx.alpha_v_fast,
+                apply_chase=ctx.apply_chase,
+                slow_scale=ctx.slow_scale,
+            )
+
+        grad_bias = None
+        if ctx.has_bias:
+            grad_bias = grad_y.sum(dim=0)
+
+        # 34 forward args (added slow_scale + v_row/v_col/sum_v_inv/
+        # gf_trust_delta_sq/adafactor_beta2); only x and bias have grads.
+        return (grad_x, None, None, None, None, grad_bias,
+                None, None, None, None,
+                None,
+                None, None, None,
+                None,
+                None, None, None, None,
+                None, None,
+                None, None, None, None,
+                None, None, None,
+                None,
+                None, None, None,
+                None, None)
