@@ -29,6 +29,7 @@ class CausalSelfAttention(nn.Module):
         assert cfg.n_embd % cfg.n_head == 0
         self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=False)
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
+        self.resid_dropout = nn.Dropout(cfg.dropout)
         self.n_head = cfg.n_head
         self.n_embd = cfg.n_embd
         self.dropout = cfg.dropout
@@ -44,7 +45,7 @@ class CausalSelfAttention(nn.Module):
             q, k, v, is_causal=True,
             dropout_p=self.dropout if self.training else 0.0)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.c_proj(y)
+        return self.resid_dropout(self.c_proj(y))
 
 
 class MLP(nn.Module):
@@ -52,9 +53,10 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = nn.Linear(cfg.n_embd, 4 * cfg.n_embd, bias=False)
         self.c_proj = nn.Linear(4 * cfg.n_embd, cfg.n_embd, bias=False)
+        self.dropout = nn.Dropout(cfg.dropout)
 
     def forward(self, x):
-        return self.c_proj(F.gelu(self.c_fc(x)))
+        return self.dropout(self.c_proj(F.gelu(self.c_fc(x))))
 
 
 class Block(nn.Module):
@@ -77,6 +79,7 @@ class GPT(nn.Module):
         self.cfg = cfg
         self.wte = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         self.wpe = nn.Embedding(cfg.block_size, cfg.n_embd)
+        self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
         self.ln_f = nn.LayerNorm(cfg.n_embd)
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
@@ -98,7 +101,7 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         B, T = idx.shape
         pos = torch.arange(T, device=idx.device)
-        x = self.wte(idx) + self.wpe(pos)[None, :, :]
+        x = self.drop(self.wte(idx) + self.wpe(pos)[None, :, :])
         for blk in self.blocks:
             x = blk(x)
         x = self.ln_f(x)

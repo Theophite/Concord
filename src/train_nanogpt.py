@@ -81,6 +81,7 @@ def main():
     ap.add_argument("--n_layer", type=int, default=6)
     ap.add_argument("--n_head", type=int, default=6)
     ap.add_argument("--n_embd", type=int, default=384)
+    ap.add_argument("--dropout", type=float, default=0.0)
     ap.add_argument("--concord_lr", type=float, default=0.05)
     ap.add_argument("--concord_wd", type=float, default=0.0)
     ap.add_argument("--step_cap", type=float, default=10.0)
@@ -102,7 +103,8 @@ def main():
 
     train, val, vocab, _ = load_char_data(args.data, device)
     cfg = GPTConfig(vocab_size=vocab, block_size=args.block_size,
-                    n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd)
+                    n_layer=args.n_layer, n_head=args.n_head,
+                    n_embd=args.n_embd, dropout=args.dropout)
     model = GPT(cfg).to(device)
     print(f"[{tag}] GPT {model.num_params()/1e6:.2f}M params  vocab={vocab}  "
           f"block={args.block_size}  bsz={args.bsz}", flush=True)

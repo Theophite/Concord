@@ -701,3 +701,18 @@ tiny-shakespeare (1.1M chars), 5000 iters, bsz=64, seed 0, NO dropout.
 - VERDICT: first contact in the right regime is a WIN -- raw Concord ties
   AdamW's best AND is far more overfit-robust. (src/nanogpt.py +
   src/train_nanogpt.py committed; nanogpt_data/ gitignored.)
+- **Rung #1 -- DROPOUT-MATCHED (user). Grid (5000 iter, seed 0):**
+  | opt | dropout | best val | final | train |
+  | Concord | 0.0 | **1.5364** | 1.544 | 1.18 |  (stable, final~best)
+  | Concord | 0.2 | 1.81  | 1.80 | -- |   (dropout HURTS: over-regularized)
+  | AdamW | 0.0 | 1.5334 | 4.36 | 0.087 | (memorized)
+  | AdamW | 0.2 | **1.4713** | 1.70 | 0.63 | (best@~it1750, still tail-overfits)
+  EACH AT ITS BEST: **AdamW 1.4713 vs Concord 1.5364 -> AdamW +0.065 nats** =
+  the honest v-hat cost in the LM regime. But: AdamW's 1.47 needs dropout 0.2
+  AND early-stopping (two regularizers, must catch the min); Concord's 1.5364
+  needs NEITHER (final~best, stable) and REJECTS dropout (self-regularizes ->
+  double-damp underfits to 1.81). Dropout helped only AdamW. Concord trades
+  ~0.065 for tuning-free + overfit-robust + ~1/3 optimizer-state bits.
+  (Caveat: Concord's chase lr=0.05 NOT swept for nanoGPT -- a sweep may close
+  some of the 0.065.) NEXT: rung #2 data>>capacity (neither memorizes = pure
+  optimization-quality test); rung #3 washing-spectrum (none/full/single).
