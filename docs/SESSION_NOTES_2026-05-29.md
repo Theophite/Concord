@@ -669,3 +669,35 @@ regularization can't help.
   and hold -> washing modes overtake. If so, the "underfit" IS the
   generalization win, and the §2.8 verdict is reversed. (`single` additive;
   none/full/rank1 untouched -> running control safe.)
+
+## 2.14 nanoGPT: RAW CONCORD MATCHES AdamW (and self-regularizes) -- the pivot
+First test in the regime that matters (LM = non-realizable, next-char
+stochastic). Built `src/nanogpt.py` (10.8M char GPT: n_layer=n_head=6,
+n_embd=384, block=256, bias=False Linears, untied lm_head) + `src/train_nanogpt.py`
+(every nn.Linear -> ConcordLinearPackedB, eps=1 shipped recipe, step fused in
+backward, per-step rebalance; aux AdamW on embeddings+LN; warmup+cosine). Char
+tiny-shakespeare (1.1M chars), 5000 iters, bsz=64, seed 0, NO dropout.
+- **Controlled head-to-head (identical model/data/schedule):**
+  | optimizer | best val | final val | final train |
+  | Concord (raw, int-packed) | **1.5364** | 1.544 | 1.18 |
+  | AdamW (fp32) | **1.5334** | 4.361 | 0.087 |
+- **(1) Best-val TIE** (1.5364 vs 1.5334, ~noise): raw Concord with NO per-coord
+  v-hat matches AdamW's PEAK generalization on a from-scratch transformer LM.
+  Refutes "Concord trails AdamW" -- in the v-hat-relevant regime it keeps up.
+- **(2) AdamW MEMORIZED, Concord didn't:** AdamW train->0.087 (memorized 1M
+  chars), val EXPLODED to 4.36 (worse than random ~4.17). Concord held: train
+  1.18, val 1.54. Concord's int-storage+chase+washing = FREE regularization
+  that resists memorization. §2.13 made real: the "underfit washer" is the
+  ROBUST one where memorization is the failure mode. (Concord uses the full
+  schedule, val improves to ~iter4250; AdamW peaks ~iter1000 then overfits.)
+  ~110ms/iter; 2.3GB Concord vs 2.7GB AdamW.
+- **Caveats:** NO dropout on either (standard char-nanoGPT uses 0.2 -> stops
+  AdamW's blowup, gets ~1.47). char-shakespeare is MEMORIZABLE (AdamW proved
+  it). So this is "memorization possible + AdamW does it," not yet the pure
+  data>>capacity regime. NEXT rungs: (a) dropout-matched both -> AdamW's tuned
+  best vs Concord; (b) DATA>>CAPACITY (bigger corpus, neither memorizes) = the
+  pure optimization-quality test of Concord-without-v-hat; (c) washing-spectrum
+  (none/full/single) here.
+- VERDICT: first contact in the right regime is a WIN -- raw Concord ties
+  AdamW's best AND is far more overfit-robust. (src/nanogpt.py +
+  src/train_nanogpt.py committed; nanogpt_data/ gitignored.)

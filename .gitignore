@@ -2,8 +2,9 @@
 __pycache__/
 *.pyc
 
-# Datasets (downloaded, ~340MB)
+# Datasets (downloaded)
 cifar_data/
+nanogpt_data/
 data/
 
 # Model / optimizer checkpoints + resume state (large, regenerable)
