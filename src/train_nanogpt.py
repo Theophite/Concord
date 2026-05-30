@@ -29,7 +29,8 @@ from prototype_packed_b import ConcordLinearPackedB
 
 
 def wrap_with_concord(model, device, lr, alpha=0.1, beta1=0.0,
-                      weight_decay=0.0, eps=1.0, step_cap=10.0):
+                      weight_decay=0.0, eps=1.0, step_cap=10.0,
+                      precond_p=0.5, gf_consol=0.0):
     """Replace every nn.Linear with ConcordLinearPackedB, loading the
     from-scratch random init into s_fast (load_weights -> live weight = init
     at step 0; the chase redistributes mantissa over the first steps)."""
@@ -44,6 +45,8 @@ def wrap_with_concord(model, device, lr, alpha=0.1, beta1=0.0,
                     device=device, alpha=alpha, beta1=beta1, lr=lr)
                 c.set_optimizer_kind('adamw', weight_decay=weight_decay,
                                      eps=eps, step_cap=step_cap)
+                c.precond_p = precond_p     # eps<1 + precond_p>0 engages the
+                c.gf_consol = gf_consol     # drift-cancel v_proxy whitening
                 with torch.no_grad():
                     c.load_weights(child.weight.data.float())
                     if child.bias is not None:
@@ -85,6 +88,14 @@ def main():
     ap.add_argument("--concord_lr", type=float, default=0.05)
     ap.add_argument("--concord_wd", type=float, default=0.0)
     ap.add_argument("--step_cap", type=float, default=10.0)
+    ap.add_argument("--eps", type=float, default=1.0,
+                    help="Concord precond eps. 1.0 (shipped) -> v_proxy inert "
+                         "(uniform chase). <1 engages the drift-cancel v_proxy "
+                         "whitening (the noise filter).")
+    ap.add_argument("--precond_p", type=float, default=0.5,
+                    help="Padam precond power on v_proxy (0=SGD, 0.5=Adam-sqrt).")
+    ap.add_argument("--gf_consol", type=float, default=0.0,
+                    help="coherence-gated consolidation rate (garbage filter).")
     ap.add_argument("--alpha", type=float, default=0.1)
     ap.add_argument("--aux_lr", type=float, default=1e-3)
     ap.add_argument("--adamw_lr", type=float, default=1e-3)
@@ -112,12 +123,14 @@ def main():
     if args.mode == "concord":
         layers, npacked = wrap_with_concord(
             model, device, lr=args.concord_lr, alpha=args.alpha,
-            weight_decay=args.concord_wd, step_cap=args.step_cap)
+            weight_decay=args.concord_wd, step_cap=args.step_cap,
+            eps=args.eps, precond_p=args.precond_p, gf_consol=args.gf_consol)
         aux = [p for p in model.parameters() if p.requires_grad]
         aux_opt = torch.optim.AdamW(aux, lr=args.aux_lr, weight_decay=0.0)
         print(f"[{tag}] Concord on {len(layers)} Linears "
               f"({npacked/1e6:.2f}M packed)  aux AdamW {sum(p.numel() for p in aux)/1e6:.2f}M "
               f"(embed+LN)  concord_lr={args.concord_lr} wd={args.concord_wd} "
+              f"eps={args.eps} precond_p={args.precond_p} gf_consol={args.gf_consol} "
               f"step_cap={args.step_cap}  aux_lr={args.aux_lr}", flush=True)
         peak_lr = args.concord_lr
     else:

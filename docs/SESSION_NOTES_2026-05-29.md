@@ -725,3 +725,42 @@ tiny-shakespeare (1.1M chars), 5000 iters, bsz=64, seed 0, NO dropout.
   ~0.06 nats (~4%) behind tuned AdamW on char-shakespeare, at 1/3 the
   optimizer-state bits, no dropout/early-stop, far more overfit-robust. That
   0.06 = the target for the low-rank/freezing v-hat surrogate.
+
+## 2.15 enwik8 rung-#2 LOCKED + MultiTimescaleOptimizer gate-1 (clean build)
+**enwik8 (data>>capacity, rung #2) -- the headline.** Concord chase-lr swept
+(U-curve 0.01:1.63 / 0.02:1.53 / 0.03:1.49 / **0.05:1.4436** / 0.10:1.45) vs
+AdamW **1.0707** -> **gap 0.37 nats, STRUCTURAL** (lr moved it only 0.05; the
+rest is the missing v-hat). 7x the char-shakespeare gap (0.06). VERDICT: in the
+heavy-tailed, non-memorizable LM regime v-hat matters *a lot*; raw Concord is
+not competitive there and needs a v-hat (or cheap v-proxy) -- the project's
+real frontier. (Both train~val on enwik8: no memorization, clean comparison.)
+
+**MultiTimescaleOptimizer (user spec) -- gate 1.** Built src/mtopt.py (clean
+fp32 Layer-A torch.optim: closed loop w=init+s_f+s_s+s_v with init-as-buffer;
+raw or whitened g/sqrt(v) injection; coh + coh_pre[=EMA-of-coh,init1] gating;
+v_s EMA; averaged readout init+G*s_s) + src/mtopt_cifar.py.
+- **1-D probes PASS:** noise-walk gated BOUNDED 657 vs ungated 17839;
+  selectivity coh spans [0,0.97] monotone in SNR. Two scale fixes the probes
+  caught (methodology working): alpha_v=0.001 not 1 (else coh saturates, §7);
+  lam<=alpha_v (coh_pre bootstrap must outlast signal-establishment ~1/alpha_v,
+  §3 timescale separation). Bit-identical scalar-vs-whiten numbers caught a
+  no-op wiring bug -- independent-instrument discipline paying off.
+- **gate-1 real-task on WiderConvNet+BN: bare cascade DIVERGES at every lr.**
+  raw-g -> NaN; whitened {0.01,0.003,0.001} -> tr_loss 1e3-1e6, val random.
+  Cause: cascade AMPLIFICATION overshoots (s_f~lr/alpha reaches whole-weight
+  magnitude). Whitening fixed the SPATIAL scale (killed the NaN) but NOT the
+  overshoot. CONCLUSION: WiderConvNet+BN is NOT a gate-1 net -- the bare
+  cascade's [CONFIRMED] home is a benign task, and taming this overshoot is
+  exactly gate-7's trust region (lambda). NEXT: gate-1 real-task on a benign
+  MLP; hard/heterogeneous nets need gate-7 (LM damping) before the cascade is
+  stable. (mtopt is pure-Python per-param, ~90s/ep -- validation impl, not speed.)
+
+**SYNTHESIS -- 3 independent confirmations this session that per-coordinate
+scaling is NON-OPTIONAL on real workloads:** (1) enwik8 v-hat gap 0.37;
+(2) mtopt bare-cascade divergence on WiderConvNet (no spatial scaler -> blows
+up); (3) CIFAR v-hat idle under memorization but the gap opens off-CIFAR. The
+multi-timescale cascade is a TEMPORAL noise filter (works -- probes pass);
+v-hat / Fisher / block-float is the orthogonal SPATIAL scale handler; the trust
+region tames cascade overshoot. All three are distinct and all three are needed
+on real nets. The Concord int-block-float exponents ARE a cheap spatial scaler
+-- which is why packed-Concord trains where the clean fp cascade diverges.

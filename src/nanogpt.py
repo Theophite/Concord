@@ -118,11 +118,15 @@ class GPT(nn.Module):
 
 # ---------------------- char-level data ----------------------
 def load_char_data(path, device, train_frac=0.9):
-    with open(path, 'r', encoding='utf-8') as f:
-        text = f.read()
-    chars = sorted(set(text))
-    stoi = {c: i for i, c in enumerate(chars)}
-    data = torch.tensor([stoi[c] for c in text], dtype=torch.long)
+    import numpy as np
+    with open(path, 'rb') as f:                       # byte-level; enwik8-safe
+        b = np.frombuffer(f.read(), dtype=np.uint8)
+    uniq = np.unique(b)
+    lut = np.zeros(256, dtype=np.int64)
+    lut[uniq] = np.arange(len(uniq))                  # present bytes -> 0..V-1
+    data = torch.from_numpy(lut[b])
+    stoi = {int(u): i for i, u in enumerate(uniq)}
+    chars = uniq
     n = int(train_frac * len(data))
     train = data[:n].to(device)
     val = data[n:].to(device)
