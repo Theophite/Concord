@@ -713,6 +713,15 @@ tiny-shakespeare (1.1M chars), 5000 iters, bsz=64, seed 0, NO dropout.
   needs NEITHER (final~best, stable) and REJECTS dropout (self-regularizes ->
   double-damp underfits to 1.81). Dropout helped only AdamW. Concord trades
   ~0.065 for tuning-free + overfit-robust + ~1/3 optimizer-state bits.
-  (Caveat: Concord's chase lr=0.05 NOT swept for nanoGPT -- a sweep may close
-  some of the 0.065.) NEXT: rung #2 data>>capacity (neither memorizes = pure
+  NEXT: rung #2 data>>capacity (neither memorizes = pure
   optimization-quality test); rung #3 washing-spectrum (none/full/single).
+- **Rung #1b -- Concord chase-lr sweep (done, no dropout, 5000 iter):** clean
+  U-shape, min at lr=0.03.
+  | lr | 0.015 | 0.02 | 0.03 | 0.05 | 0.07 |
+  | best val | 1.580 | 1.556 | **1.5303** | 1.5364 | ~1.55 |
+  TUNED Concord = 1.5303 (lr=0.03). vs AdamW-tuned 1.4713 -> **GAP 0.059**,
+  ROBUST (lr tuning shaved only 0.006). The ~0.06 v-hat cost is REAL, not a
+  tuning artifact (lr is Concord's dominant knob). Honest standing: raw Concord
+  ~0.06 nats (~4%) behind tuned AdamW on char-shakespeare, at 1/3 the
+  optimizer-state bits, no dropout/early-stop, far more overfit-robust. That
+  0.06 = the target for the low-rank/freezing v-hat surrogate.
