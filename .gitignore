@@ -17,3 +17,6 @@ data/
 
 # Training logs (transient; the curated record is in SESSION_NOTES_*.md)
 *.log
+
+# Run-output dir (saved weights, logs, figures, sweep txt -- all regenerable)
+compare_out/

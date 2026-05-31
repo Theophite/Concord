@@ -888,11 +888,13 @@ def _rebalance_packed_decide_kernel(
     packed_ptr,
     row_exp_ptr, col_exp_ptr,
     row_max_ptr, col_max_ptr,
-    N, K, MAX_M, EXP_MAX,
+    row_i8med_ptr, col_i8med_ptr,
+    N, K, MAX_M, EXP_MAX, EXP_MIN,
     seed_ptr,
     stride_pn, stride_pk,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ALLOW_TICKDOWN: tl.constexpr,
 ):
     """Decide per-row/col exponent tick-ups from row_max/col_max and
     rebalance the packed accumulators by `pos` ∈ {0, +1, +2}.
@@ -922,14 +924,39 @@ def _rebalance_packed_decide_kernel(
 
     row_max = tl.load(row_max_ptr + offs_n, mask=n_mask, other=0)
     col_max = tl.load(col_max_ptr + offs_k, mask=k_mask, other=0)
+    row_i8med = tl.load(row_i8med_ptr + offs_n, mask=n_mask, other=127)
+    col_i8med = tl.load(col_i8med_ptr + offs_k, mask=k_mask, other=127)
     row_exp = tl.load(row_exp_ptr + offs_n, mask=n_mask, other=0)
     col_exp = tl.load(col_exp_ptr + offs_k, mask=k_mask, other=0)
 
+    # ASYMMETRIC ratchet (matches the asymmetric stakes):
+    #   tick UP -- eager, MAX-driven: any single element overflowing (row_max >
+    #     MAX_M) saturates the block, so bump the exponent immediately.
+    #   tick DOWN -- lazy, MEDIAN-driven: only when the BULK underflows (i8med,
+    #     the per-row/col median |s_slow|/|v_slow|, <= 31) does the block read as
+    #     genuinely underused. Left-shift the whole block; the MINORITY of large
+    #     elements (> ~31) saturate on the shift (we do NOT require a leading
+    #     zero on every mantissa -- the bulk reclaims precision, outliers clip).
+    #   The median (vs max) is what kills the growth-phase churn: the max dips
+    #   transiently during growth (-> false tick-down -> oscillation -> extra
+    #   lossy tick-ups), but the median only drops when the block has settled low.
+    # Up/down mutually exclusive per dim (row_max can't be both > and <= MAX_M).
     row_up = (row_max > MAX_M) & (row_exp < EXP_MAX)
     col_up = (col_max > MAX_M) & (col_exp < EXP_MAX)
-    row_t = row_up.to(tl.int32)
-    col_t = col_up.to(tl.int32)
-    pos = row_t[:, None] + col_t[None, :]   # in {0, 1, 2}
+    # tick-down OFF by default: empirically it HURT the packed v-hat (1.43->1.17
+    # no-td vs 1.26 max-gated vs 1.35 median-gated) -- per-step tick-down
+    # oscillates with the v-hat chase's exponent ratcheting, and the median gate
+    # additionally clips legit max weights (median<max for any spread). Kept
+    # behind ALLOW_TICKDOWN for a future settled-phase-only experiment.
+    if ALLOW_TICKDOWN:
+        row_dn = (row_max <= MAX_M) & (row_i8med <= 31) & (row_exp > EXP_MIN)
+        col_dn = (col_max <= MAX_M) & (col_i8med <= 31) & (col_exp > EXP_MIN)
+    else:
+        row_dn = row_max < 0      # all-False (row_max >= 0 always)
+        col_dn = col_max < 0
+    row_t = row_up.to(tl.int32) - row_dn.to(tl.int32)   # {-1, 0, +1}
+    col_t = col_up.to(tl.int32) - col_dn.to(tl.int32)
+    net = row_t[:, None] + col_t[None, :]               # in {-2, ..., +2}
 
     p_off = offs_n[:, None] * stride_pn + offs_k[None, :] * stride_pk
     packed = tl.load(packed_ptr + p_off, mask=nk_mask, other=0).to(tl.int32)
@@ -937,42 +964,46 @@ def _rebalance_packed_decide_kernel(
     s_slow_i8 = (packed << 16) >> 24
     v_slow_i8 = (packed << 24) >> 24
 
-    # SR-right-shift each segment. For s_slow_i8 and v_slow_i8, also
-    # compute the mantissa-unit residual that the quantization "lost"
-    # — this residual gets added to s_fast (where it's representable
-    # at fine granularity).
+    # Bidirectional rebalance per element by sign of `net`:
+    #   net > 0: SR-RIGHT-shift all 3 (tick-up); int8 s_slow/v_slow
+    #            quantization residual migrated into s_fast (fine granularity).
+    #   net < 0: LOSSLESS LEFT-shift all 3 (tick-down) — exponent decreased so
+    #            the mantissa must grow; no rounding/residual. The upstream int8
+    #            headroom gate (i8max<=31) guarantees the <<2 worst case stays
+    #            in int8 range.
+    #   net = 0: unchanged (rsh=0 makes the up-path an identity).
     rand_off = offs_n[:, None] * K + offs_k[None, :]
-    two_pos = tl.exp2(pos.to(tl.float32))
+    rsh = tl.maximum(net, 0)              # right-shift amount (tick-up) >= 0
+    lsh = tl.maximum(-net, 0)             # left-shift amount (tick-down) >= 0
+    take_left = net < 0
+    two_pos = tl.exp2(rsh.to(tl.float32))
 
-    # s_fast: standard SR-right-shift (its LSB is the "fast" bit;
-    # losing it to SR is fine since chase + grad refills s_fast).
-    q_fast = s_fast >> pos
-    rem_fast = (s_fast - (q_fast << pos)).to(tl.float32)
+    # --- tick-UP path (SR-right-shift) ---
+    q_fast = s_fast >> rsh
+    rem_fast = (s_fast - (q_fast << rsh)).to(tl.float32)
     up_fast = (tl.rand(seed, rand_off) * two_pos < rem_fast).to(tl.int32)
     s_fast_shifted = q_fast + up_fast
 
-    # s_slow_i8: SR-right-shift, then compute the mantissa residual.
-    # residual = (s_slow_i8 * 128) / 2^pos - new_s_slow_i8 * 128
-    #          = (s_slow_i8 << (7 - pos)) - (s_slow_new << 7)
-    # For pos=1: residual ∈ {-64, 0, +64} mantissa per element.
-    q_slow = s_slow_i8 >> pos
-    rem_slow = (s_slow_i8 - (q_slow << pos)).to(tl.float32)
+    q_slow = s_slow_i8 >> rsh
+    rem_slow = (s_slow_i8 - (q_slow << rsh)).to(tl.float32)
     up_slow = (tl.rand(seed, rand_off + N * K) * two_pos < rem_slow).to(tl.int32)
-    s_slow_new = q_slow + up_slow
-    # Mantissa residual in int math (works for pos in {0, 1, 2}):
-    s_slow_residual = (s_slow_i8 << (7 - pos)) - (s_slow_new << 7)
+    s_slow_up = q_slow + up_slow
+    # Mantissa residual in int math (rsh in {0,1,2}): (s_slow*128)/2^rsh - new*128
+    s_slow_residual = (s_slow_i8 << (7 - rsh)) - (s_slow_up << 7)
 
-    # v_slow_i8: same pattern.
-    q_v = v_slow_i8 >> pos
-    rem_v = (v_slow_i8 - (q_v << pos)).to(tl.float32)
+    q_v = v_slow_i8 >> rsh
+    rem_v = (v_slow_i8 - (q_v << rsh)).to(tl.float32)
     up_v = (tl.rand(seed, rand_off + 2 * N * K) * two_pos < rem_v).to(tl.int32)
-    v_new = q_v + up_v
-    v_residual = (v_slow_i8 << (7 - pos)) - (v_new << 7)
+    v_up = q_v + up_v
+    v_residual = (v_slow_i8 << (7 - rsh)) - (v_up << 7)
 
-    # Migrate consolidated-state residuals into s_fast. Combined residual
-    # is bounded by ±(64 + 64) = ±128 for pos=1, ±(96 + 96) = ±192 for pos=2.
-    # Always within int16 range when added to s_fast_shifted.
-    s_fast_new = s_fast_shifted + s_slow_residual + v_residual
+    # Combined residual bounded by ±192 (rsh=2), within int16 added to s_fast.
+    s_fast_up = s_fast_shifted + s_slow_residual + v_residual
+
+    # --- tick-DOWN path (lossless left-shift) + select per element ---
+    s_fast_new = tl.where(take_left, s_fast << lsh, s_fast_up)
+    s_slow_new = tl.where(take_left, s_slow_i8 << lsh, s_slow_up)
+    v_new      = tl.where(take_left, v_slow_i8 << lsh, v_up)
 
     # Clamp + repack.
     s_fast_c = tl.minimum(tl.maximum(s_fast_new, -32768), 32767)
@@ -989,6 +1020,21 @@ def _rebalance_packed_decide_kernel(
         tl.store(row_exp_ptr + offs_n, row_exp + row_t, mask=n_mask)
     if pid_n == 0:
         tl.store(col_exp_ptr + offs_k, col_exp + col_t, mask=k_mask)
+
+
+# Optional rebalance instrumentation (set to a dict via reset_reb_stats() to
+# accumulate tick-up/down fire counts + left-shift clip counts; None = off).
+_REB_STATS = None
+
+
+def reset_reb_stats():
+    global _REB_STATS
+    _REB_STATS = dict(calls=0, tickup_dim=0, tickdown_dim=0, dim_total=0,
+                      clip_elems=0, elem_total=0)
+
+
+def get_reb_stats():
+    return _REB_STATS
 
 
 _REB_SEED_CACHE = {}
@@ -1008,10 +1054,18 @@ def _ensure_reb_seed_tensor(device):
 
 
 def rebalance_packed(packed_w, row_exp, col_exp, row_max, col_max,
-                       MAX_M=24000, EXP_MAX=7, seed_buf=None):
-    """Apply the rebalance ratchet (tick-up exponent if row/col max
-    exceeds threshold). Assumes row_max/col_max already populated by a
-    prior apply kernel.
+                       MAX_M=24000, EXP_MAX=7, EXP_MIN=-8, seed_buf=None,
+                       allow_tickdown=False):
+    """Apply the rebalance ratchet: tick-UP the exponent if row/col live
+    mantissa exceeds MAX_M (regain headroom), tick-DOWN to reclaim precision
+    if the row/col has headroom AND its int8 s_slow/v_slow magnitudes are
+    small enough that a left-shift can't overflow. Assumes row_max/col_max
+    already populated by a prior apply kernel.
+
+    The per-row/col int8 magnitude max is computed here (torch, capturable:
+    no host sync) from packed_w and gates tick-down -- m_eff being small is
+    NOT sufficient (s_fast can cancel a large s_slow), so we check the actual
+    int8 accumulators that would overflow on the left-shift.
 
     seed_buf is a 1-elem int32 device tensor. Caller should bump it in
     place (e.g., `seed_buf.add_(1)`) before each call so successive
@@ -1022,14 +1076,44 @@ def rebalance_packed(packed_w, row_exp, col_exp, row_max, col_max,
     if seed_buf is None:
         seed_buf = _ensure_reb_seed_tensor(packed_w.device)
     N, K = packed_w.shape
+    # int8 s_slow / v_slow magnitudes (sign-extended via int32 arithmetic
+    # shifts), reduced to per-row/col MEDIAN -> the "bulk underflow" signal that
+    # gates the asymmetric tick-down (median small = block genuinely underused;
+    # robust to the transient-max dips that churn a max-gated tick-down).
+    s_slow_i8 = (packed_w << 16) >> 24
+    v_slow_i8 = (packed_w << 24) >> 24
+    i8mag = torch.maximum(s_slow_i8.abs(), v_slow_i8.abs())        # [N,K] int32
+    row_i8med = i8mag.median(dim=1).values.to(torch.int32)        # [N]
+    col_i8med = i8mag.median(dim=0).values.to(torch.int32)        # [K]
+    if _REB_STATS is not None:
+        re = row_exp.to(torch.int32); ce = col_exp.to(torch.int32)
+        ru = (row_max > MAX_M) & (re < EXP_MAX)
+        cu = (col_max > MAX_M) & (ce < EXP_MAX)
+        if allow_tickdown:
+            rd = (row_max <= MAX_M) & (row_i8med <= 31) & (re > EXP_MIN)
+            cd = (col_max <= MAX_M) & (col_i8med <= 31) & (ce > EXP_MIN)
+        else:
+            rd = torch.zeros_like(ru); cd = torch.zeros_like(cu)
+        rt = ru.to(torch.int32) - rd.to(torch.int32)
+        ct = cu.to(torch.int32) - cd.to(torch.int32)
+        lsh = (-(rt[:, None] + ct[None, :])).clamp(min=0).to(torch.float32)
+        clip = ((i8mag.to(torch.float32) * torch.exp2(lsh)) > 127).sum().item()
+        _REB_STATS['calls'] += 1
+        _REB_STATS['tickup_dim'] += int(ru.sum() + cu.sum())
+        _REB_STATS['tickdown_dim'] += int(rd.sum() + cd.sum())
+        _REB_STATS['dim_total'] += N + K
+        _REB_STATS['clip_elems'] += clip
+        _REB_STATS['elem_total'] += N * K
     BLOCK_N, BLOCK_K = 32, 64
     grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K))
     _rebalance_packed_decide_kernel[grid](
         packed_w, row_exp, col_exp, row_max, col_max,
-        N, K, int(MAX_M), int(EXP_MAX),
+        row_i8med, col_i8med,
+        N, K, int(MAX_M), int(EXP_MAX), int(EXP_MIN),
         seed_buf,
         packed_w.stride(0), packed_w.stride(1),
         BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        ALLOW_TICKDOWN=bool(allow_tickdown),
     )
 
 
@@ -1262,6 +1346,10 @@ class ConcordLinearPackedB(nn.Module):
         # — replaces the hard step_cap clamp with a smooth SNR gate.
         # δ²=1/step_cap² matches the legacy asymptotic max step.
         self.gf_trust_delta_sq = 0.0
+        # Bidirectional rebalance tick-down (reclaim exponent precision). OFF by
+        # default: it hurt the packed v-hat (oscillates with the chase). Set True
+        # to experiment (e.g. a settled-phase-only schedule).
+        self.allow_tickdown = False
         self.wd_sv = 0.0
         self.wd_sf = 0.0
         self.mass_preserve_v = True   # default to mass-preserving v_slow leak
@@ -1599,8 +1687,8 @@ class ConcordLinearPackedB(nn.Module):
         rebalance_packed(
             self.packed_w, self.row_exp, self.col_exp,
             rmbuf, cmbuf,
-            MAX_M=self.MAX_M, EXP_MAX=self.EXP_MAX,
-            seed_buf=self._reb_seed,
+            MAX_M=self.MAX_M, EXP_MAX=self.EXP_MAX, EXP_MIN=self.EXP_MIN,
+            seed_buf=self._reb_seed, allow_tickdown=self.allow_tickdown,
         )
 
     @torch.no_grad()
