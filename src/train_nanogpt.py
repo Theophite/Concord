@@ -54,23 +54,26 @@ def _vproxy_vhat(m):
 
 @torch.no_grad()
 def _consolidated_buf(m, which="s"):
-    """The CONSOLIDATED (trusted) weight = 2*slow*128*scale -- drop the transient
-    s_fast and deploy 2x ONE slow accumulator (the other slow term ~= it via the
-    leak, so 2x recovers the full position s_slow*128 + v_slow*128). Lookahead
-    'slow weights'.
-      which='v' -> v_slow_i8 (bits 7:0,  long-time ANCHOR, leak rate alpha_v_fast
-                   ~0.001 => ~1000-step EMA; the MOST denoised / noise-resistant).
-      which='s' -> s_slow_i8 (bits 15:8, medium POSITION bearer, chase rate alpha
-                   ~0.1 => ~10-step timescale).
+    """The CONSOLIDATED (trusted) weight -- drop the transient s_fast and deploy only
+    the slow path. m_eff = s_slow*128 + s_fast + v_slow*128, so cutting s_fast leaves
+    the denoised position. If a gate strands noise in s_fast, deploying this should
+    beat the live m_eff. Variants:
+      'sv'  -> (s_slow + v_slow)*128   : EXACTLY m_eff minus s_fast (the true slow sum).
+      's2v' -> (s_slow + 2*v_slow)*128 : weight the long ANCHOR double (v_slow = leak
+               rate ~0.001 => ~1000-step EMA, the most denoised term).
+      's'   -> 2*s_slow*128            : 2x the medium position (legacy; v_slow~=s_slow).
+      'v'   -> 2*v_slow*128            : 2x the long anchor    (legacy).
     Returns a bf16 buffer to swap into the forward's _bf16_weight_buf."""
     pw = m.packed_w
-    if which == "v":
-        slow = ((pw << 24) >> 24).to(torch.float32)   # bits 7:0  v_slow_i8
-    else:
-        slow = ((pw << 16) >> 24).to(torch.float32)   # bits 15:8 s_slow_i8
+    s_slow = ((pw << 16) >> 24).to(torch.float32)     # bits 15:8 s_slow_i8
+    v_slow = ((pw << 24) >> 24).to(torch.float32)     # bits 7:0  v_slow_i8
+    if   which == "sv":  slow = s_slow + v_slow
+    elif which == "s2v": slow = s_slow + 2.0 * v_slow
+    elif which == "v":   slow = 2.0 * v_slow
+    else:                slow = 2.0 * s_slow          # "s"
     exp = (m.row_exp.float()[:, None] + m.col_exp.float()[None, :] - m.MANTISSA_BIAS)
     scale = torch.exp2(exp)
-    return (2.0 * slow * 128.0 * scale).to(m._bf16_weight_buf.dtype)
+    return (slow * 128.0 * scale).to(m._bf16_weight_buf.dtype)
 
 
 @torch.no_grad()
@@ -239,6 +242,12 @@ def main():
     ap.add_argument("--watch_dw", action="store_true",
                     help="log median per-step |dW| (the adjusted-gradient magnitude) "
                          "of the deployed weight, per eval.")
+    ap.add_argument("--watch_accum", action="store_true",
+                    help="end-of-run readout of where the live weight mass sits across "
+                         "the cascade: mean|s_fast| / |s_slow|*128 / |v_slow|*128 and the "
+                         "per-element s_fast share. Tests whether a gate that refuses to "
+                         "chase noise into s_slow merely STRANDS it in s_fast (still in "
+                         "m_eff = s_slow*128 + s_fast + v_slow*128, so still in the weight).")
     ap.add_argument("--coh_gate", action="store_true",
                     help="engage the FIXED coherence gate (Wiener coh=S/(S+noise^2) "
                          "via enable_cohpre + set_fixed_coh): SNR-gated commitment, "
@@ -259,6 +268,20 @@ def main():
                          "0=coh-gated). Start at the normal leak, move to noise-gating it.")
     ap.add_argument("--ratio_coh_floor_epochs", type=float, default=1.0,
                     help="cosine-decay both ratio-coh floors to 0 over this many epochs.")
+    ap.add_argument("--ratio_chase_floor_min", type=float, default=0.0,
+                    help="PERMANENT floor the chase decays TO (>0 keeps minimum "
+                         "consolidation -> bounds s_fast stranding).")
+    ap.add_argument("--ratio_leak_floor_min", type=float, default=0.0,
+                    help="PERMANENT floor the leak decays TO. 1.0 = drift-leak (leak "
+                         "coh-INDEPENDENT, pure alpha_v_fast*d_sv -> v_slow tracks).")
+    ap.add_argument("--fast_gain_anneal", action="store_true",
+                    help="anneal s_fast share of the FORWARD weight gamma:1->0 over "
+                         "training; the loss drives signal into the slow path and the "
+                         "deployed weight becomes s_slow*128 + v_slow*128 (drop s_fast).")
+    ap.add_argument("--fast_gain_frac", type=float, default=1.0,
+                    help="fraction of max_iters over which gamma goes 1->fast_gain_final.")
+    ap.add_argument("--fast_gain_final", type=float, default=0.0,
+                    help="target gamma at end of anneal (0.0 = fully drop s_fast).")
     ap.add_argument("--tick_down", action="store_true",
                     help="enable bidirectional rebalance (median-gated tick-down "
                          "to reclaim exponent precision). Default off (1.17 recipe).")
@@ -367,10 +390,10 @@ def main():
     floor_horizon = max(1, int(args.ratio_coh_floor_epochs
                                * (len(train) // (args.bsz * args.block_size))))
 
-    def cos_floor(start, it):
+    def cos_floor(start, it, end=0.0):
         if it >= floor_horizon:
-            return 0.0
-        return start * 0.5 * (1.0 + math.cos(math.pi * it / floor_horizon))
+            return end
+        return end + (start - end) * 0.5 * (1.0 + math.cos(math.pi * it / floor_horizon))
 
     # --- comparability: dedicated batch-sampling RNG, decoupled from the
     # model/optimizer RNG (Concord's stochastic rounding draws RNG that AdamW
@@ -396,16 +419,25 @@ def main():
     model.train()
     t0 = time.time()
     best_val = 1e9
+    _CONS_VARIANTS = ("sv", "s2v", "v", "s")   # deployed-weight candidates (drop s_fast)
+    best_cons = {k: 1e9 for k in _CONS_VARIANTS}
     prev_W = None; prev_it = 0
     for it in range(args.max_iters):
+        if args.fast_gain_anneal and args.mode == "concord" and layers:
+            _fh = max(1, int(args.fast_gain_frac * args.max_iters))
+            _fg = args.fast_gain_final if it >= _fh else (
+                args.fast_gain_final + (1.0 - args.fast_gain_final)
+                * 0.5 * (1.0 + math.cos(math.pi * it / _fh)))
+            for _m in layers:
+                _m.fast_gain = _fg
         f = lr_at(it) / peak_lr            # schedule factor in [min_frac, 1]
         warm = min(1.0, (it + 1) / args.warmup_iters) if args.warmup_iters > 0 else 1.0
         lr = peak_lr * (warm if args.const_lr else f)
         if args.mode == "concord" and args.gate_cosine:
             set_gate_gain(f)               # route the cosine onto the commitment gate
         if args.mode == "concord" and args.ratio_coh:
-            set_ratio_coh_floors(cos_floor(args.ratio_chase_floor, it),
-                                 cos_floor(args.ratio_leak_floor, it))
+            set_ratio_coh_floors(cos_floor(args.ratio_chase_floor, it, args.ratio_chase_floor_min),
+                                 cos_floor(args.ratio_leak_floor, it, args.ratio_leak_floor_min))
         if args.mode == "concord":
             for m in layers:
                 m.lr = lr
@@ -425,16 +457,17 @@ def main():
             if args.eval_consolidated and args.mode == "concord" and layers:
                 saved = [m._bf16_weight_buf for m in layers]
                 Lcons = {}
-                for which in ("v", "s"):            # 2x v_slow (anchor) and 2x s_slow
+                for which in _CONS_VARIANTS:        # (s+v), (s+2v), 2v, 2s -- all drop s_fast
                     eval_gen.set_state(gstate)      # identical batches every variant
                     for m in layers:
                         m._bf16_weight_buf = _consolidated_buf(m, which)
                     Lcons[which] = estimate_loss(model, train, val, args.bsz,
                                    args.block_size, device, args.eval_iters, gen=eval_gen)
+                    best_cons[which] = min(best_cons[which], Lcons[which]['val'])
                 for m, s in zip(layers, saved):
                     m._bf16_weight_buf = s
-                expstr += (f"  2v:T={Lcons['v']['train']:.4f}/V={Lcons['v']['val']:.4f}"
-                           f"  2s:T={Lcons['s']['train']:.4f}/V={Lcons['s']['val']:.4f}")
+                expstr += "  " + " ".join(f"{w}:V={Lcons[w]['val']:.4f}"
+                                          for w in _CONS_VARIANTS)
             if args.reb_stats and args.mode == "concord" and layers:
                 em = sum((m.row_exp.float().mean() + m.col_exp.float().mean()).item()
                          for m in layers) / len(layers)
@@ -482,6 +515,27 @@ def main():
     print(f"\n[{tag}] DONE {(time.time()-t0)/60:.1f} min  "
           f"final val {L['val']:.4f}  best val {best_val:.4f}  "
           f"peak_mem {torch.cuda.max_memory_allocated()/1e6:.0f}MB", flush=True)
+    if args.eval_consolidated and args.mode == "concord" and layers:
+        print(f"[{tag}] BEST val by deployed weight:  live(m_eff)={best_val:.4f}  "
+              + "  ".join(f"{w}={best_cons[w]:.4f}" for w in _CONS_VARIANTS), flush=True)
+
+    if args.watch_accum and args.mode == "concord" and layers:
+        # Where does the mass live at convergence? s_fast is part of m_eff, so noise the
+        # gate keeps OUT of s_slow but leaves IN s_fast is still in the deployed weight.
+        sf = ss = vs = sf_sh = 0.0
+        for m in layers:
+            pw = m.packed_w
+            a_f = (pw >> 16).to(torch.float32).abs()
+            a_s = ((pw << 16) >> 24).to(torch.float32).abs() * 128.0
+            a_v = ((pw << 24) >> 24).to(torch.float32).abs() * 128.0
+            sf += a_f.mean().item(); ss += a_s.mean().item(); vs += a_v.mean().item()
+            sf_sh += (a_f / (a_f + a_s + a_v + 1e-9)).mean().item()   # scale-invariant
+        n = len(layers); sf /= n; ss /= n; vs /= n; sf_sh /= n
+        tot = sf + ss + vs + 1e-9
+        print(f"\n[{tag}] WATCH accum ({n} layers, mean|.| in m_eff mantissa units): "
+              f"s_fast={sf:.2f} ({100*sf/tot:.1f}%)  s_slow*128={ss:.2f} ({100*ss/tot:.1f}%)  "
+              f"v_slow*128={vs:.2f} ({100*vs/tot:.1f}%)  |  per-elem s_fast share="
+              f"{100*sf_sh:.1f}%", flush=True)
 
     if args.watch_vproxy and args.mode == "concord" and layers:
         mid = len(layers) // 2

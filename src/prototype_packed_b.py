@@ -1383,6 +1383,8 @@ class ConcordLinearPackedB(nn.Module):
                                # 0 = off (uniform cautious wd). >0 enables the
                                # routing (evaporate incoherent s_fast, keep κ<α).
         self._coh_pre = None   # coherence-gate EMA; ALLOCATED BELOW (default ON,
+        self.fast_gain = 1.0   # gate s_fast share of the FORWARD weight (1.0=full
+                               # m_eff; ->0 deploys slow+v_slow). Packed keeps full s_fast.
                                # validated). disable_cohpre() sets it back to None.
         self.alpha_v_fast = 0.001
         # Derived from rates (see compute_drift_cancel_C docstring).
@@ -1718,6 +1720,17 @@ class ConcordLinearPackedB(nn.Module):
         if x.dtype != torch.bfloat16:
             x = x.to(torch.bfloat16)
         wbuf, rmbuf, cmbuf = self._ensure_buffers()
+        fg = self.fast_gain
+        if fg < 1.0:                       # smooth-gate s_fast OUT of the forward weight
+            with torch.no_grad():          # packed keeps full s_fast; grad flows through
+                pw = self.packed_w         # the gated weight -> loss drives signal to slow
+                sf = (pw >> 16).to(torch.float32)
+                ss = ((pw << 16) >> 24).to(torch.float32)
+                vs = ((pw << 24) >> 24).to(torch.float32)
+                exp = (self.row_exp.float()[:, None] + self.col_exp.float()[None, :]
+                       - self.MANTISSA_BIAS)
+                m_gated = (ss * 128.0 + fg * sf + vs * 128.0) * torch.exp2(exp)
+                wbuf.copy_(m_gated.to(wbuf.dtype))
         # Pass the lr DEVICE TENSOR (not scalar) so it's the same tensor
         # across forward calls — the captured CUDA graph sees a stable
         # pointer, and updates via `m.lr = X` (which .fill_()'s the buf)

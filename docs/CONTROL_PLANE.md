@@ -295,3 +295,57 @@ horizon, AdamW = lr1e-3 wd0.1 (canonical baseline). FAIR matched-horizon final v
   rank-0.5 / rank-2 check if we want the full curve.
 - Build path: rank-1 v̂ already exists in the packed kernel (v_row/v_col Adafactor,
   tasks #49/#117) — wire it into the enwik8 Concord run as the miserly v̂.
+
+=== OVERFIT REGIME: STRANDING + UN-STRANDING (2026-05-31) ===
+Decisive test built: 10.78M-param GPT on tiny-shakespeare (1.1MB) -> capacity>>data ->
+strong overfit. wd=0 everywhere (isolate each optimizer's IMPLICIT regularization), shared
+init (seed 0) + data_seed. Metric: BEST val (early-stop floor) + deployed-weight variants
+(--eval_consolidated: live=m_eff vs sv=(s_slow+v_slow)*128 vs s2v vs 2v vs 2s, dropping
+s_fast). New diagnostics: --watch_accum (mass split s_fast/s_slow/v_slow in m_eff).
+
+FOUR-ARM OVERFIT (best val | final | rise):
+  AdamW(lr1e-3,wd0) 1.534 | 4.629 | +3.09   (memorizes, val explodes 3x)
+  nogate            1.566 | 3.257 | +1.69   (Concord base dynamics resist overfit)
+  gate(coh_pre,64b) 1.584 | 3.748 | +1.91   (gate HURTS: worse best AND rise vs nogate)
+  ratio(32b)        1.576 | 3.313 | +1.75
+Finding 1: Concord's int8 slow accumulators structurally resist the catastrophic overfit
+AdamW shows; the win is the BASE cascade, not the gate. Finding 2: the coherence gate does
+NOT help even here -- it is the worst Concord arm.
+
+STRANDING (--watch_accum, per-elem s_fast share):
+  nogate 4.6% | gate 8.4% | ratio 57.8% (v_slow starved to 4.7%)
+The gate REFUSES to chase incoherent coords into s_slow but s_fast is part of m_eff, so the
+noise never leaves the deployed weight -- it relocates, not removes (2.6x the s_fast mass of
+nogate). Ratio-coh is catastrophic: floors decay to 0 -> chase+leak gate off -> s_fast
+balloons to 57.8%, cascade chokes. Live trains fine (signal hides in s_fast in m_eff) but
+the slow path is undeployable: deploy sv jumps to 2.65 (vs live 1.58).
+
+DEPLOYED WEIGHT (best val, drop s_fast):  live | sv | s2v
+  nogate 1.601 | 1.550 | 1.914     gate 1.584 | 1.530 | 1.844     ratio 1.576 | 2.65 | 2.67
+sv (= m_eff minus s_fast) BEATS live by ~0.05 for base+gate: s_fast carries the overfit-prone
+recent updates; the consolidated slow weight generalizes better. sv beats s2v everywhere
+(2x-v_slow OVERSHOOTS ~3x per-accumulator magnitude; the plain sum is correct). ratio's
+sv=2.65 catastrophic = the stranding, quantified.
+
+UN-STRANDING ratio-coh (kernel-free knobs; evap = lr*gf_consol*(1-coh)*s_fast, kernel L568,
+which is EXACTLY the user's rho*(1-coh)*d_fs and = gf-gated since gf=noise^2/(sig^2+noise^2)
+=1-coh; floor-min = chase/leak decay to a positive floor not 0):  best live | sv | s_fast%
+  +evap100  (gf_consol100)             1.662 | 2.103 | 7.2%
+  +evap200  (gf_consol200)             1.841 | 2.047 | 5.1%   (more drain, WORSE loss: lossy)
+  +minfloor (chase floor 0.1)          1.613 | 1.568 | 2.3%
+  +split    (floor .05 + gf_consol50)  1.560 | 1.524 | 3.8%
+  +consol   (floor .1  + gf_consol50)  1.558 | 1.517 | 2.9%
+Evap alone UN-STRANDS (s_fast 57.8->7.2%, v_slow 4.7->30.5%) but is LOSSY: with the chase
+gated ~off it DELETES incoherent-but-real signal rather than MOVING it (worse as pushed,
+1.66->1.84). Minfloor MOVES mass losslessly but banks noise into s_slow. SPLIT-THE-DIFFERENCE
+(floor banks borderline-coherent + evap trims clearly-dead) WINS: ratio+consol sv=1.517 and
++split sv=1.524 MATCH the 64-bit gate (sv 1.530) at 32 bits/param, and beat it on live
+(1.558 vs 1.584). Two combo arms agree -> not noise. fast_gain smooth-anneal (gamma:1->0,
+deploy-slow during training) did NOT help (best 1.595, final still 3.85) -- the win is the
+cascade fix, not hiding s_fast at the forward.
+
+VERDICT: ratio-coh (32b) was broken (stranding); floored-chase + (1-coh) evaporation fixes it
+to MATCH the 64-bit coh_pre gate on the deployed weight. The deployable Concord weight is
+s_slow+v_slow (drop s_fast). All OFF by default; validated recipe (+ZIP) unchanged.
+Knobs: --ratio_chase_floor_min / --ratio_leak_floor_min (floor targets), --gf_consol (evap
+rate, rho_eff=lr*gf_consol), --fast_gain_anneal, --eval_consolidated, --watch_accum.
