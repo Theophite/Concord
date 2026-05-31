@@ -142,20 +142,6 @@ def main():
                           "incoherent part of s_fast evaporates at kappa*(1-coh). "
                           "Keep kappa < alpha (0.1) so the chase bootstraps "
                           "coherence. Replaces weight_decay (set wd=0).")
-    ap.add_argument("--dev_precond_p", type=float, default=0.0,
-                     help="Free deviation-preconditioner power: divide grad_W "
-                          "by (factored (s_slow-v_slow)^2 / mean + eps)^p in "
-                          "the backward (torch, zero persistent state). "
-                          "Partial whitening, exponent k=2/(1+2p): p=0 off, "
-                          "p~1-2 closes part of the AdamW tail gap. Use "
-                          "with precond_p=0 (kernel step = grad).")
-    ap.add_argument("--dev_precond_src", type=str, default="grad",
-                     choices=["grad", "dev"],
-                     help="Preconditioner source. grad: single-sample g^2, "
-                          "factored rank-1 (E[g^2]=sigma^2 undegraded -> FULL "
-                          "whitening k=2-4p, k=0 at p=0.5 = real Adam, exp8). "
-                          "dev: slow deviation (s_slow-v_slow)^2 (self-degraded "
-                          "fixed point, partial only, lost on CIFAR).")
     ap.add_argument("--cohpre", action="store_true",
                      help="Enable coh_pre-gated acceptance: gate the chase by "
                           "coh + coh_pre*(1-coh), coh_pre = per-coord EMA of "
@@ -242,10 +228,6 @@ def main():
             m.enable_cohpre()   # coh_pre-gated acceptance (λ = alpha_v_fast)
         else:
             m.disable_cohpre()  # gate default-ON now; CIFAR recipe keeps it off unless --cohpre
-        if args.dev_precond_p > 0:
-            import prototype_packed_b as _ppb
-            _ppb._DEV_PRECOND["p"] = float(args.dev_precond_p)
-            _ppb._DEV_PRECOND["src"] = args.dev_precond_src
         m.alpha = args.alpha
         m.beta1 = args.beta1
         m.alpha_v_fast = args.alpha_v_fast

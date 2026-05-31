@@ -764,46 +764,9 @@ def _denom_diagnostic(packed_w, grad_W, row_exp, col_exp,
               flush=True)
 
 
-# ── Free deviation-preconditioner (state-less partial √v̂) ──────────
-# concord is UNwhitened (the √v̂/drift/gf denominator is inert), so its slow
-# deviation D = s_slow − v_slow carries the per-element gradient 2nd moment
-# (E[D²] ∝ E[G²]). Rank-1 factoring D² gives a free per-element scale est ∝
-# σ², and dividing grad_W by (est/mean + ε)^p partially whitens — closed-loop
-# exponent k = 2/(1+2p) (exp7): k=2 SGD → 0.67 (p=1) → 0.40 (p=2). Zero
-# persistent state — computed from the packed s_slow/v_slow each backward.
-_DEV_PRECOND = {"p": 0.0, "eps": 0.01, "src": "grad"}
-
-
-def _deviation_precondition(grad_W, packed_w, row_exp, col_exp, mantissa_bias):
-    p = _DEV_PRECOND["p"]
-    if p <= 0.0:
-        return grad_W
-    eps = _DEV_PRECOND["eps"]
-    src = _DEV_PRECOND.get("src", "grad")
-    with torch.no_grad():
-        if src == "dev":
-            # DEVIATION proxy: self-degraded fixed point, caps at PARTIAL
-            # whitening k=2/(1+2p) (exp7/exp8). Kept for A/B; lost on CIFAR.
-            s_slow_i8 = ((packed_w << 16) >> 24).to(torch.float32)
-            v_slow_i8 = ((packed_w << 24) >> 24).to(torch.float32)
-            exp = (row_exp[:, None].to(torch.float32)
-                   + col_exp[None, :].to(torch.float32) - mantissa_bias)
-            scale_fwd = torch.pow(2.0, exp)
-            D = (s_slow_i8 - v_slow_i8) * 128.0 * scale_fwd
-            base2 = D * D + 1e-12
-        else:
-            # SINGLE-SAMPLE g^2: E[g^2]=sigma^2 UNdegraded (minibatch noise,
-            # precond-independent), so rank-1 factoring reaches FULL whitening
-            # k=2-4p -> 0 at p=0.5 = real Adam (exp8). Fresh each step (not
-            # self-limiting like the deviation); rank-1 over a row+col knocks
-            # down the single-sample noise. +floor: init-safe (grad~0->no-op).
-            gf = grad_W.float()
-            base2 = gf * gf + 1e-20
-        r = base2.mean(dim=1)                                # [N] row scale
-        c = base2.mean(dim=0)                                # [K] col scale
-        est = r[:, None] * c[None, :] / r.mean()             # rank-1 ~ sigma^2
-        precond = (est / est.mean() + eps) ** p              # scale-free, ->1 init
-        return (grad_W.float() / precond).to(grad_W.dtype)
+# (Free deviation-preconditioner removed 2026-05-31: the "dev" source was
+# self-degraded / lost on CIFAR, and the "grad" source is superseded by the
+# rank-1 v-hat that is now the baked default. grad_W flows straight to apply.)
 
 
 # Use the units-correct Wiener coh = S/(S+noise²) for the coherence gate (vs the
@@ -1256,8 +1219,6 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
             grad_W = grad_W.to(torch.bfloat16)
         if not grad_W.is_contiguous():
             grad_W = grad_W.contiguous()
-        grad_W = _deviation_precondition(grad_W, ctx.packed_w, ctx.row_exp,
-                                         ctx.col_exp, ctx.mantissa_bias)
         # Only zero the rebalance bookkeeping buffers if we're going to
         # write to them — skipping the zeros saves two more kernel
         # launches per layer per backward.
@@ -1898,9 +1859,6 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
         grad_W_2d = grad_W_4d.reshape(ctx.out_channels, -1).contiguous()
         if grad_W_2d.dtype != torch.bfloat16:
             grad_W_2d = grad_W_2d.to(torch.bfloat16)
-        grad_W_2d = _deviation_precondition(grad_W_2d, ctx.packed_w,
-                                            ctx.row_exp, ctx.col_exp,
-                                            ctx.mantissa_bias)
         if ctx.track_rebalance:
             ctx.row_max_buf.zero_()
             ctx.col_max_buf.zero_()
