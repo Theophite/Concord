@@ -176,6 +176,46 @@ across all 5 evals from iter 4000.
 - **Takeaway:** consolidation = a free ~0.004-nat deploy-time win (drop s_fast, 2*s_slow),
   costless at inference. Not a training change.
 
+## TOY DIFFUSION (the target objective) — Concord within ~10% of AdamW at 5k
+src/train_diffusion.py: tiny ~2.5M UNet (32->16->8 + concat skips, GroupNorm/SiLU
+ResBlocks, sinusoidal-t MLP), hand-rolled DDPM eps-prediction on CIFAR-10, no
+diffusers dep. Shared init (load_weights) + data_seed -> identical (image,t,noise)
+draws both modes. Concord = 21 conv+linear packed-B (rank-1 v-hat recipe + coh_gate),
+aux AdamW for GroupNorm+bias. ~0.05 s/iter, both modes; both start val 1.131 @ iter0.
+**5k val eps-MSE: AdamW best 0.0321 (lr1e-3); Concord best 0.0352 (lr5e-4) = +0.0031
+(~+10%).** Concord lr U-curve (confirmed optimum 5e-4, lower UNDER-trains @5k like enwik8):
+  1e-4 .0378 | 2e-4 .0371 | 3e-4 .0369 | **5e-4 .0352** | 1e-3 .0381 | 2e-3 .0478
+AdamW: 1e-3 .0321 | 2e-4 .0336. Same signature as enwik8 (lr opt 5e-4, slightly behind
+@5k, train~=val so no overfit at 13 epochs). The ~10% gap is the familiar
+under-convergence, NOT lr -> horizon should close it. CAVEAT: eps-MSE not FID; bf16
+acts vs fp32 AdamW (storage reality). Artifacts: tools/run_diffusion{,_lr}.sh,
+compare_out/diffusion{,_lr}.log.
+
+## HORIZON SCALING — most of the "residual" was under-convergence, not a floor
+The 5k gap (Concord 1.1438 vs AdamW 1.0673 = 0.0765) was largely Concord being
+under-converged: its parsimonious high-SNR-selective descent is slower/step but keeps
+paying out long after AdamW plateaus. Same init + batch order, cosine spanning each
+horizon, AdamW = lr1e-3 wd0.1 (canonical baseline). FAIR matched-horizon final val:
+| iters | Concord | AdamW  | gap    | gap ratio |
+|-------|---------|--------|--------|-----------|
+| 5k    | 1.1438  | 1.0673 | 0.0765 | --        |
+| 10k   | 1.0527  | 1.0154 | 0.0373 | 0.49x     |
+| 20k   | 0.9999  | 0.9769 | 0.0230 | 0.62x     |
+- Concord broke **sub-1.0 at 20k (0.9999)** -- a fully int-packed optimizer within
+  **0.023 nats (~98%)** of well-tuned fp32 AdamW. ~70% of the original 5k gap was horizon.
+- Gap is shrinking but **DECELERATING** (0.49x then 0.62x per doubling), NOT clean
+  geometric -> extrapolates to a small **persistent floor ~0.015-0.02 nats** (the genuine
+  int8-mantissa/chase-vs-momentum cost), not zero.
+- **No noise-resistance edge here:** at 20k (~3.3 enwik8 passes) BOTH optimizers begin to
+  overfit -- both val-bottom at iter 18k then bounce, with similar train/val gaps (Concord
+  0.068, AdamW 0.060; Concord's marginally LARGER). The "Concord resists noise" hypothesis
+  does NOT manifest on enwik8 even at 3.3 epochs -> needs the dedicated overfitting regime
+  (smaller data / label noise) if it exists at all.
+- Going >20k on enwik8 muddies the floor question (both overfit deeper); a clean floor
+  test needs a BIGGER corpus so 20k stays <1 epoch.
+- Artifacts: tools/run_longhorizon.sh (10k), tools/run_horizon20k.sh (20k); logs
+  compare_out/{longhorizon,h20k}.log.
+
 ## Where the gap lives (from the SGD-chase 1.43 weights vs Adam 1.07)
 - **Parsimony:** SGD-chase moves 16× less (‖dC‖ 6.5 vs ‖dA‖ 117), 92% of the loss
   at 6% of the motion, lower-rank movement. Selective, not slow.
