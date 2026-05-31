@@ -422,6 +422,8 @@ def _apply_packed_adamw_kernel(
     gf_trust_delta_sq,   # fp32: δ² in step = grad/√(Var + δ²·v̂);
                           # 0 disables (legacy: clamp by step_cap only)
     gate_gain,           # fp32: scalar cosine schedule on the commitment gate
+    chase_floor,         # fp32: ratio-coh fast->slow floor (cosine ->0 over ~1 epoch)
+    leak_floor,          # fp32: ratio-coh slow->v_slow floor
                           # (1.0 = off). Anneals α·gate·s_fast consolidation.
     step_salt_ptr,
     stride_pn, stride_pk,
@@ -435,6 +437,7 @@ def _apply_packed_adamw_kernel(
     USE_GF_CONSOLIDATION: tl.constexpr,  # True → gf-gated evaporation routing
     USE_COHPRE: tl.constexpr,  # True → coh_pre-gated acceptance (chase)
     USE_FIXED_COH: tl.constexpr,  # True → Wiener coh = S/(S+noise²) (units-correct)
+    USE_RATIO_COH: tl.constexpr,  # True -> gate chase+leak by live coh, no coh_pre
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -491,7 +494,7 @@ def _apply_packed_adamw_kernel(
     # v̂ (Adafactor rank-1, W² units) feeds both the trust region and the
     # consolidation-coherence gate, so load it if either is active.
     coh = 0.0
-    if USE_GF_TRUST_REGION or USE_GF_CONSOLIDATION or USE_COHPRE:
+    if USE_GF_TRUST_REGION or USE_GF_CONSOLIDATION or USE_COHPRE or USE_RATIO_COH:
         v_row_tile = tl.load(v_row_ptr + offs_n,
                               mask=n_mask, other=0.0).to(tl.float32)
         v_col_tile = tl.load(v_col_ptr + offs_k,
@@ -500,7 +503,7 @@ def _apply_packed_adamw_kernel(
         v_hat = v_row_tile[:, None] * v_col_tile[None, :] * sum_v_inv
     if USE_GF_TRUST_REGION:
         v_proxy = v_proxy + gf_trust_delta_sq * v_hat
-    if USE_GF_CONSOLIDATION or USE_COHPRE:
+    if USE_GF_CONSOLIDATION or USE_COHPRE or USE_RATIO_COH:
         # Momentum = displacement between two time-lagged positions: the
         # mean gradient over v_slow's window is α_v·d_sv (mantissa units),
         # → W units via scale_fwd. Coherence = (mean grad)² / E[g²] ∈ [0,1]
@@ -590,7 +593,9 @@ def _apply_packed_adamw_kernel(
         # the diffusion of noise into s_slow at the source, while holding
         # converged coords (high coh_pre memory) that plain coh would drop.
         gate = 1.0
-        if USE_COHPRE:
+        if USE_RATIO_COH:
+            gate = chase_floor + (1.0 - chase_floor) * coh   # fast->slow, floored
+        elif USE_COHPRE:
             coh_pre = tl.load(coh_pre_ptr + p_off,
                               mask=nk_mask, other=1.0).to(tl.float32)
             gate = coh + coh_pre * (1.0 - coh)
@@ -611,6 +616,8 @@ def _apply_packed_adamw_kernel(
         s_slow_full_post = s_slow_i8 * 128
         gap_v_full = (s_slow_full_post - v_slow_full).to(tl.float32)
         delta_v8 = alpha_v_fast * gap_v_full / 128.0
+        if USE_RATIO_COH:
+            delta_v8 = delta_v8 * (leak_floor + (1.0 - leak_floor) * coh)   # slow->v_slow, floored
         r3 = _hash_uniform(s_fast, pos_hash, step_salt ^ 0x33335555)
         floor_v = tl.floor(delta_v8)
         frac_v = delta_v8 - floor_v
@@ -808,6 +815,33 @@ def set_coh_weighted_v(enabled):
     _COH_WEIGHTED_V = bool(enabled)
 
 
+# EXPERIMENTAL (default OFF): ratio-coherence gate. Gate BOTH the chase
+# (s_fast->s_slow) and the leak (s_slow->v_slow) by the live Wiener coh and DROP
+# coh_pre: the per-coord s_fast:s_slow:v_slow ratio then carries the accumulated
+# (established) coherence -- coherent mass settles into v_slow, noise stays in
+# s_fast -- so no fp32 coh_pre buffer (back to 32 bits/param). Pair with
+# disable_cohpre() on the layers.
+_RATIO_COH = False
+# Per-transition bootstrap floors: min flow at coh=0 so the gated cascade ignites
+# from the all-s_fast init (d_sv=0 -> coh=0 would deadlock). Cosine-decay both to 0
+# over ~one epoch -> pure coherence gating, no permanent noise leak. Global scalars.
+_RATIO_CHASE_FLOOR = 0.9     # fast -> slow  (beta1-like timescale)
+_RATIO_LEAK_FLOOR = 0.999    # slow -> v_slow (beta2-like timescale)
+
+
+def set_ratio_coh(enabled):
+    global _RATIO_COH
+    _RATIO_COH = bool(enabled)
+
+
+def set_ratio_coh_floors(chase, leak):
+    """Per-step setter for the two bootstrap floors. Schedule: cosine from 0.9
+    (fast->slow) / 0.999 (slow->v_slow) to 0 over ~one epoch."""
+    global _RATIO_CHASE_FLOOR, _RATIO_LEAK_FLOOR
+    _RATIO_CHASE_FLOOR = float(chase)
+    _RATIO_LEAK_FLOOR = float(leak)
+
+
 def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
                          row_max, col_max,
                          lr, mantissa_bias=15, alpha=0.1, beta1=0.0,
@@ -880,6 +914,8 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         float(wd_sv), float(wd_sf),
         float(gf_trust_delta_sq),
         float(_GATE_GAIN),
+        float(_RATIO_CHASE_FLOOR),
+        float(_RATIO_LEAK_FLOOR),
         step_counter,
         packed_w.stride(0), packed_w.stride(1),
         grad_W.stride(0), grad_W.stride(1),
@@ -892,6 +928,7 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         USE_GF_CONSOLIDATION=bool(use_gf_consol),
         USE_COHPRE=bool(use_cohpre),
         USE_FIXED_COH=bool(_USE_FIXED_COH),
+        USE_RATIO_COH=bool(_RATIO_COH),
     )
 
 

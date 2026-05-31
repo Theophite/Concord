@@ -27,7 +27,8 @@ import torch.nn as nn
 from nanogpt import GPT, GPTConfig, load_char_data, get_batch
 from prototype_packed_b import (ConcordLinearPackedB, reset_reb_stats,
                                 get_reb_stats, set_fixed_coh, set_gate_gain,
-                                set_coh_weighted_v)
+                                set_coh_weighted_v, set_ratio_coh,
+                                set_ratio_coh_floors)
 from optim_factored import FactoredAdam
 
 
@@ -246,6 +247,18 @@ def main():
                     help="EXPERIMENTAL: weight the rank-1 variance accumulation "
                          "(v_row/v_col) by coh_pre so v-hat fits COHERENT gradient "
                          "power only. Requires --coh_gate (needs coh_pre).")
+    ap.add_argument("--ratio_coh", action="store_true",
+                    help="EXPERIMENTAL: gate BOTH chase and v_slow leak by live coh "
+                         "and DROP coh_pre -- the s_fast:s_slow:v_slow ratio carries "
+                         "established coherence. 32 bits/param (no fp32 coh_pre buffer).")
+    ap.add_argument("--ratio_chase_floor", type=float, default=0.9,
+                    help="ratio-coh fast->slow gate floor START (1=normal chase, "
+                         "0=coh-gated); cosine-decays to 0 over ratio_coh_floor_epochs.")
+    ap.add_argument("--ratio_leak_floor", type=float, default=0.999,
+                    help="ratio-coh slow->v_slow leak floor START (1=normal leak rate, "
+                         "0=coh-gated). Start at the normal leak, move to noise-gating it.")
+    ap.add_argument("--ratio_coh_floor_epochs", type=float, default=1.0,
+                    help="cosine-decay both ratio-coh floors to 0 over this many epochs.")
     ap.add_argument("--tick_down", action="store_true",
                     help="enable bidirectional rebalance (median-gated tick-down "
                          "to reclaim exponent precision). Default off (1.17 recipe).")
@@ -306,6 +319,15 @@ def main():
         if args.coh_weighted_v:
             print(f"[{tag}] COH-WEIGHTED v-hat (normalized): rank-1 variance "
                   f"fits coherent power", flush=True)
+        set_ratio_coh(args.ratio_coh)
+        if args.ratio_coh:
+            set_fixed_coh(True)
+            for m in layers:
+                m.disable_cohpre()      # ratio-coh: no coh_pre buffer (32 bits/param)
+            print(f"[{tag}] RATIO-COH: chase {args.ratio_chase_floor}->0 / leak "
+                  f"{args.ratio_leak_floor}->0 over ~{args.ratio_coh_floor_epochs} epoch, "
+                  f"then coh-gated; coh_pre dropped (32 bits/param) on {len(layers)} "
+                  f"layers", flush=True)
         aux = [p for p in model.parameters() if p.requires_grad]
         aux_opt = torch.optim.AdamW(aux, lr=args.aux_lr, weight_decay=0.0)
         print(f"[{tag}] Concord on {len(layers)} Linears "
@@ -339,6 +361,17 @@ def main():
             f = args.lr_min_frac + 0.5 * (1 - args.lr_min_frac) * (1 + math.cos(math.pi * p))
         return peak_lr * f
 
+    # ratio-coh bootstrap floors: cosine-decay chase (0.9) / leak (0.999) -> 0 over
+    # ~one epoch, i.e. start at the normal (ungated) chase+leak and move to pure
+    # coherence-gating once the s_fast:s_slow:v_slow ratio carries the memory.
+    floor_horizon = max(1, int(args.ratio_coh_floor_epochs
+                               * (len(train) // (args.bsz * args.block_size))))
+
+    def cos_floor(start, it):
+        if it >= floor_horizon:
+            return 0.0
+        return start * 0.5 * (1.0 + math.cos(math.pi * it / floor_horizon))
+
     # --- comparability: dedicated batch-sampling RNG, decoupled from the
     # model/optimizer RNG (Concord's stochastic rounding draws RNG that AdamW
     # does not -> the default-generator batch sequences would drift apart after
@@ -370,6 +403,9 @@ def main():
         lr = peak_lr * (warm if args.const_lr else f)
         if args.mode == "concord" and args.gate_cosine:
             set_gate_gain(f)               # route the cosine onto the commitment gate
+        if args.mode == "concord" and args.ratio_coh:
+            set_ratio_coh_floors(cos_floor(args.ratio_chase_floor, it),
+                                 cos_floor(args.ratio_leak_floor, it))
         if args.mode == "concord":
             for m in layers:
                 m.lr = lr

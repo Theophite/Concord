@@ -20,3 +20,4 @@ data/
 
 # Run-output dir (saved weights, logs, figures, sweep txt -- all regenerable)
 compare_out/
+dist/

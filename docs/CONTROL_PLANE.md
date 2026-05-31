@@ -214,6 +214,29 @@ owns noise rejection. `g2 *= coh_pre/mean(coh_pre)` in the backward before the m
 - Transient: both forms ~0.12 ahead at iter 1000 (faster early commitment to coherent
   dirs), washes out by mid-training.
 
+## RATIO-COHERENCE GATE — coherence memory in the cascade, no coh_pre buffer (32 b/param)
+The coh_pre gate costs +32 bits/param (per-element fp32 EMA = 64 b/param total), breaking
+the 32-bit claim. Fix: gate BOTH the chase (s_fast->s_slow) and leak (s_slow->v_slow) by the
+LIVE Wiener coh and DROP coh_pre -- the per-coord s_fast:s_slow:v_slow ratio carries the
+established coherence (coherent mass settles into v_slow; noise stays in s_fast). Live coh is
+free (from the packed word); the ratio is the memory. USE_RATIO_COH constexpr (off ->
+bit-identical). nanogpt --ratio_coh.
+BOOTSTRAP DEADLOCK + FLOOR FIX: all-s_fast init -> s_slow=v_slow=0 -> d_sv=0 -> coh=0 ->
+gate=coh starves the chase -> deadlock (coh_pre=1-at-init was silently the bootstrap). Fix:
+per-transition bootstrap floors, factor = floor + (1-floor)*coh (floor=1 = normal ungated
+rate; floor=0 = coh-gated), cosine-decayed to 0 over ~1 epoch -- start at the normal
+chase+leak, move to coherence-gating once the ratio carries memory. fast->slow floor 0.9,
+slow->v_slow 0.999 (beta1/beta2-like). Global scalars (no buffer). set_ratio_coh_floors().
+enwik8 5k A/B (lr5e-4): gate 1.1422 (64b) | no-gate 1.1451 | ratio no-floor 1.1450
+(DEADLOCKED = no-gate) | ratio scheduled-floor 1.1461 (32b; cascade IGNITES -- exp~ -2.53
+like the gated run, NOT deadlocked-flat).
+VERDICT: the floor fixes the deadlock (ignition confirmed). enwik8 CANNOT resolve the value
+-- the whole gate/no-gate/ratio spread is a ~0.004 band (data>>capacity, consolidation
+~neutral), below the gate's 0.003 edge; the 1-epoch floor also barely engages gating in 5k.
+Mechanism built, sound, 32 b/param, off by default. Its value needs the OVERFITTING regime
+-- the decisive test for the gate, 2x-v_slow consolidation, AND ratio-coh (all neutral on
+enwik8 because there is nothing to overfit).
+
 ## HORIZON SCALING — most of the "residual" was under-convergence, not a floor
 The 5k gap (Concord 1.1438 vs AdamW 1.0673 = 0.0765) was largely Concord being
 under-converged: its parsimonious high-SNR-selective descent is slower/step but keeps
