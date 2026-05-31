@@ -26,7 +26,7 @@ import torch.nn as nn
 
 from nanogpt import GPT, GPTConfig, load_char_data, get_batch
 from prototype_packed_b import (ConcordLinearPackedB, reset_reb_stats,
-                                get_reb_stats, set_fixed_coh)
+                                get_reb_stats, set_fixed_coh, set_gate_gain)
 from optim_factored import FactoredAdam
 
 
@@ -48,6 +48,27 @@ def _vproxy_vhat(m):
     vr = m.v_row.float(); vc = m.v_col.float()
     vhat = (vr[:, None] * vc[None, :]) / (vr.sum() + 1e-30)
     return vproxy, vhat
+
+
+@torch.no_grad()
+def _consolidated_buf(m, which="s"):
+    """The CONSOLIDATED (trusted) weight = 2*slow*128*scale -- drop the transient
+    s_fast and deploy 2x ONE slow accumulator (the other slow term ~= it via the
+    leak, so 2x recovers the full position s_slow*128 + v_slow*128). Lookahead
+    'slow weights'.
+      which='v' -> v_slow_i8 (bits 7:0,  long-time ANCHOR, leak rate alpha_v_fast
+                   ~0.001 => ~1000-step EMA; the MOST denoised / noise-resistant).
+      which='s' -> s_slow_i8 (bits 15:8, medium POSITION bearer, chase rate alpha
+                   ~0.1 => ~10-step timescale).
+    Returns a bf16 buffer to swap into the forward's _bf16_weight_buf."""
+    pw = m.packed_w
+    if which == "v":
+        slow = ((pw << 24) >> 24).to(torch.float32)   # bits 7:0  v_slow_i8
+    else:
+        slow = ((pw << 16) >> 24).to(torch.float32)   # bits 15:8 s_slow_i8
+    exp = (m.row_exp.float()[:, None] + m.col_exp.float()[None, :] - m.MANTISSA_BIAS)
+    scale = torch.exp2(exp)
+    return (2.0 * slow * 128.0 * scale).to(m._bf16_weight_buf.dtype)
 
 
 @torch.no_grad()
@@ -204,6 +225,18 @@ def main():
                     help="dedicated RNG seed for batch sampling, DECOUPLED from "
                          "model/optimizer RNG -> identical batch order across "
                          "optimizers (the comparability fix).")
+    ap.add_argument("--eval_consolidated", action="store_true",
+                    help="also eval the CONSOLIDATED weight (2*s_slow, drop s_fast = "
+                         "Lookahead slow weights) on the same batches -> consV. Tests "
+                         "'deploy the trusted weight, not the s_fast-polluted live one'.")
+    ap.add_argument("--const_lr", action="store_true",
+                    help="hold lr at peak (warmup then constant; no cosine decay).")
+    ap.add_argument("--gate_cosine", action="store_true",
+                    help="route the cosine schedule onto the commitment GATE (gate_gain) "
+                         "instead of the lr. Use with --const_lr + --coh_gate.")
+    ap.add_argument("--watch_dw", action="store_true",
+                    help="log median per-step |dW| (the adjusted-gradient magnitude) "
+                         "of the deployed weight, per eval.")
     ap.add_argument("--coh_gate", action="store_true",
                     help="engage the FIXED coherence gate (Wiener coh=S/(S+noise^2) "
                          "via enable_cohpre + set_fixed_coh): SNR-gated commitment, "
@@ -318,8 +351,13 @@ def main():
     model.train()
     t0 = time.time()
     best_val = 1e9
+    prev_W = None; prev_it = 0
     for it in range(args.max_iters):
-        lr = lr_at(it)
+        f = lr_at(it) / peak_lr            # schedule factor in [min_frac, 1]
+        warm = min(1.0, (it + 1) / args.warmup_iters) if args.warmup_iters > 0 else 1.0
+        lr = peak_lr * (warm if args.const_lr else f)
+        if args.mode == "concord" and args.gate_cosine:
+            set_gate_gain(f)               # route the cosine onto the commitment gate
         if args.mode == "concord":
             for m in layers:
                 m.lr = lr
@@ -331,10 +369,24 @@ def main():
                 g['lr'] = lr
 
         if it % args.eval_interval == 0 or it == args.max_iters - 1:
+            gstate = eval_gen.get_state() if args.eval_consolidated else None
             L = estimate_loss(model, train, val, args.bsz, args.block_size,
                               device, args.eval_iters, gen=eval_gen)
             best_val = min(best_val, L['val'])
             expstr = ""
+            if args.eval_consolidated and args.mode == "concord" and layers:
+                saved = [m._bf16_weight_buf for m in layers]
+                Lcons = {}
+                for which in ("v", "s"):            # 2x v_slow (anchor) and 2x s_slow
+                    eval_gen.set_state(gstate)      # identical batches every variant
+                    for m in layers:
+                        m._bf16_weight_buf = _consolidated_buf(m, which)
+                    Lcons[which] = estimate_loss(model, train, val, args.bsz,
+                                   args.block_size, device, args.eval_iters, gen=eval_gen)
+                for m, s in zip(layers, saved):
+                    m._bf16_weight_buf = s
+                expstr += (f"  2v:T={Lcons['v']['train']:.4f}/V={Lcons['v']['val']:.4f}"
+                           f"  2s:T={Lcons['s']['train']:.4f}/V={Lcons['s']['val']:.4f}")
             if args.reb_stats and args.mode == "concord" and layers:
                 em = sum((m.row_exp.float().mean() + m.col_exp.float().mean()).item()
                          for m in layers) / len(layers)
@@ -350,6 +402,12 @@ def main():
                 expstr += f"  rho_inst={sum(ri)/len(ri):+.3f}"
                 if re_:
                     expstr += f"  rho_ema={sum(re_)/len(re_):+.3f}"
+            if args.watch_dw and args.mode == "concord" and layers:
+                curW = torch.cat([m.weight.detach().flatten().float() for m in layers])
+                if prev_W is not None and it > prev_it:
+                    dwm = ((curW - prev_W).abs().median() / (it - prev_it)).item()
+                    expstr += f"  dW/step={dwm:.2e}"
+                prev_W = curW; prev_it = it
             print(f"[{tag}] iter {it:>5}/{args.max_iters}  lr={lr:.4f}  "
                   f"train {L['train']:.4f}  val {L['val']:.4f}  "
                   f"best_val {best_val:.4f}{expstr}  ({time.time()-t0:.0f}s)", flush=True)

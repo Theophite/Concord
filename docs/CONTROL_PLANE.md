@@ -154,6 +154,28 @@ test (capacity>>data / label noise) -- where the gate's "structurally can't fit
 noise" property should yield a real generalization win (its enwik8 effect is small
 only because data>>capacity = nothing to overfit).
 
+## CONSOLIDATED / LOOKAHEAD WEIGHT — deploy s_slow, not v_slow ("double the slow weight")
+Packed word = `m_eff = s_slow*128 + s_fast + v_slow*128` (scale x). Three timescales:
+s_fast (int16, instantaneous SR-tick), s_slow (int8x128, chase target, alpha=0.1 ~10-step),
+v_slow (int8x128, long-time anchor, leak alpha_v_fast=0.001 ~1000-step EMA). Deploy a
+"consolidated/trusted" weight by dropping the transient s_fast and doubling ONE slow
+accumulator (the other ~= it, so 2x recovers the position). `--eval_consolidated` evals
+both `2*s_slow` and `2*v_slow` on identical batches alongside the live weight.
+**RESULT (gate model, lr5e-4, 5000-iter, per-eval@4999): live V=1.1546; 2*s_slow V=1.1507
+(-0.0039, BETTER); 2*v_slow V=1.1628 (+0.0082, WORSE).** Same ordering on train, robust
+across all 5 evals from iter 4000.
+- **2*s_slow WINS** — beats live on BOTH train & val: dropping the s_fast transient is a
+  pure win, AND doubling s_slow replaces the *stale* v_slow anchor with the fresh position
+  (so it beats even the literal drop-s_fast weight s_slow+v_slow, which lands ~halfway).
+- **2*v_slow LOSES** — its 1000-step EMA lags too far on a 5000-step cosine run (ends ~0.008
+  behind live). The "most denoised anchor" is too stale here.
+- **Generalization gap (V-T) ~flat: live 0.0273, 2v 0.0257, 2s 0.0275.** v_slow's is
+  marginally tightest (more averaging) but tiny — enwik8 (data>>capacity) has ~nothing to
+  overfit, so v_slow's noise-resistance can't pay for its lag. The denoised-anchor win
+  should appear only in the OVERFITTING regime (the deferred test).
+- **Takeaway:** consolidation = a free ~0.004-nat deploy-time win (drop s_fast, 2*s_slow),
+  costless at inference. Not a training change.
+
 ## Where the gap lives (from the SGD-chase 1.43 weights vs Adam 1.07)
 - **Parsimony:** SGD-chase moves 16× less (‖dC‖ 6.5 vs ‖dA‖ 117), 92% of the loss
   at 6% of the motion, lower-rank movement. Selective, not slow.

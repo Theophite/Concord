@@ -421,6 +421,8 @@ def _apply_packed_adamw_kernel(
     wd_sv, wd_sf,
     gf_trust_delta_sq,   # fp32: δ² in step = grad/√(Var + δ²·v̂);
                           # 0 disables (legacy: clamp by step_cap only)
+    gate_gain,           # fp32: scalar cosine schedule on the commitment gate
+                          # (1.0 = off). Anneals α·gate·s_fast consolidation.
     step_salt_ptr,
     stride_pn, stride_pk,
     stride_gn, stride_gk,
@@ -594,7 +596,7 @@ def _apply_packed_adamw_kernel(
             gate = coh + coh_pre * (1.0 - coh)
             coh_pre_new = (1.0 - alpha_v_fast) * coh_pre + alpha_v_fast * coh
             tl.store(coh_pre_ptr + p_off, coh_pre_new, mask=nk_mask)
-        chase_mantissa = alpha * gate * s_fast.to(tl.float32)
+        chase_mantissa = alpha * gate * gate_gain * s_fast.to(tl.float32)
         chase_int8_f = chase_mantissa / 128.0
         r2 = _hash_uniform(s_fast, pos_hash, step_salt ^ 0x5A5A5A5A)
         floor_s = tl.floor(chase_int8_f)
@@ -808,11 +810,18 @@ def _deviation_precondition(grad_W, packed_w, row_exp, col_exp, mantissa_bias):
 # broken S/v̂ that reads ~0). Module-global so it bakes into the kernel constexpr
 # without threading through the 30-arg autograd Function. Set once before training.
 _USE_FIXED_COH = False
+# Scalar cosine schedule on the commitment gate (1.0 = off). Set per-step.
+_GATE_GAIN = 1.0
 
 
 def set_fixed_coh(enabled):
     global _USE_FIXED_COH
     _USE_FIXED_COH = bool(enabled)
+
+
+def set_gate_gain(g):
+    global _GATE_GAIN
+    _GATE_GAIN = float(g)
 
 
 def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
@@ -886,6 +895,7 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         float(alpha_v_fast),
         float(wd_sv), float(wd_sf),
         float(gf_trust_delta_sq),
+        float(_GATE_GAIN),
         step_counter,
         packed_w.stride(0), packed_w.stride(1),
         grad_W.stride(0), grad_W.stride(1),
