@@ -191,6 +191,29 @@ under-convergence, NOT lr -> horizon should close it. CAVEAT: eps-MSE not FID; b
 acts vs fp32 AdamW (storage reality). Artifacts: tools/run_diffusion{,_lr}.sh,
 compare_out/diffusion{,_lr}.log.
 
+## COHERENCE-WEIGHTED RANK-1 VARIANCE (coh_weighted_v) — free + neutral on enwik8
+Idea: gate the rank-1 variance ACCUMULATION by coh_pre so v_hat fits coherent gradient
+power. The per-element weight is consumed in the row/col marginal sums, so v_row/v_col
+stay rank-1 (O(N+K)) — no per-element state, no rank-full obstruction, no second
+mechanism. v_hat is demoted to scale-equalization over the active set; the temporal gate
+owns noise rejection. `g2 *= coh_pre/mean(coh_pre)` in the backward before the marginals
+(no kernel change). `_COH_WEIGHTED_V` / `set_coh_weighted_v()`, nanogpt `--coh_weighted_v`.
+**enwik8 10k A/B (validated recipe, lr5e-4, eval_iters50), final val:**
+  baseline 1.0511 (exp~ -1.94) | RAW 1.0607 (+0.0096, exp~ -1.51) | NORM 1.0518 (+0.0007, exp~ -1.97)
+- **RAW** (`g2*=coh_pre`) HURTS: shrinking v_hat = higher effective LR on still-training
+  coords -> overshoot (LR already at optimum) -> +0.01 tail + more rebalance churn
+  (exp~ -1.51 vs -1.94). At 5k it was -0.0008 (sign flipped with horizon = the LR-raise
+  compounding). **STRIPPED.** (NB the "v_hat invariant to global coherence contraction"
+  claim is FALSE: v_hat = R·Cᵀ/1ᵀR scales ~linearly with coherent power.)
+- **NORMALIZED** (`g2*=coh_pre/mean`) is NEUTRAL (+0.0007) and churn-free (exp~=baseline):
+  de-confound -> raw's harm was ENTIRELY the LR-raise, not the reshape. The reshape itself
+  is **free + sound** (validated, kept, off-by-default).
+- WHY neutral not a win on enwik8: data>>capacity, the gate already owns noise rejection,
+  so v_hat's spared role has nothing to reclaim. Same regime-dependence as v_slow
+  consolidation -> candidate-useful only in the OVERFITTING regime (deferred test).
+- Transient: both forms ~0.12 ahead at iter 1000 (faster early commitment to coherent
+  dirs), washes out by mid-training.
+
 ## HORIZON SCALING — most of the "residual" was under-convergence, not a floor
 The 5k gap (Concord 1.1438 vs AdamW 1.0673 = 0.0765) was largely Concord being
 under-converged: its parsimonious high-SNR-selective descent is slower/step but keeps

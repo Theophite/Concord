@@ -824,6 +824,27 @@ def set_gate_gain(g):
     _GATE_GAIN = float(g)
 
 
+# EXPERIMENTAL (default OFF, so the validated default is untouched): gate the
+# rank-1 variance ACCUMULATION by established coherence (coh_pre). The per-element
+# weight is consumed in the row/col marginal sums, so v_row/v_col stay rank-1
+# (O(N+K)); v_hat becomes a rank-1 fit to coherent gradient power, not raw g^2.
+# Read in the autograd Function backward (Python), so no kernel/constexpr change.
+# Demotes v_hat to scale-equalization over the active set, leaning on the
+# coherence gate for noise rejection. The weight is NORMALIZED by its per-layer mean
+# so v_hat only RESHAPES onto coherent power without shrinking magnitude. (The
+# un-normalized/raw form effectively raised the LR on the still-training coords and
+# HURT the enwik8 tail by ~+0.01 at 10k; normalized is NEUTRAL there and churn-free.
+# enwik8 is data>>capacity, so the spared noise-suppression role has nothing to
+# reclaim -- candidate-useful only in the overfitting regime.) Read in the autograd
+# Function backward (Python); no kernel/constexpr change.
+_COH_WEIGHTED_V = False
+
+
+def set_coh_weighted_v(enabled):
+    global _COH_WEIGHTED_V
+    _COH_WEIGHTED_V = bool(enabled)
+
+
 def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
                          row_max, col_max,
                          lr, mantissa_bias=15, alpha=0.1, beta1=0.0,
@@ -1250,6 +1271,11 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
         if ctx.track_adafactor_v and ctx.v_row is not None:
             with torch.no_grad():
                 g2 = grad_W.float() ** 2
+                if _COH_WEIGHTED_V and ctx.coh_pre is not None:
+                    # normalized: reshape onto coherent power, preserve magnitude
+                    # (eff. LR). Weight consumed in the marginals below.
+                    w = ctx.coh_pre / ctx.coh_pre.mean().clamp(min=1e-12)
+                    g2 = g2 * w
                 g2_row = g2.sum(dim=1)
                 g2_col = g2.sum(dim=0)
                 b2 = ctx.adafactor_beta2
@@ -1884,6 +1910,9 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
         if ctx.track_adafactor_v and ctx.v_row is not None:
             with torch.no_grad():
                 g2 = grad_W_2d.float() ** 2
+                if _COH_WEIGHTED_V and ctx.coh_pre is not None:
+                    w = ctx.coh_pre / ctx.coh_pre.mean().clamp(min=1e-12)
+                    g2 = g2 * w             # reshape onto coherent power (mag-preserving)
                 g2_row = g2.sum(dim=1)
                 g2_col = g2.sum(dim=0)
                 b2 = ctx.adafactor_beta2

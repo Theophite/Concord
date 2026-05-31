@@ -26,7 +26,8 @@ import torch.nn as nn
 
 from nanogpt import GPT, GPTConfig, load_char_data, get_batch
 from prototype_packed_b import (ConcordLinearPackedB, reset_reb_stats,
-                                get_reb_stats, set_fixed_coh, set_gate_gain)
+                                get_reb_stats, set_fixed_coh, set_gate_gain,
+                                set_coh_weighted_v)
 from optim_factored import FactoredAdam
 
 
@@ -241,6 +242,10 @@ def main():
                     help="engage the FIXED coherence gate (Wiener coh=S/(S+noise^2) "
                          "via enable_cohpre + set_fixed_coh): SNR-gated commitment, "
                          "freeze the incoherent/stuck coords. Use with gf_trust=1.")
+    ap.add_argument("--coh_weighted_v", action="store_true",
+                    help="EXPERIMENTAL: weight the rank-1 variance accumulation "
+                         "(v_row/v_col) by coh_pre so v-hat fits COHERENT gradient "
+                         "power only. Requires --coh_gate (needs coh_pre).")
     ap.add_argument("--tick_down", action="store_true",
                     help="enable bidirectional rebalance (median-gated tick-down "
                          "to reclaim exponent precision). Default off (1.17 recipe).")
@@ -297,6 +302,10 @@ def main():
         else:
             for m in layers:
                 m.disable_cohpre()          # gate is default-ON now; ablate it off
+        set_coh_weighted_v(args.coh_weighted_v)
+        if args.coh_weighted_v:
+            print(f"[{tag}] COH-WEIGHTED v-hat (normalized): rank-1 variance "
+                  f"fits coherent power", flush=True)
         aux = [p for p in model.parameters() if p.requires_grad]
         aux_opt = torch.optim.AdamW(aux, lr=args.aux_lr, weight_decay=0.0)
         print(f"[{tag}] Concord on {len(layers)} Linears "
