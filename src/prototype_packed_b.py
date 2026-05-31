@@ -809,7 +809,7 @@ def _deviation_precondition(grad_W, packed_w, row_exp, col_exp, mantissa_bias):
 # Use the units-correct Wiener coh = S/(S+noise²) for the coherence gate (vs the
 # broken S/v̂ that reads ~0). Module-global so it bakes into the kernel constexpr
 # without threading through the 30-arg autograd Function. Set once before training.
-_USE_FIXED_COH = False
+_USE_FIXED_COH = True   # validated default: Wiener coh S/(S+noise^2). False=legacy(broken units)
 # Scalar cosine schedule on the commitment gate (1.0 = off). Set per-step.
 _GATE_GAIN = 1.0
 
@@ -1317,13 +1317,14 @@ class ConcordLinearPackedB(nn.Module):
     Supports both SGD and AdamW (three_accum). v_slow_i8 leak and
     Bayesian-anchored wd are active in AdamW mode.
 
-    NOTE: the default `optimizer_kind='sgd'` set in __init__ runs the
-    legacy SGD chase apply kernel — which does NOT use the gf trust
-    region, Adafactor v_row/v_col EMAs, drift-cancel preconditioning,
-    or any of the modern features. Call `set_optimizer_kind('adamw')`
-    explicitly to enable them. If you forget, you'll quietly get the
-    old behaviour with all the new buffers tracking but not affecting
-    the dynamics.
+    DEFAULT (2026-05-31+) = the validated production optimizer:
+    optimizer_kind='adamw' with rank-1 v-hat (v_scale=0, gf_trust_delta_sq=1,
+    eps=1e-10, precond_p=0.5) and the fixed coherence gate ON (coh_pre
+    allocated in __init__; module global _USE_FIXED_COH=True). A bare
+    ConcordLinearPackedB(in, out) IS that optimizer — no knob-setting needed,
+    which is what makes it a drop-in for OneTrainer / any trainer. Recover the
+    legacy SGD-chase via set_optimizer_kind('sgd'); ablate the gate via
+    disable_cohpre(); per-knob attributes override the rest.
     """
 
     MANTISSA_BIAS = 15
@@ -1343,19 +1344,22 @@ class ConcordLinearPackedB(nn.Module):
         # can update lr between CUDA-graph replays without re-capturing.
         # Setting `m.lr = X` (via the property) updates both.
         self._lr_value = float(lr)
-        # Optimizer kind + hyperparameters (defaults match SGD).
-        self.optimizer_kind = 'sgd'
+        # Optimizer kind + hyperparameters. DEFAULTS = the validated production
+        # recipe: rank-1 v-hat AdamW (v_scale=0, gf_trust=1, eps<<1, precond=0.5)
+        # + fixed coherence gate (coh_pre allocated below). A bare
+        # ConcordLinearPackedB IS the validated optimizer; override for ablations.
+        self.optimizer_kind = 'adamw'
         self.weight_decay = 0.0
-        self._eps_value = 1.0   # backing store for the `eps` property
+        self._eps_value = 1e-10   # backing store for `eps`; <<1 engages the v-hat denom
         self.step_cap = 10.0
-        self.v_scale = 1.0
+        self.v_scale = 0.0     # 0 = kill the (proven-dead) velocity-noise v_proxy precond
         self.precond_p = 0.5   # Padam-style preconditioner power: 0.5=sqrt
                                # (default), 0=SGD, (0,0.5)=partial adaptivity
         self.gf_consol = 0.0   # gf-gated consolidation evaporation rate κ.
                                # 0 = off (uniform cautious wd). >0 enables the
                                # routing (evaporate incoherent s_fast, keep κ<α).
-        self._coh_pre = None   # per-coord established-coherence EMA buffer;
-                               # None = off. enable_cohpre() allocates it.
+        self._coh_pre = None   # coherence-gate EMA; ALLOCATED BELOW (default ON,
+                               # validated). disable_cohpre() sets it back to None.
         self.alpha_v_fast = 0.001
         # Derived from rates (see compute_drift_cancel_C docstring).
         # Setting `m.drift_cancel_C = X` after construction overrides.
@@ -1378,7 +1382,7 @@ class ConcordLinearPackedB(nn.Module):
         # so step is implicitly bounded by ~1/δ at gf→0 and → 0 at gf→1
         # — replaces the hard step_cap clamp with a smooth SNR gate.
         # δ²=1/step_cap² matches the legacy asymptotic max step.
-        self.gf_trust_delta_sq = 0.0
+        self.gf_trust_delta_sq = 1.0   # validated: 1 => v_hat IS the denom (rank-1 Adam)
         # Bidirectional rebalance tick-down (reclaim exponent precision). OFF by
         # default: it hurt the packed v-hat (oscillates with the chase). Set True
         # to experiment (e.g. a settled-phase-only schedule).
@@ -1412,6 +1416,9 @@ class ConcordLinearPackedB(nn.Module):
         # avoid div-by-zero on the first step (when v_row is still 0).
         self.register_buffer('_sum_v_inv',
             torch.ones(1, dtype=torch.float32, device=device))
+        # Coherence gate ON by default (validated recipe): per-coord coh_pre EMA
+        # (fp32, init 1.0). Apply kernel gates the chase by coh + coh_pre*(1-coh).
+        self._coh_pre = torch.ones_like(self.packed_w, dtype=torch.float32)
         # Per-row/col running high-watermark of |s_slow*128 + s_fast +
         # v_slow*128| (the full live mantissa). Diagnostic: tells us
         # how close we ever came to MAX_M=24000 across training, which
@@ -1492,6 +1499,12 @@ class ConcordLinearPackedB(nn.Module):
         ~1e-3 per-step EMA increment is below bf16 resolution near 1.0."""
         self._coh_pre = torch.ones_like(self.packed_w, dtype=torch.float32)
         return self._coh_pre
+
+    @torch.no_grad()
+    def disable_cohpre(self):
+        """Turn the coherence gate OFF (no-gate ablation): _coh_pre -> None, so
+        the apply kernel takes the ungated chase path."""
+        self._coh_pre = None
 
     def set_optimizer_kind(self, kind, weight_decay=0.0, eps=1.0,
                               step_cap=10.0):

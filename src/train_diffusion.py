@@ -210,6 +210,9 @@ def main():
                 m.enable_cohpre()
             print(f"[{args.tag}] FIXED coherence gate ENGAGED on {len(layers)} layers",
                   flush=True)
+        else:
+            for m in layers:
+                m.disable_cohpre()          # gate default-ON now; ablate off
         aux = [p for p in model.parameters() if p.requires_grad]
         aux_opt = torch.optim.AdamW(aux, lr=args.aux_lr, betas=(0.9, 0.95),
                                     weight_decay=0.0)

@@ -294,6 +294,9 @@ def main():
                 m.enable_cohpre()           # engage coh_pre-gated commitment
             print(f"[{tag}] FIXED coherence gate ENGAGED (Wiener SNR-gated "
                   f"commitment) on {len(layers)} layers", flush=True)
+        else:
+            for m in layers:
+                m.disable_cohpre()          # gate is default-ON now; ablate it off
         aux = [p for p in model.parameters() if p.requires_grad]
         aux_opt = torch.optim.AdamW(aux, lr=args.aux_lr, weight_decay=0.0)
         print(f"[{tag}] Concord on {len(layers)} Linears "

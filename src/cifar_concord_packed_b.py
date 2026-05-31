@@ -240,6 +240,8 @@ def main():
         m.gf_consol = args.gf_consol
         if args.cohpre:
             m.enable_cohpre()   # coh_pre-gated acceptance (λ = alpha_v_fast)
+        else:
+            m.disable_cohpre()  # gate default-ON now; CIFAR recipe keeps it off unless --cohpre
         if args.dev_precond_p > 0:
             import prototype_packed_b as _ppb
             _ppb._DEV_PRECOND["p"] = float(args.dev_precond_p)
