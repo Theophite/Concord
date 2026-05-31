@@ -26,7 +26,7 @@ import torch.nn as nn
 
 from nanogpt import GPT, GPTConfig, load_char_data, get_batch
 from prototype_packed_b import (ConcordLinearPackedB, reset_reb_stats,
-                                get_reb_stats)
+                                get_reb_stats, set_fixed_coh)
 from optim_factored import FactoredAdam
 
 
@@ -204,6 +204,10 @@ def main():
                     help="dedicated RNG seed for batch sampling, DECOUPLED from "
                          "model/optimizer RNG -> identical batch order across "
                          "optimizers (the comparability fix).")
+    ap.add_argument("--coh_gate", action="store_true",
+                    help="engage the FIXED coherence gate (Wiener coh=S/(S+noise^2) "
+                         "via enable_cohpre + set_fixed_coh): SNR-gated commitment, "
+                         "freeze the incoherent/stuck coords. Use with gf_trust=1.")
     ap.add_argument("--tick_down", action="store_true",
                     help="enable bidirectional rebalance (median-gated tick-down "
                          "to reclaim exponent precision). Default off (1.17 recipe).")
@@ -251,6 +255,12 @@ def main():
         if args.tick_down:
             for m in layers:
                 m.allow_tickdown = True
+        if args.coh_gate:
+            set_fixed_coh(True)             # Wiener coh = S/(S+noise^2)
+            for m in layers:
+                m.enable_cohpre()           # engage coh_pre-gated commitment
+            print(f"[{tag}] FIXED coherence gate ENGAGED (Wiener SNR-gated "
+                  f"commitment) on {len(layers)} layers", flush=True)
         aux = [p for p in model.parameters() if p.requires_grad]
         aux_opt = torch.optim.AdamW(aux, lr=args.aux_lr, weight_decay=0.0)
         print(f"[{tag}] Concord on {len(layers)} Linears "

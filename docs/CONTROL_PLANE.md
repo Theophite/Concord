@@ -135,8 +135,24 @@ N=v_proxy (the velocity-noise residual). lr cancels -> true gradient-SNR in [0,1
 gate's noise term). The gate broke by grabbing v_hat (wrong units) instead of v_proxy.
 -> Two orthogonal cheap tools from state Concord already keeps: v_hat (factored,
 MAGNITUDE) = the preconditioner (1.17 win); fixed coherence (v_proxy-based, SNR) =
-the selectivity/freeze signal. NEXT (untested): engage the fixed gate for
-SNR-gated commitment ("freeze the stuck pieces").
+the selectivity/freeze signal.
+**ENGAGED (USE_FIXED_COH kernel flag + enable_cohpre, --coh_gate):** packed v_hat +
+fixed coherence gate, lr=1e-3 -> 1.1601 (vs no-gate 1.1712) = a real ~0.011-nat
+denoise (~11% of the residual), pulling ahead from ~iter 2000 (when coh_pre decays
+and the gate starts freezing incoherent coords). lr=2e-3 -> 2.44 (step-size ceiling,
+unrelated to gate). KEEPER: the "freeze the stuck pieces" mechanism works with correct
+math -- small but real. Best packed recipe: rank-1 v_hat + fixed coh gate.
+**lr U-curve (v_hat+gate, 5000-iter):** 1e-3=1.1601, 7e-4=1.1542, 5e-4=1.1438(opt),
+3e-4=1.1598(undertrains). 1e-3 was near the instability cliff; optimum is lr=5e-4.
+**BEST PACKED RECIPE = rank-1 v_hat + fixed coherence gate + lr=5e-4 = 1.1438**
+= 79% of the AdamW gap (1.4302->1.1438 of 0.3616), residual 0.075 to Adam(1.0686).
+A fully int-packed optimizer within 0.075 nats of well-tuned fp32 AdamW, via two
+free native mechanisms (magnitude v_hat + SNR-freeze gate) + dialed lr.
+Remaining 0.075: fairness (wd=0/dropout=0) vs fundamental (mantissa/momentum).
+NEXT: (a) fairness sweep (gate, lr5e-4, +wd) for the residual; (b) OVERFITTING-regime
+test (capacity>>data / label noise) -- where the gate's "structurally can't fit
+noise" property should yield a real generalization win (its enwik8 effect is small
+only because data>>capacity = nothing to overfit).
 
 ## Where the gap lives (from the SGD-chase 1.43 weights vs Adam 1.07)
 - **Parsimony:** SGD-chase moves 16× less (‖dC‖ 6.5 vs ‖dA‖ 117), 92% of the loss

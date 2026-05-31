@@ -432,6 +432,7 @@ def _apply_packed_adamw_kernel(
     USE_GF_TRUST_REGION: tl.constexpr,  # True → add δ²·v̂ floor to v_proxy
     USE_GF_CONSOLIDATION: tl.constexpr,  # True → gf-gated evaporation routing
     USE_COHPRE: tl.constexpr,  # True → coh_pre-gated acceptance (chase)
+    USE_FIXED_COH: tl.constexpr,  # True → Wiener coh = S/(S+noise²) (units-correct)
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -503,8 +504,18 @@ def _apply_packed_adamw_kernel(
         # → W units via scale_fwd. Coherence = (mean grad)² / E[g²] ∈ [0,1]
         # (Cauchy–Schwarz). Reconstructed from s_slow−v_slow + v̂ — no new
         # buffer. coh→1 = coherent signal, coh→0 = incoherent noise.
-        mean_grad_w = alpha_v_fast * d_sv * scale_fwd
-        coh = mean_grad_w * mean_grad_w / (v_hat + 1e-12)
+        if USE_FIXED_COH:
+            # Dimensionally-correct Wiener/Kalman SNR gate. Both terms from the
+            # SAME velocity decomposition d_fs = signal + noise: signal =
+            # drift_cancel_C·d_sv (the drift), noise = noise_in_w (already
+            # computed). coh = S²/(S²+N²) ∈[0,1]; the lr/scale cancels -> true
+            # gradient-SNR (vs the broken α_v·d_sv vs E[g²] units mismatch).
+            sig_w = drift_cancel_C * d_sv * scale_fwd
+            sig2 = sig_w * sig_w
+            coh = sig2 / (sig2 + noise_in_w * noise_in_w + 1e-30)
+        else:
+            mean_grad_w = alpha_v_fast * d_sv * scale_fwd
+            coh = mean_grad_w * mean_grad_w / (v_hat + 1e-12)
         coh = tl.minimum(tl.maximum(coh, 0.0), 1.0)
 
     # ── AdamW step ─────────────────────────────────────────────
@@ -793,6 +804,17 @@ def _deviation_precondition(grad_W, packed_w, row_exp, col_exp, mantissa_bias):
         return (grad_W.float() / precond).to(grad_W.dtype)
 
 
+# Use the units-correct Wiener coh = S/(S+noise²) for the coherence gate (vs the
+# broken S/v̂ that reads ~0). Module-global so it bakes into the kernel constexpr
+# without threading through the 30-arg autograd Function. Set once before training.
+_USE_FIXED_COH = False
+
+
+def set_fixed_coh(enabled):
+    global _USE_FIXED_COH
+    _USE_FIXED_COH = bool(enabled)
+
+
 def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
                          row_max, col_max,
                          lr, mantissa_bias=15, alpha=0.1, beta1=0.0,
@@ -875,6 +897,7 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         USE_GF_TRUST_REGION=bool(use_gf_trust),
         USE_GF_CONSOLIDATION=bool(use_gf_consol),
         USE_COHPRE=bool(use_cohpre),
+        USE_FIXED_COH=bool(_USE_FIXED_COH),
     )
 
 
