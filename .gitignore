@@ -20,4 +20,7 @@ data/
 
 # Run-output dir (saved weights, logs, figures, sweep txt -- all regenerable)
 compare_out/
-dist/
+# ignore dist/ CONTENTS (build artifacts) but keep the distilled winning-config
+# deliverable tracked. dist/* (not dist/) so git still descends to find the exception.
+dist/*
+!dist/concord_winner/
