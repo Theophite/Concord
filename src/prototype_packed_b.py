@@ -1636,6 +1636,61 @@ class ConcordLinearPackedB(nn.Module):
         v_slow_i8 = ((self.packed_w << 24) >> 24)
         return s_fast, s_slow_i8, v_slow_i8
 
+    @staticmethod
+    def _ns5(M, ns_steps=5):
+        a, b, c = 3.4445, -4.7750, 2.0315
+        X = (M / (M.norm() + 1e-7)).bfloat16()
+        tr = X.shape[0] > X.shape[1]
+        if tr: X = X.t()
+        for _ in range(int(ns_steps)):
+            A = X @ X.t()
+            X = a * X + (b * A + c * (A @ A)) @ X
+        if tr: X = X.t()
+        return X.float()
+
+    @torch.no_grad()
+    def orthogonalize_slow(self, ns_steps=5):
+        """EXPERIMENTAL (Muon at slow<->v_slow): orthogonalize the d_sv DELTA -- the drift
+        INCREMENT accumulated since the last call -- and ADD the correction to v_slow. This
+        is increment-orthogonalization (Muon's actual op), NOT overwriting the accumulator:
+        the prior overwrite version (v_slow=s_slow-NS5(d_sv)) moved the DEPLOYED weight 29%
+        in one call (probe_ortho_confound) because it replaced the WHOLE accumulated drift.
+        Here d_sv_now - d_sv_snap is denoised (change in clean drift, not raw s_fast) and
+        super-quantum over K steps (probe_muon2). We replace the window's NEW drift Delta
+        with NS5(Delta) by v_slow += (Delta - NS5(Delta)) [magnitude-matched], leaving all
+        pre-window drift untouched. Call PERIODICALLY (every K). OFF by default. 2D only."""
+        if self.packed_w.dim() != 2:
+            return
+        pw = self.packed_w
+        s_fast    = (pw >> 16)
+        s_slow_i8 = ((pw << 16) >> 24).to(torch.float32)
+        v_slow_i8 = ((pw << 24) >> 24).to(torch.float32)
+        d_sv = s_slow_i8 - v_slow_i8
+        snap = getattr(self, "_dsv_snap", None)
+        if snap is None:                       # first call: just snapshot, nothing to orthog.
+            self._dsv_snap = d_sv.clone()
+            return
+        delta = d_sv - snap                    # drift INCREMENT this window (denoised)
+        dn = delta.norm()
+        if dn < 1e-6:
+            self._dsv_snap = d_sv.clone()
+            return
+        d_orth = self._ns5(delta, ns_steps)
+        d_orth = d_orth * (delta.abs().mean() / (d_orth.abs().mean() + 1e-9))  # match magnitude
+        # replace the window's increment delta -> d_orth: v_slow += (delta - d_orth).
+        # (effective new drift = snap_drift + d_orth; pre-window drift untouched.)
+        corr = delta - d_orth
+        v_new = v_slow_i8 + corr
+        fl = torch.floor(v_new); frac = v_new - fl
+        v_new_i8 = (fl + (torch.rand_like(frac) < frac).float()).clamp(-128, 127).to(torch.int32)
+        s_slow_c = s_slow_i8.clamp(-128, 127).to(torch.int32)
+        packed_new = (((s_fast & 0xFFFF) << 16)
+                      | ((s_slow_c & 0xFF) << 8)
+                      | (v_new_i8 & 0xFF))
+        self.packed_w.copy_(packed_new)
+        # re-snapshot from the ACTUAL post-write d_sv (so quantization error doesn't accrue).
+        self._dsv_snap = (s_slow_c.to(torch.float32) - v_new_i8.to(torch.float32))
+
     @torch.no_grad()
     def get_rebalance_watermark_stats(self):
         """Returns (row_hwm, col_hwm) tensors — the all-time per-row /

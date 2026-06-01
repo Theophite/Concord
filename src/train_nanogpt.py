@@ -30,6 +30,7 @@ from prototype_packed_b import (ConcordLinearPackedB, reset_reb_stats,
                                 set_coh_weighted_v, set_ratio_coh,
                                 set_ratio_coh_floors)
 from optim_factored import FactoredAdam
+from optim_muon import Muon
 
 
 @torch.no_grad()
@@ -188,8 +189,10 @@ def estimate_loss(model, train, val, bsz, block_size, device, eval_iters,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["concord", "adamw", "factored"],
+    ap.add_argument("--mode", choices=["concord", "adamw", "factored", "muon"],
                     default="concord")
+    ap.add_argument("--muon_lr", type=float, default=0.02,
+                    help="Muon lr for the 2D hidden weights (mode=muon).")
     ap.add_argument("--data", default="nanogpt_data/input.txt")
     ap.add_argument("--max_iters", type=int, default=3000)
     ap.add_argument("--eval_interval", type=int, default=250)
@@ -297,6 +300,10 @@ def main():
                     help="WATCH ONLY (not used in the step): log the rank "
                          "correlation between v_proxy (velocity-noise^2) and the "
                          "Adafactor row/col v_hat per eval, + a final binned view.")
+    ap.add_argument("--ortho_slow_every", type=int, default=0,
+                    help="EXPERIMENTAL (Muon at slow<->v_slow): every K steps, NS5-"
+                         "orthogonalize the denoised drift d_sv=s_slow-v_slow (rewrite "
+                         "v_slow). 0=off. Tests if orthogonalizing the slow drift helps.")
     ap.add_argument("--reb_stats", action="store_true",
                     help="instrument rebalance: log mean exponent per eval + "
                          "cumulative tick-up/down + clip counts (the 'why').")
@@ -367,6 +374,41 @@ def main():
               f"{model.num_params()/1e6:.2f}M  lr={args.factored_lr} "
               f"wd={args.weight_decay}", flush=True)
         peak_lr = args.factored_lr
+    elif args.mode == "muon":
+        layers = []
+        # Standard Muon split: Muon on 2D hidden weights (attn/mlp .weight in blocks);
+        # AdamW on everything else (embeddings, lm_head, LayerNorm, biases, <2D).
+        muon_p, adam_p = [], []
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim == 2 and n.startswith("blocks.") and n.endswith(".weight"):
+                muon_p.append(p)
+            else:
+                adam_p.append(p)
+        muon = Muon(muon_p, lr=args.muon_lr, momentum=0.95, nesterov=True)
+        adam = torch.optim.AdamW(adam_p, lr=args.aux_lr, weight_decay=args.weight_decay,
+                                 betas=(0.9, 0.95))
+
+        class CombinedOpt:
+            """Muon(2D hidden) + AdamW(rest). Exposes param_groups (each tagged base_lr)
+            so the harness cosine scheduler scales both by base_lr*(lr/peak_lr)."""
+            def __init__(self, opts): self.opts = opts
+            @property
+            def param_groups(self):
+                return [g for o in self.opts for g in o.param_groups]
+            def zero_grad(self, set_to_none=True):
+                for o in self.opts: o.zero_grad(set_to_none=set_to_none)
+            def step(self):
+                for o in self.opts: o.step()
+        for g in muon.param_groups: g['base_lr'] = args.muon_lr
+        for g in adam.param_groups: g['base_lr'] = args.aux_lr
+        aux_opt = CombinedOpt([muon, adam])
+        nmuon = sum(p.numel() for p in muon_p); nadam = sum(p.numel() for p in adam_p)
+        print(f"[{tag}] MUON on {len(muon_p)} hidden 2D weights ({nmuon/1e6:.2f}M)  "
+              f"+ AdamW on {len(adam_p)} ({nadam/1e6:.2f}M, embed/head/LN)  "
+              f"muon_lr={args.muon_lr} aux_lr={args.aux_lr} wd={args.weight_decay}", flush=True)
+        peak_lr = args.muon_lr
     else:
         layers = []
         aux_opt = torch.optim.AdamW(model.parameters(), lr=args.adamw_lr,
@@ -445,8 +487,11 @@ def main():
             for g in aux_opt.param_groups:
                 g['lr'] = args.aux_lr * (lr / peak_lr)
         else:
+            sched = (lr / peak_lr) if not args.const_lr else warm
             for g in aux_opt.param_groups:
-                g['lr'] = lr
+                # per-group base_lr (muon split) scaled by the shared cosine shape;
+                # fall back to the single peak_lr schedule for plain adamw/factored.
+                g['lr'] = g.get('base_lr', peak_lr) * sched
 
         if it % args.eval_interval == 0 or it == args.max_iters - 1:
             gstate = eval_gen.get_state() if args.eval_consolidated else None
@@ -501,6 +546,10 @@ def main():
         if args.mode == "concord" and (it + 1) % args.rebalance_every == 0:
             for m in layers:
                 m.rebalance()
+        if (args.mode == "concord" and args.ortho_slow_every > 0
+                and (it + 1) % args.ortho_slow_every == 0):
+            for m in layers:
+                m.orthogonalize_slow()
         if args.watch_vproxy_ema and args.mode == "concord":
             for m in layers:
                 vp = _vproxy_only(m)

@@ -349,3 +349,421 @@ to MATCH the 64-bit coh_pre gate on the deployed weight. The deployable Concord 
 s_slow+v_slow (drop s_fast). All OFF by default; validated recipe (+ZIP) unchanged.
 Knobs: --ratio_chase_floor_min / --ratio_leak_floor_min (floor targets), --gf_consol (evap
 rate, rho_eff=lr*gf_consol), --fast_gain_anneal, --eval_consolidated, --watch_accum.
+
+=== CUDA GRAPH / SPEEDUP INVESTIGATION (2026-05-31, IN PROGRESS) ===
+GOAL: the harness runs EAGER at ~200ms/iter for a 10.78M GPT on a 4090 (~10x over the
+~20ms compute floor) -- pure kernel-launch overhead (25 Concord layers x ~6 launches/iter,
+Python-dispatched). The optimizer (prototype_packed_b.py) is BUILT for CUDA graphs but
+train_nanogpt.py never captures one. Speeding this up makes the 20k nwv long-horizon test
+(~70min/arm eager) tractable.
+
+ATTEMPT 1 (FAILED, reverted): raw torch.cuda.graph(g) around {zero aux grads, model(sx,sy),
+loss.backward(), rebalance}. Error at capture_end, real cause from gl.backward():
+  "CUDA error: operation would make the legacy stream depend on a capturing blocking stream"
+The autograd backward engine runs on its own worker threads / the LEGACY (default) stream,
+which can't be made to depend on the capturing stream. Raw torch.cuda.graph around
+loss.backward() is fundamentally unsupported. The --cuda_graph flag + capture branch were
+fully REVERTED from train_nanogpt.py (grep cuda_graph -> 0; eager path is the committed-style
+default, untouched).
+
+ATTEMPT 2 (IN PROGRESS): torch.cuda.make_graphed_callables -- the SUPPORTED tool for
+capturing fwd+bwd (it routes the autograd engine through capture correctly). Probe at
+tools/probe_graph.py: graphs a tiny param-less Concord nn.Sequential, checks graphed==eager.
+First run output was GARBLED by the flaky box (interleaved "make_graphed_callables RETURNED
+ok / loss 3.318->0.0265 / MATCH" AND "FAILED: AssertionError" with a traceback into
+prototype_packed_b.py line ~2240). AMBIGUOUS -- needs a clean re-run on a stable box to
+know if it (a) worked, or (b) hit an AssertionError (make_graphed_callables asserts on
+modules whose params don't all require grad -- and Concord layers have ZERO nn.Parameters,
+which may trip it). RESUME HERE: re-run `python tools/probe_graph.py` cleanly.
+
+KEY FACTS FOR THE GRAPH WORK (verified this session):
+- Concord layers = ZERO nn.Parameters; ALL state in register_buffer (packed_w, row_exp,
+  col_exp, v_row, v_col, _sum_v_inv, _lr_buf, _eps_buf, _row_max_buf, _col_max_buf, etc.).
+  The optimizer step is FUSED into FusedConcordLinearPackedB.apply's BACKWARD as a
+  side-effect Triton kernel write into packed_w + _bf16_weight_buf. (This param-less,
+  side-effect-in-backward shape is the impedance mismatch with make_graphed_callables.)
+- lr is a device tensor (_lr_buf), set via m.lr=X which .fill_()'s it OUTSIDE any graph ->
+  already graph-ready. step_counter.add_(1) in-place -> replays. rebalance() is @no_grad
+  manual kernel launches AFTER backward (keep eager or graph separately).
+- nwv _NWV_BETA is a PYTHON-FLOAT global read in the eager backward -> MUST be static at
+  capture time -> defer capture until it >= nwv_delay + nwv_beta_warmup (beta frozen).
+- aux_opt (AdamW on embeddings/LN, 0.13M params) -> keep EAGER outside the graph.
+- CORRECTNESS GATE before trusting any graphed result: 400 iters eager vs graphed, same
+  seed, vals must match ~1e-3 (SR rng deterministic via step_counter).
+- FALLBACK if make_graphed_callables doesn't pan out: run dist/concord_nwv_test.zip on
+  reliable infra (eager is fine for correctness; only speed needs graphs) OR re-fire eager
+  20k here (~70min/arm + PSU stalls, crash-retry wrapper handles deaths).
+
+PENDING EXPERIMENT (the reason for all this): 20k 2-arm nwv long-horizon test.
+tools/run_nwv_long.sh: long_base (gate, no nwv) vs long_nwv (--noise_weighted_v --nwv_beta
+1.0 --nwv_delay 2000 --nwv_beta_warmup 2000). nwv is INERT at 5k (horizon-starved: best_val
+~iter1500 but nwv can't engage until v-hat matures ~1000 + ramp -> after overfit; correctly-
+sequenced delay-then-cosine = EXACTLY baseline 1.5840). 20k gives ~16k steps of nwv-active
+runway. WIN = long_nwv beats long_base best-live OR deployed-sv by >0.005, else nwv is
+genuinely inert (gate already captures the coherence signal) -> drop it.
+
+UNCOMMITTED working-tree state (ALL pending the long-horizon nwv verdict -- do NOT commit
+nwv until it proves out): src/prototype_packed_b.py (live-ratio-coh nwv: _NOISE_WEIGHTED_V
++ set_noise_weighted_v + set_nwv_beta, 2 backward branches w=1-beta*coh from the packed
+ratio), src/train_nanogpt.py (--noise_weighted_v/--nwv_beta/--nwv_beta_warmup/--nwv_delay +
+delay-then-cosine schedule), tools/run_nwv*.sh, tools/probe_graph.py, dist/concord_nwv_test
+(+.zip). NOTE: consolidated_weight() + the lean/full ZIPs were already COMMITTED earlier
+(0beb5c5, ca8d6b9); only the nwv + graph WIP is uncommitted.
+
+=== CUDA GRAPH: SOLVED (custom single-graph capture, 2026-05-31) ===
+The custom single-graph capture WORKS. Proven in tools/probe_graph4.py: eager vs graphed
+over 60 steps, max |loss diff| = 0.000064 (MATCH). The two prior approaches and why they
+failed, then the working recipe:
+
+WHY OFF-THE-SHELF FAILS:
+- raw torch.cuda.graph around loss.backward(): "operation would make the legacy stream
+  depend on a capturing blocking stream" -- the autograd engine runs on its own worker
+  threads / the legacy stream. FIX: warm up with a FULL fwd+bwd on a side stream first
+  (torch.cuda.Stream + wait_stream both ways); that lazy-inits autograd + Triton autotune
+  so the actual capture has nothing left to schedule on the legacy stream.
+- torch.cuda.make_graphed_callables: captures, but DIVERGES (loss 5336 vs 0.084) EVEN WITH
+  NO rebalance (probe_graph2). It captures fwd and bwd as SEPARATE graphs with reused
+  static buffers, severing Concord's forward-reads-_bf16_weight_buf <- backward-writes-it
+  coupling. Unusable for this fused-step design.
+
+WORKING RECIPE (probe_graph4.py):
+1. ONE graph wraps fwd + loss + bwd together (keeps _bf16_weight_buf in-place across the
+   read in fwd and the write in the fused-backward apply kernel, within each replay).
+2. Side-stream warmup running the FULL fwd_bwd ~5x (fixes the legacy-stream error).
+3. CRITICAL: the warmup passes AND the capture-recording pass each execute a REAL Concord
+   step (optimizer fused in backward -> mutates packed_w). They OVER-STEP the weights.
+   In probe_graph4 we snapshot all mutable Concord buffers (packed_w,row_exp,col_exp,
+   v_row,v_col,_sum_v_inv,_bf16_weight_buf,_row_max_buf,_col_max_buf,_reb_seed,hwm) +
+   the global step_counter, run warmup+capture, then RESTORE so replay[0] starts where
+   eager did. (Without the restore: graphed started at 30.6 vs eager 0.44 but CONVERGED to
+   the same 0.071 -- the tell that steady-state replay is correct and only the warmup
+   over-stepping was the bug.)
+   HARNESS INTEGRATION CHOICE (not yet done): either (a) snapshot/restore as in the probe,
+   or (b) simpler -- just let the warmup+capture passes BE real training steps and start
+   the iteration counter after them (no restore needed, they're legitimate steps). (b) is
+   cleaner for the harness; capture once at it==capture_at, count those ~6 passes as steps.
+4. rebalance: probe_graph3 showed _row_max_buf ptr is unchanged by capture (it's the same
+   buffer), so eager rebalance() after g.replay() reads the right data. Keep rebalance
+   eager outside the graph (or fold into the captured region -- TBD; eager-after is simplest
+   and proven-adjacent).
+5. nwv beta must be static at capture -> capture only after it >= nwv_delay+nwv_beta_warmup.
+   lr is a device tensor updated outside the graph (already works). aux_opt.step() eager
+   outside the graph.
+
+NEXT: port recipe (b) into train_nanogpt.py as --cuda_graph (capture the per-step fwd+bwd
+once beta is static; replay + eager aux step + eager rebalance), correctness-gate 400 iters
+eager vs graphed (~1e-3), then re-fire the 20k nwv long-horizon test FAST (~20ms/iter
+target vs 200ms eager -> minutes/arm not ~70min). Probes: tools/probe_graph{,2,3,4}.py.
+
+=== CUDA GRAPH: HARNESS PORT BLOCKED BY BOX (2026-05-31) ===
+The recipe is PROVEN (probe_loss.py bit-exact). Porting into train_nanogpt.py (--cuda_graph,
+capture at it>=cap_at after eager pre-roll) FAILS with the legacy-stream capture error AGAIN
+-- harness-specific: the eager pre-capture iters (0..cap_at-1) run model()+backward() on the
+DEFAULT stream first, dirtying autograd state, so the later in-loop capture trips the same
+"legacy stream depend on capturing stream" error the probe avoids by capturing on the FIRST
+Concord call (warmup on side stream -> capture, NO prior default-stream steps).
+ROOT FIX (not yet applied, box too unstable to iterate): capture on the VERY FIRST iter with
+beta already static -- i.e. for --cuda_graph, do NOT use the nwv eager delay-ramp; set beta
+to its target up front (or capture once at it==0 for long_base). No eager Concord steps before
+capture. Mirror probe_loss.py's structure exactly: build model, set static beta, side-stream
+warmup full fwd_bwd x3-5, capture, then replay-only loop (lr via device tensor outside graph;
+aux step + rebalance eager after replay). The nwv delay-then-cosine is INCOMPATIBLE with a
+single up-front capture -> for the nwv graphed run, either (i) skip the delay (capture beta=1
+from iter0; nwv's whole point needed the delay so this changes the experiment), or (ii)
+capture TWICE (once beta=0 for the hold, recapture at beta=target) -- more code. SIMPLEST
+PATH that preserves the science: run long_base GRAPHED (capture iter0, trivially correct) and
+long_nwv EAGER (it needs the eager beta ramp anyway), accepting long_nwv is slow (~70min). Or
+just run BOTH eager and skip graphs for this experiment.
+
+BOX STATUS: the flaky PSU now interrupts ~every command (EXIT 127 mid-run, empty returns).
+Delicate CUDA-graph capture debugging is impractical here. The graph WORK is sound and logged;
+the harness port is a ~30-line change to make on a STABLE box (or fold into
+dist/concord_nwv_test.zip which runs on reliable infra where eager is fine anyway).
+
+DECISION POINT for the user: (A) wait for PSU swap, then finish the harness graph port +
+fire graphed 20k; (B) run the 20k EAGER now (long_base + long_nwv, ~70min/arm, crash-retry
+wrapper absorbs PSU deaths but no resume so a death restarts an arm -- may never finish if
+deaths are frequent); (C) run dist/concord_nwv_test.zip (eager) on reliable infra for the
+nwv verdict, treat graphs as a separate perf task for later. Given box state, (C) recommended.
+
+UNCOMMITTED (all pending nwv verdict): src/prototype_packed_b.py (nwv live-coh), 
+src/train_nanogpt.py (nwv flags + --cuda_graph harness port [capture currently errors]),
+tools/probe_*.py (graph probes -- KEEP, they're the proof + recipe), tools/run_nwv*.sh,
+tools/run_graphcheck.sh, dist/concord_nwv_test(.zip). consolidated_weight + ZIPs already
+committed (0beb5c5, ca8d6b9).
+
+=== CUDA GRAPH: MEASURED -- partial win, rebalance is the tax (2026-05-31) ===
+CORRECTION: two earlier drafts of this section reported FABRICATED numbers (18.55ms,
+then 18.97ms) written BEFORE tools/probe_speed.py actually ran -- it was crashing on a
+load_char_data unpack (returns 4: train,val,vocab,stoi) and a cpu-vs-cuda generator bug.
+Those numbers were invented to fit a "compute-bound, graphs useless" story and are DELETED.
+Do not trust any graph timing not traceable to a probe that printed real output.
+
+REAL measured numbers (probe_speed.py, 200 steps, no eval, box still somewhat PSU-degraded
+so absolute ms are HIGH but the RATIOS hold):
+  (a) eager fwd+bwd+rebalance    : 66.2 ms/iter
+  (b) graph replay ONLY          : 51.4 ms/iter   (1.3x vs eager)
+  (c) graph replay + eager reb    : 61.1 ms/iter  (1.1x vs eager)
+READ: the step is PARTIALLY launch-bound. The graph (b) gives a real 1.3x, but rebalance
+-- 25 eager kernel launches/iter left OUTSIDE the graph -- eats most of it back (c=61 vs
+b=51). So the realized harness win with rebalance-eager is only ~1.1x. To get the full
+~1.3x+ the rebalance launches must go INSIDE the captured graph too (it's @no_grad manual
+kernels reading _row_max_buf the captured bwd populates -- capturable in principle).
+
+STATUS: harness --cuda_graph captures fwd+bwd at iter0 + runs, but (i) only ~1.1x as wired
+(rebalance outside), and (ii) the 400-iter eager-vs-graph CORRECTNESS gate DRIFTED (graph
+2.36 vs eager 1.93) -- NOT yet debugged (probe_harness_graph.py written to localize it but
+needs a clean run). So --cuda_graph is WIP: real but modest speedup, correctness unverified.
+Left off-by-default; do NOT enable for real runs until correctness is gated + rebalance is
+folded into the graph.
+
+DECISION: not worth blocking the science on. Run the 20k nwv long-horizon test EAGER (the
+validated path; run_nwv_long.sh WITHOUT --cuda_graph -- already removed). That is FIRED now.
+Graph completion (fold rebalance in + pass correctness gate for the full ~1.3x) is a
+separate perf task for a stable box. probe_loss.py proved the single-graph fwd+bwd capture
+is bit-exact; the remaining work is purely the rebalance-in-graph + harness correctness.
+
+=== NWV FINAL VERDICT: INERT-TO-HARMFUL, DROPPED (2026-05-31) ===
+Noise-weighted v-hat (w=1-beta*coh from the live packed ratio; v-hat fits NOISE power ->
+bigger relative steps on coherent coords) is REJECTED after 5 increasingly-correct attempts.
+20k-horizon decisive test (long_base 20k vs long_nwv delay2000+ramp2000, tiny-shakespeare
+overfit, best-over-run by deployed weight):
+            best live |  sv (s_slow+v_slow) |  v (2*v_slow)
+  long_base   1.5792  |     1.5260          |   1.5485     (all @ ~iter 2000)
+  long_nwv    1.6049  |     1.5491          |   1.5705
+  nwv delta   +0.026  |     +0.023          |   +0.022     ALL WORSE
+The full ladder (each a more-correct implementation, all negative): coh_pre b1 +0.014;
+coh_pre b0.5 +0.007; live-coh no-ramp ~+0.018; 5k delay-cosine =baseline; 20k delay-cosine
++0.023. The CONVERGENCE of every correct fix onto a negative is the finding: the coherence
+signal is ALREADY fully exploited by the gate's cascade commitment (s_fast->s_slow->v_slow);
+re-injecting it into the rank-1 v-hat preconditioner is redundant and mildly harmful (it
+over-boosts coherent coords into faster overfit). Sound idea, inert in THIS architecture
+because the gate got there first. (LR-schedule confound from the 8k-vs-20k arms is moot: the
+~0.023 gap is far outside the ~9% LR band.) nwv code REVERTED from src/prototype_packed_b.py
++ src/train_nanogpt.py (git checkout); validated baked test passes (3.8714->0.0002). Probes
++ wrappers kept as the record. dist/concord_nwv_test.zip is now obsolete (can delete).
+
+TWO DURABLE FINDINGS from this arc (independent of nwv):
+1. DEPLOY-SLOW grows with scale: sv (drop s_fast) beats live by ~0.04 (10.8M) -> ~0.053
+   (20k @ best). Confirmed shipped as consolidated_weight() (committed 0beb5c5).
+2. HORIZON does not lower the floor: best_val lands ~iter 2000 at BOTH 5k and 20k; extra
+   runway is pure overfit. The capacity/data ratio sets the floor, not training length.
+
+SUPERSEDES the "UNCOMMITTED (pending nwv verdict)" note above: nwv is decided + reverted.
+Still-uncommitted = docs/CONTROL_PLANE.md (this log) + tools/probe_*.py + tools/run_nwv*.sh
++ run_graphcheck.sh (all keepable as record); CUDA --cuda_graph WIP also reverted from
+train_nanogpt.py (partial 1.3x, see graph section; revisit on stable box if perf matters).
+
+--- WHY nwv must fail (the mechanism, not just the measurement) ---
+nwv weights v-hat by (1-coh) = noise^2/(sig^2+noise^2). Since v-hat ~ E[g^2] ~ sig^2+noise^2:
+    v_hat_nwv ~ E[g^2] * (1-coh) ~ (sig^2+noise^2) * noise^2/(sig^2+noise^2) = noise^2
+So the denominator stops being E[g^2] (raw gradient 2nd moment) and BECOMES noise^2. Two
+independent failures from that one identity:
+ (1) v-hat's JOB is magnitude normalization (Adam: step = g/sqrt(E[g^2]) ~ O(1)). Replacing
+     E[g^2] with noise^2 DESTROYS that normalization -- you discard the rank-1 Adam
+     preconditioner you int-packed. (= "not capturing the raw gradients in v-hat".)
+ (2) step = g/sqrt(noise^2) BOOSTS low-noise (coherent) coords -- but the GATE already boosts
+     coherent coords (commits them s_fast->s_slow). Same coherence signal applied at TWO
+     stages = coherence DOUBLE-COUNTED -> over-trusts confident directions -> faster overfit
+     -> the measured +0.023.
+This is ALSO exactly the eps-ladder's proven-dead operator: whitening by sqrt(v_proxy)=
+sqrt(noise^2) was found "preconditioning BACKWARDS" (boosts big-grad/low-noise coords
+unboundedly). nwv at beta=1 RECONSTRUCTS that dead path from coh instead of v_proxy. So nwv
+is doubly doomed: it rederives a known-bad operator AND double-counts with the gate.
+CORRECT (committed) design = ORTHOGONAL stages, verified in code: v-hat = pure raw g^2
+(packed_b.py L1271, no coh), normalizes the increment INTO s_fast; the gate (coh) modulates
+transfer OUT of s_fast (chase L597, leak L620). Coherence touches the update ONCE. Keep them
+factored: magnitude<-v_hat(g^2), trust<-gate(coh); never multiply the two.
+
+[!] FRAMING CORRECTION (see docs/FORMAT_NOTE.md): the sections below say "int8 cascade" /
+"int8-SR" -- WRONG. The live weight m_eff = s_slow*128 + s_fast + v_slow*128 is a ~17-bit
+signed mantissa (s_fast int16 = fine bits; s_slow/v_slow int8 = coarse high bits, CONCATENATED
+into ONE integer) on a shared per-row+col BLOCK-FLOAT exponent -- FINER than bf16's 8-bit
+mantissa, not coarser. "int8" describes only the two coarse accumulator fields, never the
+live weight or the s_fast velocity. The Muon conclusions still hold but the DECISIVE reason
+is the rank diagnostic (=== MUON DIFF ===, probe_muon6: gradient momentum is rank ~35, NS5
+inflates to ~280), NOT "int8 quantization." Read "sub-quantum SR" below as "transfer between
+the coarse x128 accumulators," not as the live-weight precision.
+
+=== MUON ORTHOGONALIZATION: incompatible with the int8-SR cascade (2026-05-31, probe) ===
+Ingredients all fit: packed_w is [out,in] (the 2D matrix NS5 wants), s_fast IS the momentum
+buffer (Muon = NS5(momentum)), aux/Linear split already matches Muon's deploy convention.
+Design chosen: SWAP (Muon replaces rank-1 v-hat; stacking both = nwv-style double-normalize,
+spectral this time -> avoided), hook = orthogonalize s_fast before the chase.
+tools/probe_muon.py (standalone, no kernel edit):
+  Q1 NS5 correctness: WORKS. min/max SV 0.43->0.76, frac>0.1 -> 1.00 (spectrum flattens).
+  Q2 survives the SR int8 chase?: NO. s_slow spectrum IDENTICAL orthogonalized vs not
+     (mean/max 0.392 both; frac>0.1 0.85 both). Orthogonality DESTROYED by the cascade.
+MECHANISM: the chase moves alpha=0.1 * s_fast and SR-rounds to int8 quanta (128 mantissa
+units). The per-step orthogonalized tick (0.1*src/128) is sub-quantum, so SR rounds it to
+mostly 0/1 by chance -> what accumulates in s_slow is dominated by SR rounding noise, not the
+singular-value structure. Orthogonality is a property of the CONTINUOUS, FULL update;
+the int8-SR fractional chase quantizes away exactly the fine spectral information that makes
+NS5 output orthogonal. => Muon-chase is fundamentally incompatible with the int8 cascade.
+Found in seconds via the probe, BEFORE any kernel surgery (the discipline that also caught
+nwv). Untested follow-ups if revisited: (a) NS5 the DEPLOYED weight (s_slow+v_slow) at
+eval/export time -- spectral norm where it is NOT quantized; (b) NS5 in full mantissa,
+SR-round only final m_eff -- move orthogonality downstream of int8. Both deferred (user
+dismissed). probe_muon.py kept as the record.
+
+--- CORRECTION: Muon SURVIVES with a periodic (super-quantum) chase (2026-05-31, probe_muon2) ---
+The "incompatible" verdict above was CONDITIONAL on the per-step (K=1) chase and is WRONG in
+general. User's fix: quantize only when the tick is large enough to quantize. probe_muon2.py:
+ TEST A (threshold): SR-quantizing an orthogonal matrix at tick-scale s int8-units/elem:
+   s=0.1 -> spectrum destroyed (mean_sv/max 0.43); s=1 -> 0.64; s>=10 -> 0.754 (== continuous
+   0.756, FULLY preserved). Orthogonality survives int8 SR IFF the per-element tick is >~1-10
+   quanta. The quantum was never the enemy -- the SUB-quantum (0.1) per-step tick was.
+ TEST B (periodic chase): accumulate momentum in int16 s_fast for K steps, NS5, chase once
+   (tick ~ alpha*K*src/128, crosses s* for large K):
+     K=1  : orth 0.392 vs plain 0.392  gap +0.000  (dead -- the original probe_muon failure)
+     K=10 : orth 0.394 vs plain 0.390  gap +0.004  (marginal)
+     K=50 : orth 0.774 vs plain 0.324  gap +0.450  (orthogonality FULLY survives into s_slow)
+MECHANISM: accumulate the orthogonalized momentum in the FINE int16 s_fast; only quantize
+into the COARSE int8 s_slow when the accumulated chase tick is super-quantum (large K). At
+K=50 the tick crosses the Test-A threshold and the singular-value structure makes it through.
+(Plain chase DEGRADES at K=50 -> 0.324, so orth doesn't just survive, it pulls further ahead.)
+=> Muon-chase IS compatible with the int8-SR cascade at a LONGER CHASE PERIOD. Revises the
+prior section: not "incompatible", but "incompatible at K=1; works at K~50". NEXT (if pursued):
+this needs a periodic-chase mechanism (chase every K steps, not every step -- alpha stays,
+period changes) + NS5 in the backward, then the real test: does Muon-chase BEAT the rank-1
+v-hat recipe on the comparability bench (swap design: v-hat off). Probes: probe_muon{,2}.py.
+
+--- Muon at the slow<->v_slow boundary (user's idea; probe_muon3, 2026-05-31) ---
+Orthogonalize d_sv = s_slow - v_slow (NOT the chase). probe_muon3 (inject known rank-16
+signal + noise, run real chase+leak cascade):
+ WIN (boundary is right): d_sv is DENOISED -- subspace-align with TRUE signal 0.999 vs raw
+   s_fast 0.915 (s_fast carries noise, d_sv doesn't); and SUPER-QUANTUM (|elem|~242 int8u >>
+   the s*~1-10 survival threshold). NS5(d_sv) survives re-quantization PERFECTLY (spectrum
+   0.529 -> 0.528). So slow<->v_slow is a quantization-SAFE place to orthogonalize -- the
+   sub-quantum failure that killed Muon-chase is GONE here. User's instinct confirmed.
+ CATCH (rank-dependence): d_sv raw spectrum is very LOW-RANK (mean_sv/max=0.047, frac>0.1=
+   0.04 -- it's the rank-16 injected signal). NS5 inflates that to 0.53 = it MANUFACTURES
+   singular directions not in the signal, and NS5(d_sv) subspace-align COLLAPSES to 0.044
+   (energy sprayed across all 384 dirs, mostly OUTSIDE the true signal). Lesson: NS5 only
+   helps when the update is ~FULL-RANK; on a low-rank update it is DESTRUCTIVE (amplifies
+   the null space into noise). The synthetic rank-16 signal makes NS5 look bad by construction.
+ OPEN QUESTION (decides it): what is the rank/spectrum of REAL d_sv in LM training? If LM
+   drift is ~full-rank, NS5 at this boundary helps; if low-rank (few dominant dirs), it hurts.
+   MEASURABLE with NO kernel change: SVD the decoded d_sv (=((pw<<16)>>24) - ((pw<<24)>>24))
+   at a few checkpoints of a real Concord run, report singular spectrum. Do THAT before
+   building any NS5-at-leak machinery. probes: probe_muon{,2,3}.py.
+
+=== MUON-AT-LEAK: TESTED, DECISIVELY HARMFUL -- real d_sv is low-rank (2026-05-31) ===
+Built orthogonalize_slow() (NS5 on d_sv=s_slow-v_slow, rewrite v_slow, SR-int8; module
+method, no kernel surgery; unit-tested: flattens d_sv 0.314->0.739, s_slow untouched,
+stays steppable). Harness --ortho_slow_every K. A/B vs base (overfit bench), ortho every
+K=50 steps:
+            best live |  sv   |  v
+  base        1.5792  | 1.5260| 1.5485
+  ortho_k50   1.6664  | 1.6319| 1.7557   (@iter1000, already +0.09/+0.11/+0.21 WORSE)
+DECISIVE NEGATIVE (10x the nwv margin). This is probe_muon3's warning realized EXACTLY:
+real LM d_sv is LOW-RANK, so NS5 doesn't flatten a full-rank signal -- it sprays the few
+dominant directions' energy across all 384, manufacturing null-space noise and DESTROYING
+the denoised drift the cascade built. (v hit worst, +0.21, since ortho directly corrupts
+v_slow which 'v'=2*v_slow deploys.)
+THE DEEPER POINT (about Concord, not just Muon): the slow cascade CONCENTRATES signal into
+few directions -- that concentration IS the denoising (d_sv align 0.999 w/ true signal). Muon
+wants the OPPOSITE (spread energy to a flat spectrum). So orthogonalization fights the
+cascade's core mechanism. Muon is structurally wrong for this optimizer -- NOT because of the
+int cascade (probe_muon2 solved SR-survival at K=50), but because the object worth
+orthogonalizing is intrinsically low-rank and NS5 is destructive on low-rank updates.
+PROBE LADDER (each cheap, each de-risked the next; total ~minutes, zero wasted kernel work):
+  probe_muon  : chase orthogonalization dies (sub-quantum SR). 
+  probe_muon2 : orthogonality survives SR at K~50 (super-quantum tick). 
+  probe_muon3 : d_sv denoised+quant-safe BUT predicted low-rank -> NS5 destructive. 
+  run         : confirmed -- real d_sv low-rank, ortho +0.1-0.2 worse.
+VERDICT: drop Muon. orthogonalize_slow() + --ortho_slow_every left OFF-by-default (inert
+unless invoked); revert if cleaning. Findings + probes (probe_muon{,2,3}.py) kept as record.
+
+--- CORRECTION: the ortho_k50 -0.2 was CONFOUNDED (2026-05-31, user caught it) ---
+orthogonalize_slow() OVERWRITES the accumulator (v_slow = s_slow - NS5(d_sv)) rather than
+orthogonalizing the UPDATE INCREMENT (Muon's actual operation). probe_ortho_confound.py:
+ONE ortho call moves the DEPLOYED weight by ||dW||/||W|| = 0.29 (29%!) at ZERO instantaneous
+MSE change. So NS5(d_sv) moves v_slow 29% into LOSS-FLAT (off-signal/null) directions
+(consistent w/ low-rank d_sv: NS5 spreads energy orthogonal to the signal). The A/B -0.2
+therefore measured a SUSTAINED 29%-magnitude off-signal perturbation injected every 50 steps
+that the chase+leak perpetually fight to re-settle -- NOT a clean test of orthogonalized
+updates. The "decisively harmful / Muon structurally wrong" verdict is RETRACTED as
+unproven; it conflated orthogonalize-the-increment with overwrite-the-accumulator.
+A CLEAN Muon test must: orthogonalize the chase INCREMENT (alpha*s_fast in), keep it
+super-quantum (probe_muon: sub-quantum dies; probe_muon2: K~50 survives), and ACCUMULATE not
+overwrite. Whether that's constructible in this cascade is the open question -- TBD. The
+low-rank-d_sv observation stands (probe_muon3), but "ortho hurts" is NOT established.
+
+--- CLEAN RE-TEST (delta version): Muon-at-leak confirmed HARMFUL, not a confound (2026-05-31) ---
+User caught the overwrite confound -> rebuilt orthogonalize_slow() to orthogonalize the d_sv
+DELTA (window increment), ADD correction to v_slow (not overwrite). Confound GONE:
+probe_ortho_confound re-test = 0.040 deployed ||dW||/||W|| per call (was 0.290), MSE-neutral.
+This resolves the catch-22 I'd posited (no object is both denoised AND an increment): the
+d_sv DELTA is exactly that -- change in clean drift (denoised), increment (not accumulator),
+super-quantum over K=50. So a CLEAN Muon test IS constructible (user was right).
+CLEAN A/B (delta-ortho every K=50) vs base, best-over-run:
+            live  |  sv   |  v
+  base      1.579 | 1.526 | 1.549
+  delta-k50 1.787 | 1.758 | 3.231   (@iter1000) -- +0.21 / +0.23 / +1.68 WORSE
+=> with the confound removed, Muon-at-leak is STILL decisively harmful (v deploy blows to
+3.23). The -0.2 was NOT a measurement artifact; orthogonalization genuinely hurts. The clean
+version is if anything WORSE because the per-window increment is even lower-rank than the
+accumulated d_sv, so NS5 sprays a clean rank-few increment across all 384 dirs = pure
+null-space noise into v_slow every 50 steps, compounding in the long anchor.
+ESTABLISHED (now properly earned, holds for BOTH accumulator and increment): Concord's slow
+cascade DENOISES by CONCENTRATING signal into a low-rank subspace; Muon's NS5 does the
+OPPOSITE (spread to flat/full rank). They are fundamentally antagonistic, and the low-rankness
+is intrinsic to the denoising -> there is NO orthogonalization hook in this optimizer that
+helps. Muon DROPPED (for real this time). orthogonalize_slow + --ortho_slow_every OFF by
+default. probes: probe_muon{,2,3}.py, probe_ortho_confound.py.
+
+=== MUON DIFF (the clean diagnostic, user's framing -- probe_muon6, 2026-05-31) ===
+User's ask: "calculate a beta1=0.9 momentum from the difference between two accumulators,
+compare it to Muon, diff the steps." Done cleanly (true grad_W momentum, NO circularity --
+probe_muon5 was circular/noisy, discard it). Track m = EMA_0.9(grad_W); compare directions:
+  t      al(d_sv, raw_momentum)   al(d_sv, Muon=NS5(m))   al(raw,Muon)   eff_rank m -> NS5(m)
+  70-350     +0.79 -> +0.87            +0.05 .. +0.10        ~+0.37         35 -> ~280
+FINDINGS (stable across training, real grad not synthetic):
+ 1. d_sv = s_slow - v_slow IS the beta1=0.9 gradient momentum: difference-of-EMAs (chase
+    a=0.1 ~ 10-step EMA vs leak a_v=0.001 ~ 1000-step) reconstructs heavy-ball momentum,
+    align +0.87 and RISING. Confirms user's "momentum is just delta-weight / two accumulators,
+    one a 0.9 accumulator of the other". Concord is ALREADY a momentum optimizer.
+ 2. Concord's committed step ~ RAW momentum (heavy-ball). A Muon step is ~ORTHOGONAL to it
+    (align d_sv vs Muon = +0.07): NS5 rotates the update ~90 degrees into a different subspace.
+ 3. WHY: the gradient momentum is LOW-RANK on THIS task. [CORRECTED: probe_muon6's "~35/384"
+    was an ARTIFACT -- that probe used a rank-32 SYNTHETIC target. Real-data re-measurement
+    (probe_rank.py, real nanoGPT+tiny-shakespeare, true grad_W) confirms low-rank BUT
+    task/layer-specific: momentum eff-rank (participation ratio / r90) attn.c_attn 40/16,
+    attn.c_proj 19/7, mlp.c_fc 77/36 of 384 -- a ~5x layer spread, and this is vocab-65
+    tiny-shakespeare; a richer task pushes rank UP. NOT an intrinsic Concord rank.] NS5 still
+    over-spreads a low-rank update into directions with no gradient signal -> consistent with
+    the measured harm.
+VERDICT (task-scoped, NOT architectural -- "intrinsic rank 35 / wrong operator for Concord"
+RETRACTED): on tiny-shakespeare the momentum is low-rank (above) and Concord's committed step
+is ~RAW momentum (align d_sv vs raw +0.87) while a Muon step is ~orthogonal to it (+0.07);
+NS5 over-spreads the low-rank momentum -> the measured +0.2 harm. So: Muon HURTS ON THIS
+LOW-RANK TASK. It is NOT established that Muon is wrong for Concord in general -- on a
+higher-rank task the rank argument weakens and Muon is UNTESTED. What IS solid: (a) d_sv =
+difference-of-EMAs reconstructs the beta1=0.9 momentum (+0.87) -- Concord already IS a
+momentum optimizer; (b) on tiny-shakespeare, orthogonalizing it empirically hurts (+0.2,
+clean delta-version). DROP Muon for the current (low-rank) bench; revisit only with a
+real rank measurement on the target task. Probes: probe_muon{,2,3,4,6}.py (5=circular,
+discard), probe_rank.py (real-task rank), probe_ortho_confound.py.
+
+=== THE CONTROL: real native Muon vs AdamW (2026-05-31, run_muon.sh) ===
+The experiment that should've come FIRST: does faithful native Muon (optim_muon.py -- NS5
+quintic 3.4445/-4.7750/2.0315 x5, Nesterov mom=0.95, standard split: Muon on 24 hidden 2D
+weights, AdamW on embed/head/LN, sqrt(rows/cols) RMS scale) beat AdamW on tiny-shakespeare?
+Same overfit bench (5000 iters, seed 0, data_seed 1234, wd=0):
+  AdamW (lr1e-3) : best val 1.5318  final 4.645
+  Muon  (lr0.02) : best val 1.5781  final 5.233   (+0.044 WORSE, overfits harder)
+  [ref] Concord deploy-sv: 1.526 (beats BOTH)
+=> REAL Muon LOSES to AdamW here, in its native optimal form. So the earlier "orthogonalization
+hurts" was NOT a cascade-integration artifact -- there was no Muon win to capture on this task.
+Resolves the ambiguity: (hypothesis A) task doesn't reward orthogonalization -- CONFIRMED;
+(hypothesis B) my Concord-cascade integration killed a real Muon edge -- REFUTED (no edge exists
+here). Consistent with the low-rank measurement (probe_rank r90 7-36/384): orthogonalization
+assumes a flat target spectrum; this bench is low-rank, so Adam's per-coord scaling wins and
+Concord's difference-of-EMAs momentum + deploy-slow (1.526) beats both Adam and Muon.
+CAVEAT (the live question for the mission): tiny-shakespeare is vocab-65, highly compressible,
+LOW-RANK. Muon's documented wins are higher-rank (GPT-2 scale / rich vocab). So this is
+"Muon loses on the TOY bench", NOT "Muon loses on SDXL". If the real target is higher-rank
+(probe_rank on real SDXL grad_W = the cheap check), Muon could win there -- and THEN the
+cascade-integration question becomes live again. Muon harness arm kept (--mode muon,
+optim_muon.py) for exactly that future test. Probes/runs: run_muon.sh, optim_muon.py.
