@@ -767,3 +767,28 @@ LOW-RANK. Muon's documented wins are higher-rank (GPT-2 scale / rich vocab). So 
 (probe_rank on real SDXL grad_W = the cheap check), Muon could win there -- and THEN the
 cascade-integration question becomes live again. Muon harness arm kept (--mode muon,
 optim_muon.py) for exactly that future test. Probes/runs: run_muon.sh, optim_muon.py.
+
+=== RANK-AWARE ORTHOGONALIZATION: well-posed in theory, ILL-POSED on real d_sv (2026-05-31) ===
+User's idea: don't full-Muon (drive all 384 SVs to 1 = pump ~349 noise dirs); orthogonalize
+ONLY within the update's actual rank (equalize top-k signal SVs to 1, rest to 0; target
+U_k Vh_k). Two probes:
+ probe_muon7 (synthetic, KNOWN rank-16 signal): MECHANICALLY SOUND at the right k --
+   raw d_sv align 0.999 | full NS5 (Muon) align 0.044 (eff_rank 298) | rank-k k=16 align 1.000
+   (eff_rank 16) | k=2R align 0.500 | k=64 align 0.250. So k=true-rank is surgical, but
+   OVERSHOOTING k is catastrophic (noise dirs orthonormalized to unit weight dominate).
+   Undershoot safe, overshoot destructive -> need a CONSERVATIVE, ACCURATE k.
+ probe_spectrum (REAL d_sv, real nanoGPT+tiny-shakespeare, 384x384 attn proj, it100-800):
+   NO CLEAN GAP. SVs taper smoothly: sv[0,5,10,20,40,80,160,320] = 1.0, 0.69, 0.40, 0.16,
+   0.11, 0.087, 0.057, 0.014. Sharpest adjacent knee only x1.2-1.7 (a real gap is x5-10+),
+   and its location WANDERS (rank 3->7->13->9, unstable). Energy ranks spread hugely:
+   r50=5, r90=73, r99=227 of 384.
+VERDICT: rank-aware ortho is well-posed for low-rank-PLUS-CLEAN-GAP signals (the synthetic
+probe) but ILL-POSED on real LM updates, which have a SMOOTH (power-law-ish) spectrum with no
+signal/noise boundary. Any fixed k either TRUNCATES real signal (knee ~rank 5-13 discards the
+0.4-0.7 SVs in ranks 5-20) or INFLATES real noise (r90=73 orthonormalizes dozens of
+0.08-magnitude dirs to 1.0 = probe_muon7's destructive overshoot). There is no good k.
+This is the ROOT reason every Muon variant failed: not "k=384 too big" but "the update
+spectrum is smooth, so NO rank-equalization target is clean." Orthogonalization assumes a
+spectrum you can cleanly equalize; real d_sv isn't one. CLOSES the orthogonalization line.
+(Caveat unchanged: tiny-shakespeare; a higher-rank task MIGHT have a gap -- re-probe_spectrum
+on the real target before reviving this.) Probes: probe_muon7.py, probe_spectrum.py.
