@@ -1,19 +1,25 @@
-"""Independent token control plane for SDXL text encoders.
+"""Independent, spec-driven token control plane for SDXL text encoders.
 
-A separate, inspectable override layer over a FROZEN token_embedding. Specific tokens
-(existing single tokens, OR whole words added as new single tokens) are routed to
-controlled values; the rest of the vocab is untouched. Per-token modes:
-  - sanitize -> ZERO (the token contributes nothing -> suppress the concept)
-  - fix(vec) -> a fixed value (e.g. a neutral word's embedding, often a cleaner
-                sanitizer than zero, since zero still leaves an attended empty slot)
-  - (trainable -> the Concord hybrid composes on top, for real concept tokens)
+You declare a LIST of tokens and, per token, a MODE and an explicit INIT. The
+control plane (a drop-in replacement for the frozen token_embedding) sets it all
+up; the embedding trainer then just runs forward/backward -- trainable tokens
+self-step, static tokens stay fixed -- with NO monkeypatching, because the spec is
+encoded in the module's structure (buffers for static, Concord modules for
+trainable), not in the training loop.
 
-Most explicit words are MULTI-token in CLIP (tok -> pen+is), so they can't be
-zeroed at the vocab-row level (the pieces are shared with innocuous words). The
-fix: add the whole word as one new token, then control THAT id. Control is
-independent of the base weights -- save/load/toggle cp.state_dict() separately.
+  TokenSpec(token, mode, init)
+    mode  = "sanitize" -> ZERO  (suppress; the token contributes nothing)
+            "fix"      -> a fixed static value (e.g. a neutral token's embedding)
+            "train"    -> a norm-preserving Concord embedding (trains, self-steps)
+    init  = explicit only (NO subword-mean):
+            torch.Tensor [dim] | "zero" | "random" | a SINGLE-token word to copy.
+            (a multi-token init word is an error -- give a vector instead.)
+
+Whole words that are multi-token in CLIP (tok -> pen+is) are added as one new
+token so they tokenize to a single controlled id.
 """
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
@@ -21,73 +27,118 @@ sys.path.insert(0, str(Path(__file__).parent.resolve()))
 import torch
 import torch.nn as nn
 
+from concord_embedding_packed import ConcordPackedEmbedding
+
+
+@dataclass
+class TokenSpec:
+    token: str
+    mode: str = "train"                 # "sanitize" | "fix" | "train"
+    init: object = "zero"               # tensor | "zero" | "random" | single-token word
+
+
+def resolve_init(init, tokenizer, base_weight):
+    """Explicit init -> a [dim] vector. No subword-mean: a multi-token init word errors."""
+    dim, dev = base_weight.shape[1], base_weight.device
+    if torch.is_tensor(init):
+        return init.float().reshape(dim).to(dev)
+    if init in (None, "zero"):
+        return torch.zeros(dim, device=dev)
+    if init == "random":
+        return torch.randn(dim, device=dev) * 0.05
+    if isinstance(init, str):
+        ids = tokenizer(init, add_special_tokens=False).input_ids
+        if len(ids) != 1:
+            raise ValueError(f"init word '{init}' is {len(ids)} CLIP tokens; pass a "
+                             f"single-token word or an explicit vector (no subword-mean)")
+        return base_weight[ids[0]].float().to(dev)
+    raise ValueError(f"unrecognized init {init!r}")
+
 
 class ControlPlaneEmbedding(nn.Module):
     def __init__(self, base):
         super().__init__()
-        self.base = base                                  # nn.Embedding, frozen
-        self.V0, self.dim = base.weight.shape             # original vocab size
+        self.base = base                                    # nn.Embedding, frozen
+        self.V0, self.dim = base.weight.shape
         d = base.weight.device
-        self.register_buffer("route", torch.full((self.V0,), -1, dtype=torch.long, device=d))
-        self.register_buffer("vals", torch.zeros(1, self.dim, dtype=base.weight.dtype, device=d))
+        # per-id routing: kind 0=base, 1=static, 2=trainable; idx into the kind's table.
+        self.register_buffer("kind", torch.zeros(self.V0, dtype=torch.int8, device=d))
+        self.register_buffer("idx", torch.zeros(self.V0, dtype=torch.long, device=d))
+        self.register_buffer("static_vals", torch.zeros(1, self.dim, dtype=base.weight.dtype, device=d))
+        self.trainable = None                               # ConcordPackedEmbedding (lazily)
 
     @torch.no_grad()
     def _grow(self, max_id):
-        if max_id >= self.route.shape[0]:
-            extra = torch.full((max_id + 1 - self.route.shape[0],), -1,
-                               dtype=torch.long, device=self.route.device)
-            self.route = torch.cat([self.route, extra])
+        n = max_id + 1 - self.kind.shape[0]
+        if n > 0:
+            d = self.kind.device
+            self.kind = torch.cat([self.kind, torch.zeros(n, dtype=torch.int8, device=d)])
+            self.idx = torch.cat([self.idx, torch.zeros(n, dtype=torch.long, device=d)])
 
     @torch.no_grad()
-    def sanitize(self, ids):
-        ids = torch.as_tensor(ids, device=self.route.device)
-        self._grow(int(ids.max()))
-        self.route[ids] = 0                               # -> the zero row
+    def set_zero(self, tid):
+        self._grow(tid); self.kind[tid] = 1; self.idx[tid] = 0     # static row 0 = zero
 
     @torch.no_grad()
-    def fix(self, ids, vecs):
-        ids = torch.as_tensor(ids, device=self.route.device)
-        self._grow(int(ids.max()))
-        start = self.vals.shape[0]
-        self.vals = torch.cat([self.vals, vecs.to(self.vals).reshape(len(ids), self.dim)])
-        self.route[ids] = torch.arange(start, start + len(ids), device=self.route.device)
+    def set_fixed(self, tid, vec):
+        self._grow(tid)
+        row = self.static_vals.shape[0]
+        self.static_vals = torch.cat([self.static_vals, vec.to(self.static_vals).reshape(1, self.dim)])
+        self.kind[tid] = 1; self.idx[tid] = row
 
-    def controlled(self):
-        return int((self.route >= 0).sum())
+    def attach_trainable(self, tids, inits, lr, target_norm):
+        """tids: list of ids; inits: [K, dim]. Builds the Concord trainable embedding
+        and routes those ids to its rows."""
+        self.trainable = ConcordPackedEmbedding(len(tids), self.dim, device=self.kind.device,
+                                                lr=lr, target_norm=target_norm)
+        self.trainable.init_tokens(init=inits)
+        with torch.no_grad():
+            for row, tid in enumerate(tids):
+                self._grow(tid); self.kind[tid] = 2; self.idx[tid] = row
 
     def forward(self, input_ids):
-        emb = self.base(input_ids.clamp(max=self.V0 - 1))     # new ids get overridden below
-        r = self.route[input_ids.clamp(max=self.route.shape[0] - 1)]
-        m = r >= 0
-        if m.any():
-            emb = torch.where(m.unsqueeze(-1), self.vals[r.clamp(min=0)], emb)
-        return emb
+        flat = input_ids.reshape(-1)
+        emb = self.base(flat.clamp(max=self.V0 - 1))
+        c = self.kind[flat.clamp(max=self.kind.shape[0] - 1)]
+        i = self.idx[flat.clamp(max=self.idx.shape[0] - 1)]
+        sm = c == 1
+        tm = c == 2
+        if sm.any() or tm.any():
+            emb = emb.clone()
+            if sm.any():
+                emb[sm] = self.static_vals[i[sm]].to(emb.dtype)
+            if tm.any() and self.trainable is not None:
+                emb[tm] = self.trainable(i[tm]).to(emb.dtype)
+        return emb.reshape(*input_ids.shape, self.dim)
 
 
-def _wrap(te):
-    emb = te.get_input_embeddings()
-    if not isinstance(emb, ControlPlaneEmbedding):
-        emb = ControlPlaneEmbedding(emb)
-        te.text_model.embeddings.token_embedding = emb
-    return emb
-
-
-def sanitize_words(te, tokenizer, words, verbose=True):
-    """Suppress each WORD: if it's a single existing token, zero it; if multi-token
-    (the usual case for explicit terms), add it as one new token and zero THAT, so the
-    word tokenizes to a controlled id. Returns the ControlPlaneEmbedding."""
-    cp = _wrap(te)
-    existing, added = [], []
-    for w in words:
-        ids = tokenizer(w, add_special_tokens=False).input_ids
-        if len(ids) == 1:
-            cp.sanitize(ids); existing.append(w)
+def apply_token_spec(te, tokenizer, specs, lr=5e-3):
+    """Configure a control plane on `te` from a list of TokenSpec. Returns it; its
+    `.trainable` (Concord) is what the trainer's loss.backward() self-steps -- the
+    static tokens are buffers and never move. No monkeypatching."""
+    base = te.get_input_embeddings()
+    cp = base if isinstance(base, ControlPlaneEmbedding) else ControlPlaneEmbedding(base)
+    if cp is not base:
+        te.text_model.embeddings.token_embedding = cp
+    raw = cp.base.weight
+    median = raw.float().norm(dim=1).median().item()
+    train_ids, train_inits = [], []
+    for s in specs:
+        ids = tokenizer(s.token, add_special_tokens=False).input_ids
+        if len(ids) == 1 and not s.token.startswith("<"):
+            tid = ids[0]                                     # existing single token
         else:
-            tokenizer.add_tokens(w)
-            cp.sanitize([tokenizer.convert_tokens_to_ids(w)]); added.append(w)
-    if verbose:
-        print(f"  zeroed {len(existing)} existing single tokens {existing} + "
-              f"{len(added)} multi-token words added-then-zeroed {added}")
+            tokenizer.add_tokens(s.token); tid = tokenizer.convert_tokens_to_ids(s.token)
+        if s.mode == "sanitize":
+            cp.set_zero(tid)
+        elif s.mode == "fix":
+            cp.set_fixed(tid, resolve_init(s.init, tokenizer, raw))
+        elif s.mode == "train":
+            train_ids.append(tid); train_inits.append(resolve_init(s.init, tokenizer, raw))
+        else:
+            raise ValueError(f"bad mode {s.mode!r}")
+    if train_ids:
+        cp.attach_trainable(train_ids, torch.stack(train_inits), lr, median)
     return cp
 
 
@@ -98,18 +149,33 @@ if __name__ == "__main__":
         r"C:\Concord\albedobaseXL_v21.safetensors", torch_dtype=torch.bfloat16).to(dev)
     for m in (pipe.text_encoder, pipe.text_encoder_2):
         m.requires_grad_(False)
-    ADULT = ["tok", "tok", "tok", "nude", "naked"]
 
-    for tag, te, tok in (("L", pipe.text_encoder, pipe.tokenizer),
-                         ("G", pipe.text_encoder_2, pipe.tokenizer_2)):
-        print(f"[{tag}]")
-        cp = sanitize_words(te, tok, ADULT)
-        nid = tok.convert_tokens_to_ids("tok")          # now a single controlled id
-        ids = torch.tensor([[nid]], device=dev)
-        print(f"  'tok' -> controlled id {nid}, embedding norm {cp(ids).norm():.3f} (zeroed)")
-        dog = tok("dog", add_special_tokens=False).input_ids[0]
-        d = torch.tensor([[dog]], device=dev)
-        print(f"  unrelated 'dog' token unchanged: {torch.equal(cp(d), cp.base(d))} | "
-              f"{cp.controlled()} ids controlled, rest of {cp.V0} vocab untouched")
-    print("\n[done] independent control plane: explicit words tokenize to one id and "
-          "zero out; base frozen + intact. fix(neutral) instead of zero is an option.")
+    te, tok = pipe.text_encoder, pipe.tokenizer
+    man = te.get_input_embeddings().weight[tok("man", add_special_tokens=False).input_ids[0]]
+    SPEC = [
+        TokenSpec("tok",   "sanitize"),                          # multi-token -> added + zeroed
+        TokenSpec("tok", "fix",   init="person"),              # redirect to 'person' embedding
+        TokenSpec("<tok>",  "train", init="man"),                 # trainable, copy 'man' to start
+        TokenSpec("<char1>", "train", init=man.float() * 0.5),     # trainable, explicit vector
+        TokenSpec("<blank>", "train", init="zero"),                # trainable, from zero
+    ]
+    cp = apply_token_spec(te, tok, SPEC, lr=5e-2)
+    g = lambda w: cp(torch.tensor([[tok.convert_tokens_to_ids(w)]], device=dev)).norm().item()
+    print(f"[modes] sanitize 'tok' norm {g('tok'):.3f} (0) | fix 'tok' norm "
+          f"{g('tok'):.3f} (=person) | trainable '<tok>' norm {g('<tok>'):.3f} (median-pinned)")
+    dog = torch.tensor([[tok('dog', add_special_tokens=False).input_ids[0]]], device=dev)
+    print(f"[intact] 'dog' untouched: {torch.equal(cp(dog), cp.base(dog))} | "
+          f"trainable module: {cp.trainable.K} tokens, {cp.trainable.core.packed_w.numel()*4} bytes")
+
+    # the trainer just runs backward; only the 3 trainable tokens self-step.
+    import torch.nn.functional as F
+    ids = torch.tensor([[tok.convert_tokens_to_ids("<tok>"),
+                         tok.convert_tokens_to_ids("<char1>"),
+                         tok.convert_tokens_to_ids("<blank>")]], device=dev)
+    before = cp.trainable.deploy_weight().float().clone()
+    for _ in range(20):
+        F.mse_loss(cp(ids).float(), torch.randn(1, 3, 768, device=dev) * 3).backward()
+    moved = (cp.trainable.deploy_weight().float() - before).norm(dim=1)
+    print(f"[train] 3 trainable tokens moved {moved.mean():.3f}; deploy norms "
+          f"{cp.trainable.deploy_weight().norm(dim=1).mean():.3f} (still median-pinned). "
+          f"static tokens unchanged -- no monkeypatching, the spec is the structure.")
