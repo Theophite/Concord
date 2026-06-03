@@ -17,16 +17,25 @@ Best validation loss, head-to-head, same bench:
 Concord at **32 b/param beats both AdamW and Muon** on this bench. The shipped default is
 the **bare recipe** (no knobs); the win comes from two pieces, both included here:
 
-> **Tentatively best (not the shipped default): the "split" un-stranding config.** A separate
-> overfit run found that the ratio-coherence variant with `chase_floor_min=0.1` +
-> `gf_consol=50` ("split-the-difference": a small chase floor banks borderline-coherent mass
-> losslessly, light evaporation trims clearly-dead noise) deploys at **sv 1.517** — the lowest
-> deployed val in the study, and ~0.03 below *that run's* bare-nogate (1.550). CAVEAT: it has
-> NOT been A/B'd same-seed against the 1.526 headline above (different run/seed; 1.517 vs 1.526
-> is within the run-noise band). So it is **promising, not confirmed**. The machinery is shipped
-> (`set_ratio_coh`, `set_ratio_coh_floors`, `--gf_consol`, off by default); to reproduce:
-> `--ratio_coh --ratio_chase_floor_min 0.1 --ratio_leak_floor_min 0.1 --gf_consol 50`. A clean
-> same-seed A/B vs bare-nogate is the open task to promote it from tentative to default.
+> **CONFIRMED best (opt-in): the "split" un-stranding config.** A clean **same-seed A/B**
+> (`seed 0`, identical validated recipe, both arms) settles it: the ratio-coherence variant
+> with `chase_floor_min=0.1` + `gf_consol=50` ("split-the-difference": a small chase floor
+> banks borderline-coherent mass losslessly, light evaporation trims clearly-dead noise) is
+> the best deployed weight measured:
+>
+> | same-seed A/B | best live | **deploy sv** |
+> |---|---|---|
+> | bare recipe (nogate) | 1.5700 | 1.5404 |
+> | **split (+consol)** | **1.5563** | **1.5180** |
+> | Δ | −0.014 | **−0.022** |
+>
+> The split beats the bare recipe by **0.022 on the deployed weight** (4× the ~0.005 noise
+> bar) head-to-head — confirming the earlier cross-run hint. It is an **opt-in** (4 flags),
+> not the zero-knobs shipped default, but it is the best Concord config on this bench. The
+> machinery is shipped (`set_ratio_coh`, `set_ratio_coh_floors`, `--gf_consol`, off by
+> default); to use:
+> `--ratio_coh --ratio_chase_floor_min 0.1 --ratio_leak_floor_min 0.1 --gf_consol 50`.
+> (Still single-bench / single-seed-pair; multi-seed + the real target remain to generalize.)
 
 1. **The validated recipe** = a bare `ConcordLinearPackedB`. No knobs to set. It is
    rank-1 v̂ AdamW (Adafactor row×col E[g²]; `v_scale=0`, `gf_trust_delta_sq=1`,

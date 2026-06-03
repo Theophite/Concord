@@ -350,15 +350,21 @@ s_slow+v_slow (drop s_fast). All OFF by default; validated recipe (+ZIP) unchang
 Knobs: --ratio_chase_floor_min / --ratio_leak_floor_min (floor targets), --gf_consol (evap
 rate, rho_eff=lr*gf_consol), --fast_gain_anneal, --eval_consolidated, --watch_accum.
 
-TENTATIVELY BEST (2026-06-01, recorded but NOT confirmed): the split-the-difference config
-+consol (--ratio_coh --ratio_chase_floor_min 0.1 --ratio_leak_floor_min 0.1 --gf_consol 50)
-deploys at sv=1.517 -- the LOWEST deployed val in the study -- and within ITS run beat that
-run's bare-nogate (1.550) by ~0.03. CAVEAT: never A/B'd same-seed vs the 1.526 headline
-nogate (separate run; 1.517 vs 1.526 is within the run-noise band ~0.01). So PROMISING, not
-proven. Machinery already committed (concord/packed_b.py + train_nanogpt.py have the ratio/
-floor-min/gf_consol knobs; tools/run_combo.sh, run_evap.sh). OPEN TASK (PSU now fixed): one
-clean same-seed A/B, bare-nogate vs +consol, deployed-sv, to promote from tentative -> default
-(or refute). Until then the SHIPPED default stays the bare recipe (zero knobs, ~tied number).
+CONFIRMED BEST (2026-06-01, same-seed A/B -- tools/run_split_ab.sh, compare_out/split_ab.log):
+the split-the-difference config +consol (--ratio_coh --ratio_chase_floor_min 0.1
+--ratio_leak_floor_min 0.1 --gf_consol 50) is the best Concord config on this bench. Clean
+A/B, seed 0, identical validated recipe (eps=1e-10, v_scale=0, gf_trust=1, precond_p=0.5),
+both arms:
+              best live |  deploy sv
+  bare nogate   1.5700  |  1.5404
+  +consol split 1.5563  |  1.5180     delta -0.014 live / -0.022 sv (4x the ~0.005 bar)
+So +consol beats the bare recipe by 0.022 on the DEPLOYED weight head-to-head -- the earlier
+cross-run hint (1.517 vs nogate-1.550 within one run) is CONFIRMED, not run noise. (NOTE: an
+earlier wrapper bug ran both arms at the eps=1.0 SGD-chase DEFAULT -- the header print caught
+it [eps=1.0 not 1e-10]; rerun with $CONC passed gave the numbers above.) Status: +consol is
+the confirmed-best OPT-IN (4 flags); SHIPPED DEFAULT stays the bare recipe (zero knobs). Still
+single-bench / single seed-pair -> multi-seed + the real target to generalize. Machinery
+committed (concord/packed_b.py + train_nanogpt.py knobs; tools/run_split_ab.sh, run_combo.sh).
 
 === MECHANISM CORRECTION: THE CHASE IS NOT MOMENTUM (mass-preservation) (2026-06-01) ===
 Earlier prose (winner/ratio-coh READMEs) called Concord "a momentum optimizer in disguise" --
