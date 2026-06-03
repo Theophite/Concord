@@ -349,6 +349,11 @@ class TrainingTab:
                          tooltip="Clips the gradient norm. Leave empty to disable gradient clipping.")
         components.entry(frame, 10, 1, self.ui_state, "clip_grad_norm")
 
+        # Concord: sanitize tokens (independent control plane)
+        components.label(frame, 11, 0, "Sanitize Tokens",
+                         tooltip="Comma-separated SINGLE-token words whose CLIP embedding rows are zeroed in both text encoders, so the saved model embeds them to ~nothing at inference (a model-sanitization control plane, independent of the optimizer). Multi-token words are skipped.")
+        components.entry(frame, 11, 1, self.ui_state, "concord_sanitize_tokens")
+
     def __create_base2_frame(self, master, row, video_training_enabled: bool=False, supports_circular_padding: bool=False):
         frame = ctk.CTkFrame(master=master, corner_radius=5)
         frame.grid(row=row, column=0, padx=5, pady=5, sticky="nsew")
