@@ -676,6 +676,12 @@ class GenericTrainer(BaseTrainer):
                     global_step=train_progress.global_step
                 )
 
+                # give the Concord controller the same total-update horizon the scheduler uses
+                if getattr(self.model, "concord_controller", None) is not None:
+                    self.model.concord_controller.total_steps = max(1, int(
+                        self.config.epochs * self.data_loader.get_data_set().approximate_length()
+                        / (self.config.batch_size * max(1, self.config.gradient_accumulation_steps))))
+
             current_epoch_length = self.data_loader.get_data_set().approximate_length()
 
             if multi.is_master():
@@ -731,6 +737,10 @@ class GenericTrainer(BaseTrainer):
                 ):
                     step_seed = train_progress.global_step
                     bf16_stochastic_rounding_set_seed(step_seed, train_device)
+
+                    # per-step pre-forward hook (Concord: advance the winner lr/sigma/floor
+                    # schedule onto the layer device tensors the fused backward reads)
+                    self.model_setup.before_step(self.model, self.config, train_progress)
 
                     prior_pred_indices = [i for i in range(self.config.batch_size)
                                           if ConceptType(batch['concept_type'][i]) == ConceptType.PRIOR_PREDICTION]

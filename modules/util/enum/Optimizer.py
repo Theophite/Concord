@@ -77,6 +77,11 @@ class Optimizer(Enum):
     AIDA = 'AIDA'
     YOGI = 'YOGI'
 
+    # Concord: swaps UNet Linear/Conv for packed self-stepping layers (the optimizer
+    # update is fused INTO the backward). The OneTrainer-visible optimizer is a plain
+    # SGD over the non-swapped (aux) params; the Concord half is driven by a controller.
+    CONCORD = 'CONCORD'
+
     @property
     def is_adaptive(self):
         return self in [

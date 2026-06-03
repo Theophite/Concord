@@ -156,6 +156,19 @@ def create_optimizer(
                 differentiable=optimizer_config.differentiable if optimizer_config.differentiable is not None else False,
             )
 
+        # Concord: the UNet's Linear/Conv2d were swapped to packed self-stepping modules
+        # in the SDXL setup and update INSIDE the backward (no step here). The OneTrainer
+        # optimizer is a plain SGD over the REMAINING (aux) params -- norms, biases, and
+        # any trained embeddings/text-encoder params. The Concord schedule + rebalance are
+        # driven by the controller via before_step()/after_step().
+        case Optimizer.CONCORD:
+            optimizer = torch.optim.SGD(
+                params=parameters,
+                lr=config.learning_rate,
+                momentum=optimizer_config.momentum if optimizer_config.momentum is not None else 0.9,
+                weight_decay=optimizer_config.weight_decay if optimizer_config.weight_decay is not None else 0,
+            )
+
         # SGD_8BIT Optimizer
         case Optimizer.SGD_8BIT:
             import bitsandbytes as bnb

@@ -4,6 +4,7 @@ from modules.modelSetup.BaseStableDiffusionXLSetup import BaseStableDiffusionXLS
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
+from modules.util.enum.Optimizer import Optimizer
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.ModuleFilter import ModuleFilter
 from modules.util.NamedParameterGroup import NamedParameterGroupCollection
@@ -91,6 +92,17 @@ class StableDiffusionXLFineTuneSetup(
         self._setup_embeddings(model, config)
         self._setup_embedding_wrapper(model, config)
 
+        # Concord: swap the UNet's Linear/Conv2d for packed self-stepping layers BEFORE
+        # collecting parameters, so create_parameters() naturally hands the optimizer only
+        # the non-swapped (aux) params -- the Concord layers carry no nn.Parameter weight
+        # and self-step in backward. The controller carries the schedule + rebalance.
+        if config.optimizer.optimizer == Optimizer.CONCORD:
+            from modules.util.optimizer.concord_ot import ConcordController
+            model.concord_controller = ConcordController(
+                model.unet, self.train_device, config.learning_rate, total_steps=1)
+        else:
+            model.concord_controller = None
+
         params = self.create_parameters(model, config)
         self.__setup_requires_grad(model, config)
         init_model_parameters(model, params, self.train_device)
@@ -133,6 +145,16 @@ class StableDiffusionXLFineTuneSetup(
         else:
             model.unet.eval()
 
+    def before_step(
+            self,
+            model: StableDiffusionXLModel,
+            config: TrainConfig,
+            train_progress: TrainProgress
+    ):
+        # Concord: advance the winner lr/sigma/floor schedule before the fused backward.
+        if getattr(model, "concord_controller", None) is not None:
+            model.concord_controller.before_step()
+
     def after_optimizer_step(
             self,
             model: StableDiffusionXLModel,
@@ -145,6 +167,9 @@ class StableDiffusionXLFineTuneSetup(
             model.embedding_wrapper_1.normalize_embeddings()
             model.embedding_wrapper_2.normalize_embeddings()
         self.__setup_requires_grad(model, config)
+        # Concord: gated rebalance (skips the no-op launches) + advance the step index.
+        if getattr(model, "concord_controller", None) is not None:
+            model.concord_controller.after_step()
 
 factory.register(BaseModelSetup, StableDiffusionXLFineTuneSetup, ModelType.STABLE_DIFFUSION_XL_10_BASE, TrainingMethod.FINE_TUNE)
 factory.register(BaseModelSetup, StableDiffusionXLFineTuneSetup, ModelType.STABLE_DIFFUSION_XL_10_BASE_INPAINTING, TrainingMethod.FINE_TUNE)

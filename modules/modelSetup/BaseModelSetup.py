@@ -95,6 +95,16 @@ class BaseModelSetup(
     ):
         pass
 
+    def before_step(
+            self,
+            model: BaseModel,
+            config: TrainConfig,
+            train_progress: TrainProgress,
+    ):
+        """Per-step pre-forward hook. Default no-op; Concord overrides it to advance the
+        winner schedule onto the swapped layers before the fused backward runs."""
+        pass
+
     def report_to_tensorboard(
             self,
             model: BaseModel,
