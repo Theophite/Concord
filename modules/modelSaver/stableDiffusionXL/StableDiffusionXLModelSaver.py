@@ -79,6 +79,16 @@ class StableDiffusionXLModelSaver(
             output_model_destination: str,
             dtype: torch.dtype | None,
     ):
+        # Concord: the UNet's Linear/Conv2d were swapped for packed self-stepping layers
+        # (their state_dict has 'packed_w', not 'weight'). For the DEPLOYABLE formats,
+        # consolidate them back to standard nn.Linear/nn.Conv2d holding the deployable
+        # weights so the checkpoint loads as ordinary SDXL. The INTERNAL/backup format
+        # keeps the packed state (raw dump). Destructive -- final-save only (do not pair
+        # with mid-training safetensors saves while Concord-training).
+        if getattr(model, "concord_controller", None) is not None \
+                and output_model_format in (ModelFormat.SAFETENSORS, ModelFormat.DIFFUSERS):
+            model.concord_controller.consolidate_into_unet(model.unet)
+
         match output_model_format:
             case ModelFormat.DIFFUSERS:
                 self.__save_diffusers(model, output_model_destination, dtype)
