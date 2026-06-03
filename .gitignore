@@ -24,3 +24,4 @@ compare_out/
 # deliverable tracked. dist/* (not dist/) so git still descends to find the exception.
 dist/*
 !dist/concord_winner/
+OneTrainer/
