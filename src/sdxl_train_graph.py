@@ -40,11 +40,13 @@ import torch.nn.functional as F
 
 from concord_winner import configure_optimizer, winner_step
 from control_plane import apply_token_spec
-from sdxl_train import tokenize_prompt, encode_from_ids, dev, dt
+from sdxl_train import (tokenize_prompt, encode_from_ids, dev, dt,
+                        DiffusionConfig, make_noise, noisy_latent, diffusion_loss)
 
 
 def train_graphed(pipe, opt_config, token_specs, lat, prompt, time_ids, steps, sched,
-                  warmup=3, log_every=30):
+                  dcfg=None, warmup=3, log_every=30):
+    dcfg = dcfg or DiffusionConfig()                           # diffusion recipe (capture-safe)
     pipe.unet.enable_gradient_checkpointing()                  # cap activations -> graph fits
     layers, aux_opt, cfg = configure_optimizer(pipe.unet, dev, opt_config)
     cps = {}
@@ -65,14 +67,14 @@ def train_graphed(pipe, opt_config, token_specs, lat, prompt, time_ids, steps, s
         for p in aux_params:
             if p.grad is not None:
                 p.grad.zero_()             # in-place: keep .grad addresses static for replay
-        noise = torch.randn_like(static_lat)                   # graph RNG -> fresh per replay
+        noise = make_noise(static_lat, dcfg)                   # graph RNG -> fresh per replay
         t = torch.randint(0, sched.config.num_train_timesteps, (1,), device=dev)
-        noisy = sched.add_noise(static_lat, noise, t)
+        noisy = noisy_latent(static_lat, noise, t, sched, dcfg)
         ehs, pooled = encode_from_ids(static_ids, cps)         # TE fwd (+ token) in-graph
         pred = pipe.unet(noisy, t, encoder_hidden_states=ehs.to(dt),
                          added_cond_kwargs={"text_embeds": pooled.to(dt),
                                             "time_ids": time_ids}).sample
-        loss = F.mse_loss(pred.float(), noise.float())
+        loss = diffusion_loss(pred, noise, t, sched, dcfg)     # min-SNR-weighted if enabled
         loss.backward()                                        # UNet + token self-step
         for m in layers:
             m.rebalance()                                      # in-graph: no launch overhead
@@ -117,6 +119,7 @@ if __name__ == "__main__":
 
     opt_config = ConcordConfig(lr=5e-5, noise=True, aux="sgd")
     token_specs = [TokenSpec("<cncd>", "train", init="dog"), TokenSpec("tok", "sanitize")]
+    dcfg = DiffusionConfig(min_snr_gamma=5.0, noise_offset=0.05)   # recipe ON, under capture
 
     RES = 512
     arr = np.array(ref.resize((RES, RES))).astype("float32") / 255.0
@@ -129,7 +132,7 @@ if __name__ == "__main__":
     torch.cuda.reset_peak_memory_stats()
     t0 = time.time()
     layers, cps = train_graphed(pipe, opt_config, token_specs, lat, "a photo of <cncd>",
-                                tids, 120, sched)
+                                tids, 120, sched, dcfg=dcfg)
     torch.cuda.synchronize(); wall = time.time() - t0
 
     teL, tokL = cps["L"]

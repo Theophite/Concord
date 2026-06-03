@@ -10,6 +10,7 @@ sanitized/fixed tokens are buffers and don't move. The whole behaviour is specif
 by the two declarative objects, not patched into the loop.
 """
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
@@ -23,6 +24,53 @@ from concord_winner import ConcordConfig, configure_optimizer, winner_step, Gate
 from control_plane import TokenSpec, apply_token_spec
 
 dev, dt = torch.device("cuda"), torch.bfloat16
+
+
+@dataclass
+class DiffusionConfig:
+    """The diffusion training recipe -- separate from the optimizer (ConcordConfig) and
+    the tokens (TokenSpec). All zero == bare eps-MSE on plain Gaussian noise (so the
+    default changes nothing). Capture-safe: the on/off are python floats compared to 0
+    (constants baked at capture time), the math inside is pure tensor ops."""
+    noise_offset: float = 0.0          # per-channel constant added to the target noise
+                                       # (lets the model reach very dark / very bright)
+    input_perturbation: float = 0.0    # extra noise on the INPUT latent only, target stays
+                                       # the original noise (anti-overfit; Ning et al. 2023)
+    min_snr_gamma: float = 0.0         # 0=off; ~5 -> Min-SNR-gamma loss weighting, which
+                                       # down-weights the easy low-noise timesteps
+
+
+def make_noise(lat, dcfg):
+    """Target noise, with optional per-channel offset. torch.randn rides the default
+    generator -> fresh per CUDA-graph replay."""
+    noise = torch.randn_like(lat)
+    if dcfg.noise_offset:
+        noise = noise + dcfg.noise_offset * torch.randn(
+            lat.shape[0], lat.shape[1], 1, 1, device=lat.device, dtype=lat.dtype)
+    return noise
+
+
+def noisy_latent(lat, noise, t, sched, dcfg):
+    """The noised input. With input_perturbation the INPUT is noised by a perturbed
+    draw, but the loss target stays the original `noise`."""
+    inp = noise
+    if dcfg.input_perturbation:
+        inp = noise + dcfg.input_perturbation * torch.randn_like(noise)
+    return sched.add_noise(lat, inp, t)
+
+
+def diffusion_loss(pred, noise, t, sched, dcfg):
+    """eps-MSE, optionally Min-SNR-gamma weighted. eps-pred weight = min(SNR,gamma)/SNR,
+    SNR(t) = alpha_bar_t / (1 - alpha_bar_t). Pre-move sched.alphas_cumprod to the latent
+    device (the graph trainer does) so the gather is sync-free under capture."""
+    if dcfg.min_snr_gamma > 0:
+        ac = sched.alphas_cumprod.to(t.device)[t]
+        snr = ac / (1.0 - ac)
+        w = torch.clamp(snr, max=dcfg.min_snr_gamma) / snr
+        per = F.mse_loss(pred.float(), noise.float(), reduction="none").mean(
+            dim=list(range(1, pred.ndim)))
+        return (w * per).mean()
+    return F.mse_loss(pred.float(), noise.float())
 
 
 def tokenize_prompt(prompt, cps):
@@ -52,7 +100,9 @@ def encode_prompt(prompt, cps):
     return encode_from_ids(tokenize_prompt(prompt, cps), cps)
 
 
-def train(pipe, opt_config, token_specs, lat, prompt, time_ids, steps, sched):
+def train(pipe, opt_config, token_specs, lat, prompt, time_ids, steps, sched, dcfg=None):
+    dcfg = dcfg or DiffusionConfig()                        # default: bare eps-MSE
+    sched.alphas_cumprod = sched.alphas_cumprod.to(dev)     # for min-SNR (and graph parity)
     # PICKER: configure the UNet optimizer from the config.
     layers, aux, cfg = configure_optimizer(pipe.unet, dev, opt_config)
     # CONTROL PLANE: apply the token spec to both encoders.
@@ -71,12 +121,13 @@ def train(pipe, opt_config, token_specs, lat, prompt, time_ids, steps, sched):
             winner_step(it, steps, layers, config=cfg)          # config-driven schedule
             if aux:
                 aux.zero_grad(set_to_none=True)
-        noise = torch.randn_like(lat)
+        noise = make_noise(lat, dcfg)                           # + optional noise offset
         t = torch.randint(0, sched.config.num_train_timesteps, (1,), device=dev)
         ehs, pooled = encode_prompt(prompt, cps)
-        pred = pipe.unet(sched.add_noise(lat, noise, t), t, encoder_hidden_states=ehs.to(dt),
+        pred = pipe.unet(noisy_latent(lat, noise, t, sched, dcfg), t,
+                         encoder_hidden_states=ehs.to(dt),
                          added_cond_kwargs={"text_embeds": pooled.to(dt), "time_ids": time_ids}).sample
-        F.mse_loss(pred.float(), noise.float()).backward()      # UNet + trainable tokens self-step
+        diffusion_loss(pred, noise, t, sched, dcfg).backward()  # min-SNR-weighted; UNet+token self-step
         if aux:
             aux.step()
         rebalance()                                             # gated: skips the 794 no-op launches
