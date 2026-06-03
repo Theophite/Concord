@@ -8,14 +8,25 @@ the backward pass.
 
 Best validation loss, head-to-head, same bench:
 
-| optimizer | best val |
+| optimizer | best deployed val |
 |---|---|
 | AdamW (lr 1e-3, fp32 master + m + v = ~96 b/param) | 1.534 |
 | Muon (faithful: NS5 + Nesterov, native fp) | 1.578 |
-| **Concord — deploy the consolidated weight** | **1.526** |
+| **Concord (bare recipe) — deploy the consolidated weight** | **1.526** |
 
-Concord at **32 b/param beats both AdamW and Muon** on this bench. The win comes from
-two pieces, both included here:
+Concord at **32 b/param beats both AdamW and Muon** on this bench. The shipped default is
+the **bare recipe** (no knobs); the win comes from two pieces, both included here:
+
+> **Tentatively best (not the shipped default): the "split" un-stranding config.** A separate
+> overfit run found that the ratio-coherence variant with `chase_floor_min=0.1` +
+> `gf_consol=50` ("split-the-difference": a small chase floor banks borderline-coherent mass
+> losslessly, light evaporation trims clearly-dead noise) deploys at **sv 1.517** — the lowest
+> deployed val in the study, and ~0.03 below *that run's* bare-nogate (1.550). CAVEAT: it has
+> NOT been A/B'd same-seed against the 1.526 headline above (different run/seed; 1.517 vs 1.526
+> is within the run-noise band). So it is **promising, not confirmed**. The machinery is shipped
+> (`set_ratio_coh`, `set_ratio_coh_floors`, `--gf_consol`, off by default); to reproduce:
+> `--ratio_coh --ratio_chase_floor_min 0.1 --ratio_leak_floor_min 0.1 --gf_consol 50`. A clean
+> same-seed A/B vs bare-nogate is the open task to promote it from tentative to default.
 
 1. **The validated recipe** = a bare `ConcordLinearPackedB`. No knobs to set. It is
    rank-1 v̂ AdamW (Adafactor row×col E[g²]; `v_scale=0`, `gf_trust_delta_sq=1`,
@@ -65,15 +76,22 @@ W_deploy = layer.consolidated_weight()   # (s_slow + v_slow)·128·2^exp   <-- s
 Non-Linear params (embeddings, LayerNorm) take a small standard optimizer (e.g. AdamW) —
 Concord goes on the 2D Linear weights, which is where the parameters (and the win) are.
 
-## Why it works (one paragraph, earned this session)
+## Why it works (one paragraph, corrected 2026-06-01)
 
-Concord is a **momentum optimizer in disguise**: the slow cascade reconstructs a β1≈0.9
-gradient momentum as a difference of EMAs — `d_sv = s_slow − v_slow` aligns +0.87 with a
-true `EMA_0.9(grad)`. The two int8 accumulators at different leak rates *are* a momentum
-buffer. On this (low-rank-gradient) regime, that denoised momentum + per-coordinate v̂
-scaling beats both Adam's per-coord-only step and Muon's spectral orthogonalization — and it
-does so at 1/3 the storage. (Orthogonalization, nwv coherence-weighting, and 2×v_slow
-deployment were all tested and rejected; see the project log.)
+The slow cascade is **mass-preserving redistribution, not a momentum buffer**: the chase
+(`s_fast→s_slow`) and the leak (`s_slow→v_slow`, `mass_preserve_v=True` here) move mantissa
+between accumulators with the live weight `m_eff` invariant, so the per-step *update* is the
+instantaneous preconditioned gradient (`−lr·g/√v̂`) and the chase rate α is a redistribution
+timescale, **not a β1**. (`d_sv = s_slow − v_slow` does correlate +0.87 with `EMA_0.9(grad)`,
+but that is a *readable* momentum-like signal — consumed by the Wiener coherence gate and the
+consolidated-weight deploy — not a momentum term in the step.) The win is two things, neither
+of them momentum: a per-coordinate rank-1 v̂ (Adam-style scaling) + the coherence-gated
+**consolidated deploy weight** (drop `s_fast`), which denoises the shipped weight — and it does
+so at 1/3 the storage, beating Adam's per-coord step and Muon's orthogonalization on this
+(low-rank-gradient) regime. Momentum *can* be injected (non-mass-preserving leak via
+`mass_preserve_v=False`, explicit β1, or the d_sv blend) but is OFF here. (Orthogonalization,
+nwv coherence-weighting, 2×v_slow deploy, and the d_sv momentum blend were all tested and
+rejected; see the project log.)
 
 ## Files
 

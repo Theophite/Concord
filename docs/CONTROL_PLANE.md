@@ -349,3 +349,39 @@ to MATCH the 64-bit coh_pre gate on the deployed weight. The deployable Concord 
 s_slow+v_slow (drop s_fast). All OFF by default; validated recipe (+ZIP) unchanged.
 Knobs: --ratio_chase_floor_min / --ratio_leak_floor_min (floor targets), --gf_consol (evap
 rate, rho_eff=lr*gf_consol), --fast_gain_anneal, --eval_consolidated, --watch_accum.
+
+TENTATIVELY BEST (2026-06-01, recorded but NOT confirmed): the split-the-difference config
++consol (--ratio_coh --ratio_chase_floor_min 0.1 --ratio_leak_floor_min 0.1 --gf_consol 50)
+deploys at sv=1.517 -- the LOWEST deployed val in the study -- and within ITS run beat that
+run's bare-nogate (1.550) by ~0.03. CAVEAT: never A/B'd same-seed vs the 1.526 headline
+nogate (separate run; 1.517 vs 1.526 is within the run-noise band ~0.01). So PROMISING, not
+proven. Machinery already committed (concord/packed_b.py + train_nanogpt.py have the ratio/
+floor-min/gf_consol knobs; tools/run_combo.sh, run_evap.sh). OPEN TASK (PSU now fixed): one
+clean same-seed A/B, bare-nogate vs +consol, deployed-sv, to promote from tentative -> default
+(or refute). Until then the SHIPPED default stays the bare recipe (zero knobs, ~tied number).
+
+=== MECHANISM CORRECTION: THE CHASE IS NOT MOMENTUM (mass-preservation) (2026-06-01) ===
+Earlier prose (winner/ratio-coh READMEs) called Concord "a momentum optimizer in disguise" --
+the chase / d_sv reconstructing a beta1~0.9 EMA. That is WRONG for the validated packed-B
+recipe, which is FULLY MASS-PRESERVING:
+- Chase (s_fast->s_slow, kernel ~L607-614): hardcoded mass-preserving -- s_slow_i8 += tick;
+  s_fast -= tick*128. No flag. Moves mantissa velocity->position with m_eff INVARIANT.
+- Leak (s_slow->v_slow, ~L628-632): mass-preserving iff MASS_PRESERVE = mass_preserve_v
+  (layer default TRUE; train_nanogpt does NOT override). The validated recipe runs it ON.
+=> The per-step WEIGHT update is the instantaneous preconditioned gradient (-lr*g/sqrt(v_hat)).
+   The cascade only REDISTRIBUTES that fixed mass across s_fast/s_slow/v_slow. The chase rate
+   alpha is a REDISTRIBUTION timescale, NOT a beta1. There is NO momentum in the update.
+=> d_sv = s_slow - v_slow correlates +0.87 with EMA_0.9(grad), but that is a READABLE signal
+   the Wiener coherence gate (sig = C*d_sv) and the consolidated-weight deploy consume -- not a
+   momentum term in the step.
+=> The win is per-coord rank-1 v_hat (Adam-style scaling) + the coherence-gated consolidated
+   deploy weight (drop s_fast = denoise), NOT momentum.
+Momentum CAN be injected but is OFF in the recipe: (a) non-mass-preserving leak
+(mass_preserve_v=False -> the leak adds alpha_v*d_sv ~ alpha_v*EMA(grad) to the weight; this IS
+the old CIFAR 40-bit mode, where CONCORD_README's leak is non-mass-preserving), (b) explicit
+beta1 (delta_t -= beta1*d_fs, default 0), (c) the d_sv heavy-ball blend (mom_gain, default 0;
+rejected on T5). The "chase-vs-momentum" residual in the gap analysis above = exactly this
+absence of momentum; "match momentum" is the lever. NB only the LEAK has a mass-preserve flag;
+the chase is unconditionally mass-preserving, so alpha can never be made momentum. Corrected the
+"momentum in disguise"/"beta1-equivalent" wording in dist/concord_winner/README.md,
+dist/concord_ratio_coh/README.md, and CONCORD_README.md.
