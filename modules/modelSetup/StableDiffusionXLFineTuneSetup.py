@@ -104,6 +104,14 @@ class StableDiffusionXLFineTuneSetup(
         else:
             model.concord_controller = None
 
+        # Independent control plane: zero specified single-token vocab words (sanitize),
+        # so the saved model embeds them to ~nothing. Works with any optimizer.
+        if config.concord_sanitize_tokens.strip():
+            from modules.util.optimizer.concord_ot import SanitizePlane
+            model.concord_sanitize = SanitizePlane(model, config.concord_sanitize_tokens)
+        else:
+            model.concord_sanitize = None
+
         params = self.create_parameters(model, config)
         self.__setup_requires_grad(model, config)
         init_model_parameters(model, params, self.train_device)
@@ -171,6 +179,9 @@ class StableDiffusionXLFineTuneSetup(
         # Concord: gated rebalance (skips the no-op launches) + advance the step index.
         if getattr(model, "concord_controller", None) is not None:
             model.concord_controller.after_step()
+        # control plane: keep sanitized rows at zero (in case training perturbed them).
+        if getattr(model, "concord_sanitize", None) is not None:
+            model.concord_sanitize.reapply(model)
 
 factory.register(BaseModelSetup, StableDiffusionXLFineTuneSetup, ModelType.STABLE_DIFFUSION_XL_10_BASE, TrainingMethod.FINE_TUNE)
 factory.register(BaseModelSetup, StableDiffusionXLFineTuneSetup, ModelType.STABLE_DIFFUSION_XL_10_BASE_INPAINTING, TrainingMethod.FINE_TUNE)

@@ -24,6 +24,45 @@ if _CONCORD_DIR not in sys.path:
     sys.path.insert(0, _CONCORD_DIR)
 
 
+def _resolve_single_token_ids(tokenizer, words):
+    """Resolve words to vocab ids, keeping only those that are a SINGLE token. A
+    multi-token word (e.g. 'tok' -> 'pen','is') can't be zeroed without breaking the
+    shared subwords, so it's skipped. Returns (ids, skipped_words)."""
+    ids, skipped = [], []
+    for w in words:
+        toks = tokenizer(w, add_special_tokens=False).input_ids
+        if len(toks) == 1:
+            ids.append(int(toks[0]))
+        else:
+            skipped.append(w)
+    return ids, skipped
+
+
+class SanitizePlane:
+    """Independent control plane: zero the embedding rows of given single-token vocab
+    words in BOTH SDXL text encoders, and keep them zeroed across steps. The saved model
+    then embeds those words to ~nothing at inference (standard CLIP tokenizer + modified
+    weights -> works in any SDXL tool). Works with any optimizer (not tied to Concord)."""
+
+    def __init__(self, model, tokens_csv: str):
+        words = [t.strip() for t in tokens_csv.split(",") if t.strip()]
+        self.ids1, sk1 = _resolve_single_token_ids(model.tokenizer_1, words)
+        self.ids2, sk2 = _resolve_single_token_ids(model.tokenizer_2, words)
+        self.skipped = sorted(set(sk1) & set(sk2))   # skipped in BOTH (truly multi-token)
+        self.reapply(model)
+        msg = f"[concord] sanitize: zeroed {len(self.ids1)} (CLIP-L) / {len(self.ids2)} (CLIP-G) token rows"
+        if self.skipped:
+            msg += f" | skipped multi-token (can't zero a subword): {self.skipped}"
+        print(msg)
+
+    @torch.no_grad()
+    def reapply(self, model):
+        for te, ids in ((model.text_encoder_1, self.ids1), (model.text_encoder_2, self.ids2)):
+            if ids:
+                w = te.get_input_embeddings().weight
+                w[ids] = 0.0
+
+
 def make_concord_config(learning_rate: float, optimizer_config=None):
     """Map OneTrainer settings onto the validated winner config: lr comes from the main
     learning_rate field; the winner knobs (gf_consol/noise/sigmag_peak/ratio_coh/warmup/
