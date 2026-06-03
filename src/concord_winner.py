@@ -56,6 +56,45 @@ WINNER = dict(
     lr_min_frac=0.2,
 )
 
+from dataclasses import dataclass
+
+
+@dataclass
+class ConcordConfig:
+    """The optimizer-picker entry for Concord: every winner knob, configurable.
+    Defaults == the validated sf_060 winner. `kind` lets a picker choose among
+    optimizers; the rest are the Concord details the trainer reads -- nothing is
+    hardcoded in the loop."""
+    kind: str = "concord"               # picker selector: "concord" | "adamw" | "sgd"
+    lr: float = 5e-4                    # peak lr (SDXL UNet finetune wants ~1e-5; nanoGPT used 5e-4)
+    alpha: float = 0.1                  # chase (s_fast -> s_slow)
+    alpha_v_fast: float = 0.001         # leak  (s_slow -> v_slow)
+    weight_decay: float = 0.0
+    eps: float = 1e-10
+    step_cap: float = 10.0
+    v_scale: float = 0.0
+    precond_p: float = 0.5
+    gf_trust_delta_sq: float = 1.0
+    # dissipation (the "split")
+    gf_consol: float = 50.0
+    ratio_coh: bool = True
+    ratio_chase_floor: float = 0.9
+    ratio_chase_floor_min: float = 0.1
+    ratio_leak_floor: float = 0.999
+    ratio_leak_floor_min: float = 0.1
+    # fluctuation (the noise)
+    noise: bool = True
+    sigmag_iso: bool = True
+    sigmag_peak: float = 0.6
+    # schedule
+    lr_min_frac: float = 0.2
+    warmup: int = 100
+    # aux optimizer for the non-swapped params (norms/biases)
+    aux: str = "sgd"                    # "sgd" | "adamw" | "none"
+
+
+WINNER_CONFIG = ConcordConfig()
+
 
 def _scalar(v, what):
     """Collapse a symmetric 2-tuple to a scalar (the packed conv kernel uses
@@ -126,18 +165,22 @@ def swap_unet_to_winner(unet, device, lr, gf_consol=None, verbose=True):
     return layers
 
 
-def winner_step(it, total_iters, layers, peak_lr, warmup=100, floor_horizon=None,
-                sigmag_peak=None, lr_min_frac=None, noise=True):
+def winner_step(it, total_iters, layers, peak_lr=None, warmup=None, floor_horizon=None,
+                sigmag_peak=None, lr_min_frac=None, noise=None, config=None):
     """Advance the per-step winner schedule (call BEFORE backward each step):
       - lr: warmup * cosine(1 -> lr_min_frac)        -> m.lr on every layer
       - sigma: rising-late sigmag_peak * (1 - f)      (f = cosine factor)
-      - ratio floors: cosine 0.9 -> 0.1 / 0.999 -> 0.1 over floor_horizon
-    All three are pushed to device tensors (CUDA-graph-safe). Returns the lr.
+      - ratio floors: cosine chase/leak -> their mins over floor_horizon
+    Config-driven (pass a ConcordConfig); explicit args still override it, and the
+    old lr-based call signature keeps working. All three are device tensors
+    (CUDA-graph-safe). Returns the lr.
     """
-    if sigmag_peak is None:
-        sigmag_peak = WINNER["sigmag_peak"]
-    if lr_min_frac is None:
-        lr_min_frac = WINNER["lr_min_frac"]
+    cfg = config if config is not None else WINNER_CONFIG
+    peak_lr = cfg.lr if peak_lr is None else peak_lr
+    warmup = cfg.warmup if warmup is None else warmup
+    sigmag_peak = cfg.sigmag_peak if sigmag_peak is None else sigmag_peak
+    lr_min_frac = cfg.lr_min_frac if lr_min_frac is None else lr_min_frac
+    noise = cfg.noise if noise is None else noise
     if floor_horizon is None:
         floor_horizon = max(1, total_iters)
 
@@ -148,17 +191,15 @@ def winner_step(it, total_iters, layers, peak_lr, warmup=100, floor_horizon=None
     for m in layers:
         m.lr = lr
 
-    # rising-late isotropic noise: ~0 early (f~1), grows late (f->lr_min_frac)
-    set_sigmag_sigma(sigmag_peak * (1.0 - f) if noise else 0.0)
+    set_sigmag_sigma(sigmag_peak * (1.0 - f) if noise else 0.0)   # rising-late noise
 
-    # ratio-coh bootstrap floors cosine-decay to their mins
     def cos_floor(start, end):
         if it >= floor_horizon:
             return end
         return end + (start - end) * 0.5 * (1.0 + math.cos(math.pi * it / floor_horizon))
     set_ratio_coh_floors(
-        cos_floor(WINNER["ratio_chase_floor"], WINNER["ratio_chase_floor_min"]),
-        cos_floor(WINNER["ratio_leak_floor"], WINNER["ratio_leak_floor_min"]))
+        cos_floor(cfg.ratio_chase_floor, cfg.ratio_chase_floor_min),
+        cos_floor(cfg.ratio_leak_floor, cfg.ratio_leak_floor_min))
     return lr
 
 
@@ -173,6 +214,42 @@ def make_aux_optimizer(params, lr, momentum=0.9, weight_decay=0.0):
     Plain SGD is proportional to the gradient and won't manufacture that collapse.
     """
     return torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
+
+
+def make_aux(params, config):
+    """Aux optimizer for the non-Concord params, chosen by the config."""
+    if config.aux == "sgd":
+        return torch.optim.SGD(params, lr=config.lr, momentum=0.9)
+    if config.aux == "adamw":
+        return torch.optim.AdamW(params, lr=config.lr)
+    return None
+
+
+def configure_optimizer(unet, device, config):
+    """THE OPTIMIZER PICKER. Given a ConcordConfig, set up the optimizer for `unet`
+    and return (concord_layers, aux_opt, config). For kind='concord': swap to the
+    winner, push every config knob onto the layers + the global flags, build the aux.
+    For a baseline kind: a plain torch optimizer over the UNet (concord_layers=None).
+    The trainer then drives winner_step(config=...) + rebalance + aux_opt.step()."""
+    if config.kind != "concord":
+        opt = {"adamw": torch.optim.AdamW, "sgd": torch.optim.SGD}[config.kind]
+        return None, opt(unet.parameters(), lr=config.lr), config
+    layers = swap_unet_to_winner(unet, device, config.lr, gf_consol=config.gf_consol,
+                                 verbose=False)
+    for m in layers:                                   # push the rest of the config
+        m.set_optimizer_kind('adamw', weight_decay=config.weight_decay,
+                             eps=config.eps, step_cap=config.step_cap)
+        m.precond_p = config.precond_p
+        m.v_scale = config.v_scale
+        m.gf_trust_delta_sq = config.gf_trust_delta_sq
+        m.alpha_v_fast = config.alpha_v_fast
+    ppb.set_ratio_coh(config.ratio_coh)                # global flags from the config
+    ppb.set_sigmag_noise(config.noise, isotropic=config.sigmag_iso)
+    aux = [p for p in unet.parameters() if p.requires_grad]
+    print(f"[picker] concord: {len(layers)} layers, lr={config.lr}, gf_consol="
+          f"{config.gf_consol}, ratio_coh={config.ratio_coh}, noise={config.noise}, "
+          f"aux={config.aux} ({sum(p.numel() for p in aux)/1e6:.1f}M)")
+    return layers, make_aux(aux, config), config
 
 
 def active_config():
