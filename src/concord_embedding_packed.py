@@ -42,7 +42,10 @@ class _PackedEmbStep(torch.autograd.Function):
             y = core(x)
             y.backward(G.t().to(y.dtype))
         core._resync_weight_buf()
-        mod._pin_norm(torch.unique(ids.reshape(-1)))    # norm-preserve touched tokens
+        # Pin ALL K rows (static shape -> CUDA-graph capturable). torch.unique would be
+        # dynamic-shaped AND sync. K is tiny and untouched rows are already at target,
+        # so re-pinning them is a near-no-op.
+        mod._pin_norm(torch.arange(mod.K, device=ids.device))
         return None, None, None
 
 

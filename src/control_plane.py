@@ -97,18 +97,21 @@ class ControlPlaneEmbedding(nn.Module):
                 self._grow(tid); self.kind[tid] = 2; self.idx[tid] = row
 
     def forward(self, input_ids):
+        # Branch-free + static-shape so this is CUDA-graph capturable: compute every
+        # route for every token and SELECT with torch.where -- no .any() host sync, no
+        # dynamic masked-assignment. Masked-out tokens get no gradient path, so the
+        # trainable's self-step still only sees the real train-token gradients.
         flat = input_ids.reshape(-1)
         emb = self.base(flat.clamp(max=self.V0 - 1))
         c = self.kind[flat.clamp(max=self.kind.shape[0] - 1)]
         i = self.idx[flat.clamp(max=self.idx.shape[0] - 1)]
-        sm = c == 1
-        tm = c == 2
-        if sm.any() or tm.any():
-            emb = emb.clone()
-            if sm.any():
-                emb[sm] = self.static_vals[i[sm]].to(emb.dtype)
-            if tm.any() and self.trainable is not None:
-                emb[tm] = self.trainable(i[tm]).to(emb.dtype)
+        sm = (c == 1).unsqueeze(-1)                                  # static (zero / fixed)
+        static_emb = self.static_vals[i.clamp(max=self.static_vals.shape[0] - 1)]
+        emb = torch.where(sm, static_emb.to(emb.dtype), emb)
+        if self.trainable is not None:          # python attr -> capture-time constant, not a sync
+            tm = (c == 2).unsqueeze(-1)                              # trainable (Concord)
+            train_emb = self.trainable(i.clamp(max=self.trainable.K - 1))
+            emb = torch.where(tm, train_emb.to(emb.dtype), emb)
         return emb.reshape(*input_ids.shape, self.dim)
 
 

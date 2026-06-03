@@ -25,20 +25,31 @@ from control_plane import TokenSpec, apply_token_spec
 dev, dt = torch.device("cuda"), torch.bfloat16
 
 
-def encode_prompt(prompt, cps):
-    """SDXL embeds with grad through the control planes (so trainable tokens learn);
-    penultimate hidden from both, pooled from G at the EOS position."""
+def tokenize_prompt(prompt, cps):
+    """Host-side (NOT capturable): fixed prompt -> static input_ids per encoder."""
+    return {tag: tok(prompt, padding="max_length", max_length=77, truncation=True,
+                     return_tensors="pt").input_ids.to(dev)
+            for tag, (te, tok) in cps.items()}
+
+
+def encode_from_ids(ids, cps):
+    """GPU-side (capturable): TE forward through the control planes (so trainable
+    tokens learn); penultimate hidden from both, pooled from G at the EOS position."""
     hs, pooled = [], None
     for tag in ("L", "G"):
         te, tok = cps[tag]
-        ids = tok(prompt, padding="max_length", max_length=77, truncation=True,
-                  return_tensors="pt").input_ids.to(dev)
-        out = te(ids, output_hidden_states=True)
+        out = te(ids[tag], output_hidden_states=True)
         hs.append(out.hidden_states[-2])
         if tag == "G":
-            eos = (ids == tok.eos_token_id).float().argmax(dim=-1)
-            pooled = te.text_projection(out.last_hidden_state[torch.arange(ids.shape[0]), eos])
+            eos = (ids[tag] == tok.eos_token_id).int().argmax(dim=-1)
+            ar = torch.arange(ids[tag].shape[0], device=ids[tag].device)   # on-device: no
+            pooled = te.text_projection(out.last_hidden_state[ar, eos])    # CPU->CUDA sync
     return torch.cat(hs, dim=-1), pooled
+
+
+def encode_prompt(prompt, cps):
+    """Eager convenience: tokenize (host) then encode (GPU) in one call."""
+    return encode_from_ids(tokenize_prompt(prompt, cps), cps)
 
 
 def train(pipe, opt_config, token_specs, lat, prompt, time_ids, steps, sched):
