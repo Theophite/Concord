@@ -11,6 +11,10 @@ data/
 *.pt
 *.pt.tmp
 *.tmp
+*.safetensors
+
+# Local build/compile venv (large, regenerable)
+.venv_compile/
 
 # Figures (regenerable from the analysis scripts)
 *.png
