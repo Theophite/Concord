@@ -391,3 +391,59 @@ absence of momentum; "match momentum" is the lever. NB only the LEAK has a mass-
 the chase is unconditionally mass-preserving, so alpha can never be made momentum. Corrected the
 "momentum in disguise"/"beta1-equivalent" wording in dist/concord_winner/README.md,
 dist/concord_ratio_coh/README.md, and CONCORD_README.md.
+
+=== NOISE INJECTION: built, ablated, swept (2026-06-01) ===
+Ported the noise-doc's "rising-late centered-Sigma_g" recipe into the nanoGPT harness (it was
+CIFAR-only) and tested it on the CONFIRMED-best split baseline (ratio+consol, deploy-sv 1.518).
+Build: centered Sigma_g noise in the autograd backward -- noise=(eps*grad_y)^T x - (sum eps)
+gbar, eps~N(0,1) (one matmul; verified bit-correct/centered/shaped, probe_sigmag.py); rising-
+late sigma=sigmag*(1-lr/lr_peak); --lr_min_frac floor; deploy off S+V. Ablation knobs
+--sigmag_iso (isotropic) / --sigmag_const (constant). All OFF by default (baked test unchanged).
+
+DETERMINISM: Concord is deterministic at fixed seed for best-deployed-sv (na_base == det_b ==
+1.5180 exactly, two separate runs). So all deltas below are REAL, not run noise.
+
+5-ARM ABLATION (best deploy sv; split baseline 1.5180):
+  base (no noise)           1.5180
+  floor only (lr_min 0.2)   1.5243  +0.006 WORSE  <- the LR floor ALONE hurts (refutes the
+                                                     "noise = just a hotter LR tail" confound)
+  full (Sigma_g rising)     1.5164  -0.002
+  const (Sigma_g constant)  1.5153  -0.003  (rising ~ constant: doc's "must rise late" NOT supported)
+  iso (ISOTROPIC rising)    1.5095  -0.009  BEST  <- isotropic BEATS Sigma_g (doc's central
+                                                     "shaping is necessary" claim REFUTED on nanoGPT)
+=> the doc's 3 "necessary ingredients" (Sigma_g shaping, rising schedule, LR floor) do NOT
+reproduce on BN-free nanoGPT. But noise ITSELF helps. Consistent w/ the doc's CIFAR win being
+BatchNorm-mediated (the transfer risk flagged in review).
+
+ISOTROPIC SIGMA SWEEP (10 pts, deterministic; base 1.5180):
+  sigma  0.1   0.2    0.25   0.3    0.35   0.4    0.5    0.6    0.7
+  sv    1.5216 1.5097 1.5145 1.5095 1.5076 1.5042 1.5158 1.4967 1.5098
+  delta +.004  -.008  -.003  -.009  -.010  -.014  -.002  -.021  -.008
+- 0.1 is BELOW threshold (hurts +0.004); >=0.2 helps.
+- DOWNWARD trend through 0.6 (best -0.021 = 1.4967), but heavy ~0.01 PER-SIGMA JITTER:
+  0.5 (-.002) is an outlier between 0.4 (-.014) and 0.6 (-.021); 0.25 between its better
+  neighbors. Each sigma is deterministic, but a different sigma = a different noise
+  realization -> a slightly different basin -> ~0.01 scatter, ~half the effect size.
+VERDICT: isotropic gradient noise (deploy off S+V) REAL-improves the split config's deployed
+weight, up to -0.021 (sv 1.497 vs 1.518) at sigma~0.6, nearly free (one randn + scale). The
+optimum is BROAD/high (>=0.4, not bracketed on the high side -- the curve was still descending
+at 0.6). Sigma_g shaping + rising schedule UNNECESSARY (isotropic >= shaped). CAVEATS: single
+seed (the ~0.01 jitter ~ half the effect -> magnitude needs multi-seed; the -0.021 at 2.6x
+jitter is more likely robust than the coarse -0.009 was); BN-free nanoGPT only (diverges from
+the doc's CIFAR mechanism, which supports "shaping doesn't matter here"). Knobs: --sigmag /
+--sigmag_iso / --sigmag_const / --lr_min_frac. Runs: run_noise_ablation.sh, run_sigma_sweep.sh,
+run_sigma_fine.sh; probe_sigmag.py.
+
+=== CUDA GRAPH: done + bit-exact (2026-06-01, --cuda_graph) ===
+Re-ported single-graph capture (fwd+loss+bwd at iter0, side-stream warmup, no eager pre-roll)
+into the working-tree harness. CORRECTNESS: eager vs graph (ratio_coh+noise config) tracks to
+within the eager-vs-eager SR-noise floor and CONVERGES (delta 0.049->0.003->0.014 vs the
+SR-floor 0.017/0.005/0.008; a real bug GROWS -- the pre-fix version hit 0.242 -- this shrinks).
+KEY FIX: the ratio-coh floors (chase/leak) were per-step PYTHON FLOATS that capture froze at
+iter0 (the divergence). Converted to DEVICE TENSORS (kernel sig chase_floor_ptr/leak_floor_ptr
++ tl.load + .fill_ setter, mirroring lr_ptr); sigmag sigma likewise a device tensor. So every
+SCHEDULED scalar (lr, eps, nwv beta, sigma, ratio floors) now rides a device tensor and
+survives capture -> the split+noise config is graph-safe. Speedup is modest (the step is ~
+compute-bound; graphs recover only launch overhead) -- correctness was the point. The Sigma_g
+noise matmul lives in the backward so it is captured automatically (no kernel work; per-token
+noise CANNOT go in the apply kernel, which only sees reduced grad_W). aux step + rebalance eager.

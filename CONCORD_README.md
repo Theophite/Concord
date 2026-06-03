@@ -53,9 +53,12 @@ Total state per param: 16 + 16 + 8 = **40 bits**. Compare AdamW's
 
 1. **gradient → s_fast**: SR-rounded tick of `−lr · step_live · scale_inv`
    onto s_fast.
-2. **chase**: SR-rounded tick of `α · (s_fast − s_slow)` onto s_slow.
-   Default α=0.1 → time constant ≈10 steps. This implicitly carries the
-   AdamW β1-like momentum dynamics; explicit β1 is left at 0.
+2. **chase**: SR-rounded tick of `α · (s_fast − s_slow)` onto s_slow, with the
+   same amount taken back out of s_fast — i.e. **mass-preserving redistribution**
+   (the live weight is invariant). Default α=0.1 → redistribution time constant
+   ≈10 steps; this is NOT a β1 momentum (the chase accumulates no gradient).
+   Any momentum in this recipe comes from the *non*-mass-preserving v_slow leak
+   (next), not the chase; explicit β1 is left at 0.
 3. **v_slow leak**: SR-rounded tick of `α_v_fast · (s_fast − v_slow·F) / F`
    onto v_slow_i8. Default α_v_fast=0.001 → time constant ≈1000 steps.
    Non-mass-preserving (chase-style: the live weight grows by the leak).
@@ -232,7 +235,7 @@ Defaults shown are the empirical champion on bigger CIFAR.
 
 | Field | Default | Notes |
 |---|---|---|
-| `concord_alpha` | 0.1 | chase rate; sets β1-equivalent time constant ≈10 |
+| `concord_alpha` | 0.1 | chase rate; mass-preserving redistribution time constant ≈10 steps (NOT a β1 — the chase carries no momentum) |
 | `concord_aux_lr` | base | lr for biases/norms/embeddings (the aux optimizer) |
 | `concord_aux_optimizer` | `'adamw'` | or `'sgd'`; for SDXL use adamw |
 | `concord_rebalance_every` | 8 | steps between exponent rebalances |

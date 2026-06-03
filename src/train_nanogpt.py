@@ -28,7 +28,10 @@ from nanogpt import GPT, GPTConfig, load_char_data, get_batch
 from prototype_packed_b import (ConcordLinearPackedB, reset_reb_stats,
                                 get_reb_stats, set_fixed_coh, set_gate_gain,
                                 set_coh_weighted_v, set_ratio_coh,
-                                set_ratio_coh_floors)
+                                set_ratio_coh_floors,
+                                set_v_bias_correction, bias_correction_factor,
+                                set_gap_feedback,
+                                set_sigmag_noise, set_sigmag_sigma)
 from optim_factored import FactoredAdam
 
 
@@ -218,12 +221,37 @@ def main():
                     help="weight on rank-1 v_hat in the denom. 1 + v_scale=0 + "
                          "small eps => denom=(v_hat+eps)^0.5 = factored-Adam.")
     ap.add_argument("--alpha", type=float, default=0.1)
+    ap.add_argument("--beta1", type=float, default=0.0,
+                    help="FAST-accumulator momentum: reinforces s_fast by beta1*velocity "
+                         "(d_fs) each step (heavy-ball over the v-hat-RMS step). Net s_fast "
+                         "decay = alpha-beta1, so keep 0<=beta1<alpha (=%s); beta1>=alpha "
+                         "diverges. 0 = today's recipe." % "alpha")
+    ap.add_argument("--gap_feedback", action="store_true",
+                    help="Conserved pass<->evaporate split gated by the gap MAGNITUDE: "
+                         "pass fraction c=min(1, coh+exp(-|d_sv|/gap_scale)); the (1-c) "
+                         "fraction evaporates. Strips the constant chase floor (floor "
+                         "survives only in the gap->0 ignition limit). Replaces the "
+                         "ratio-coh floor + gf_consol with one rate alpha.")
+    ap.add_argument("--gap_scale", type=float, default=500.0,
+                    help="gap-feedback scale in MANTISSA units (|d_sv|); g=exp(-|d_sv|/scale).")
     ap.add_argument("--aux_lr", type=float, default=1e-3)
     ap.add_argument("--adamw_lr", type=float, default=1e-3)
     ap.add_argument("--factored_lr", type=float, default=1e-3)
     ap.add_argument("--weight_decay", type=float, default=0.1)
     ap.add_argument("--warmup_iters", type=int, default=100)
     ap.add_argument("--lr_min_frac", type=float, default=0.1)
+    ap.add_argument("--sigmag", type=float, default=0.0,
+                    help="EXPERIMENTAL: peak centered-Sigma_g gradient-noise magnitude "
+                         "(units of ||grad_W||). Scheduled rising-late: sigma = sigmag*(1-lr/"
+                         "lr_peak). 0=off. Pair with a raised --lr_min_frac + deploy off S+V.")
+    ap.add_argument("--sigmag_iso", action="store_true",
+                    help="ABLATION: isotropic white noise instead of Sigma_g-shaped.")
+    ap.add_argument("--sigmag_const", action="store_true",
+                    help="ABLATION: constant sigma (=sigmag) instead of rising-late.")
+    ap.add_argument("--cuda_graph", action="store_true",
+                    help="capture per-step fwd+loss+bwd into ONE CUDA graph + replay (concord "
+                         "only) to cut launch overhead. lr + sigmag sigma are device tensors "
+                         "(rising-late noise survives capture). aux step + rebalance eager.")
     ap.add_argument("--rebalance_every", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--data_seed", type=int, default=1234,
@@ -274,6 +302,17 @@ def main():
     ap.add_argument("--ratio_leak_floor_min", type=float, default=0.0,
                     help="PERMANENT floor the leak decays TO. 1.0 = drift-leak (leak "
                          "coh-INDEPENDENT, pure alpha_v_fast*d_sv -> v_slow tracks).")
+    ap.add_argument("--bias_correct", action="store_true",
+                    help="(1) Adam bias-correction of v_hat: multiply by 1/(1-beta2^t) "
+                         "(beta2=0.999) each step. Tames the cold-start; ported from "
+                         "concord_ratio_coh. Off = legacy (uncorrected) behaviour.")
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the model (Concord layers stay opaque custom "
+                         "autograd Functions; inductor fuses + cudagraphs the rest). "
+                         "Requires torch/Triton aligned (torch 2.5.1 <-> Triton 3.1).")
+    ap.add_argument("--compile_mode", default="reduce-overhead",
+                    help="'reduce-overhead' (cudagraphs; best for this launch-bound model) "
+                         "or 'default' (fusion only).")
     ap.add_argument("--fast_gain_anneal", action="store_true",
                     help="anneal s_fast share of the FORWARD weight gamma:1->0 over "
                          "training; the loss drives signal into the slow path and the "
@@ -326,6 +365,13 @@ def main():
             weight_decay=args.concord_wd, step_cap=args.step_cap,
             eps=args.eps, precond_p=args.precond_p, gf_consol=args.gf_consol,
             v_scale=args.v_scale, gf_trust_delta_sq=args.gf_trust_delta_sq)
+        if args.beta1 != 0.0:
+            for m in layers:
+                m.beta1 = args.beta1   # fast-accumulator momentum (reinforce s_fast)
+            print(f"[{tag}] FAST-accum momentum beta1={args.beta1} (COHERENCE-GATED: "
+                  f"reinforces beta1*coh*velocity; per-coord net s_fast decay = "
+                  f"alpha - beta1*coh, so beta1>=alpha={args.alpha} diverges on coh~1 "
+                  f"coords)", flush=True)
         if args.tick_down:
             for m in layers:
                 m.allow_tickdown = True
@@ -351,6 +397,16 @@ def main():
                   f"{args.ratio_leak_floor}->0 over ~{args.ratio_coh_floor_epochs} epoch, "
                   f"then coh-gated; coh_pre dropped (32 bits/param) on {len(layers)} "
                   f"layers", flush=True)
+        set_gap_feedback(args.gap_feedback, args.gap_scale)
+        if args.gap_feedback:
+            print(f"[{tag}] GAP-FEEDBACK ON: conserved pass/evap, c=min(1,coh+exp(-|d_sv|/"
+                  f"{args.gap_scale})); floor stripped except gap->0", flush=True)
+        set_sigmag_noise(args.sigmag > 0.0, isotropic=args.sigmag_iso)
+        if args.sigmag > 0.0:
+            _shape = "ISOTROPIC" if args.sigmag_iso else "Sigma_g-shaped"
+            _sched = "CONSTANT" if args.sigmag_const else "rising-late*(1-lr/lr_peak)"
+            print(f"[{tag}] NOISE ON: {_shape}, {_sched}, sigma_peak={args.sigmag}, "
+                  f"lr_min_frac={args.lr_min_frac} -- deploy off S+V (sv)", flush=True)
         aux = [p for p in model.parameters() if p.requires_grad]
         aux_opt = torch.optim.AdamW(aux, lr=args.aux_lr, weight_decay=0.0)
         print(f"[{tag}] Concord on {len(layers)} Linears "
@@ -422,6 +478,43 @@ def main():
     _CONS_VARIANTS = ("sv", "s2v", "v", "s")   # deployed-weight candidates (drop s_fast)
     best_cons = {k: 1e9 for k in _CONS_VARIANTS}
     prev_W = None; prev_it = 0
+    # ---- CUDA graph capture (concord only): ONE graph over fwd+loss+bwd(+rebalance),
+    # replayed. Validated bit-exact (research_notebook probe_loss.py). Captured on the FIRST
+    # iter (NO eager pre-roll on the default stream -- that re-trips the legacy-stream error;
+    # mirror probe_loss). Per-step scalars the captured backward reads are DEVICE TENSORS
+    # updated outside the graph: lr (_lr_buf) + sigmag sigma (_get_sigmag_sigma), so the
+    # rising-late noise schedule rides replays with no recapture. The Sigma_g noise matmul
+    # lives in the backward -> it is captured automatically. aux_opt.step() stays eager.
+    _gst = {"on": bool(getattr(args, "cuda_graph", False) and args.mode == "concord" and layers),
+            "cap": False, "g": None, "loss": None, "sx": None, "sy": None}
+    _aux_params = [p for p in model.parameters() if p.requires_grad]
+    if _gst["on"]:
+        _gst["sx"] = torch.zeros(args.bsz, args.block_size, dtype=torch.long, device=device)
+        _gst["sy"] = torch.zeros(args.bsz, args.block_size, dtype=torch.long, device=device)
+
+    def _graph_step():
+        # captured region = fwd + loss + bwd ONLY (Concord step fused in bwd; the Sigma_g
+        # noise matmul rides along). rebalance() stays EAGER after replay -- matches the
+        # bit-exact probe_loss structure (rebalance reads _row_max_buf the captured bwd wrote).
+        for p in _aux_params:
+            if p.grad is not None:
+                p.grad = None
+        _, gl = model(_gst["sx"], _gst["sy"])
+        gl.backward()
+        return gl
+
+    if args.compile:
+        # Windows torch.compile cache bug: inductor's atomic write uses os.rename, which
+        # ERRORS on Windows if the destination exists (POSIX rename overwrites) -> swap in
+        # os.replace (cross-platform atomic-overwrite).
+        import os as _os
+        _os.rename = _os.replace
+        # Compile AFTER layers/aux are collected (they reference the real Concord modules,
+        # so lr/rebalance still work). Concord's custom autograd Function stays opaque;
+        # inductor fuses + (reduce-overhead) cudagraphs the rest (attention/LN/embeddings).
+        model = torch.compile(model, mode=args.compile_mode)
+        print(f"[{tag}] torch.compile mode={args.compile_mode} (first iters pay compile cost)",
+              flush=True)
     for it in range(args.max_iters):
         if args.fast_gain_anneal and args.mode == "concord" and layers:
             _fh = max(1, int(args.fast_gain_frac * args.max_iters))
@@ -430,14 +523,20 @@ def main():
                 * 0.5 * (1.0 + math.cos(math.pi * it / _fh)))
             for _m in layers:
                 _m.fast_gain = _fg
-        f = lr_at(it) / peak_lr            # schedule factor in [min_frac, 1]
+        f = lr_at(it) / peak_lr            # schedule factor in [min_frac, 1] (= lr/lr_peak)
         warm = min(1.0, (it + 1) / args.warmup_iters) if args.warmup_iters > 0 else 1.0
         lr = peak_lr * (warm if args.const_lr else f)
+        if args.mode == "concord" and args.sigmag > 0.0:
+            # rising-late sigma = sigmag_peak * (1 - lr/lr_peak): ~0 early, max late
+            # (the doc's only-helpful schedule). --sigmag_const ablates to constant.
+            set_sigmag_sigma(args.sigmag if args.sigmag_const else args.sigmag * (1.0 - f))
         if args.mode == "concord" and args.gate_cosine:
             set_gate_gain(f)               # route the cosine onto the commitment gate
         if args.mode == "concord" and args.ratio_coh:
             set_ratio_coh_floors(cos_floor(args.ratio_chase_floor, it, args.ratio_chase_floor_min),
                                  cos_floor(args.ratio_leak_floor, it, args.ratio_leak_floor_min))
+        if args.mode == "concord" and args.bias_correct:
+            set_v_bias_correction(bias_correction_factor(it))   # (1) 1/(1-beta2^t)
         if args.mode == "concord":
             for m in layers:
                 m.lr = lr
@@ -494,13 +593,44 @@ def main():
                   f"best_val {best_val:.4f}{expstr}  ({time.time()-t0:.0f}s)", flush=True)
 
         x, y = get_batch(train, args.bsz, args.block_size, device, generator=train_gen)
-        aux_opt.zero_grad(set_to_none=True)
-        _, loss = model(x, y)
-        loss.backward()              # Concord layers step in backward
-        aux_opt.step()
-        if args.mode == "concord" and (it + 1) % args.rebalance_every == 0:
-            for m in layers:
-                m.rebalance()
+        if _gst["on"] and not _gst["cap"]:
+            # FIRST iter: side-stream warmup of the FULL fwd+bwd (3x; settles autograd +
+            # Triton autotune so capture has nothing on the legacy stream), then record ONE
+            # graph. NO eager pre-roll on the default stream. Warmup+capture = ~4 real steps
+            # on batch 0 (one-time blip).
+            _gst["sx"].copy_(x); _gst["sy"].copy_(y)
+            _s = torch.cuda.Stream()
+            _s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(_s):
+                for _ in range(3):
+                    _graph_step()
+            torch.cuda.current_stream().wait_stream(_s)
+            _cg = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(_cg):
+                _gst["loss"] = _graph_step()
+            _gst["g"] = _cg; _gst["cap"] = True
+            aux_opt.step()
+            if (it + 1) % args.rebalance_every == 0:
+                for m in layers:
+                    m.rebalance()
+            loss = _gst["loss"]
+            print(f"[{tag}] CUDA graph captured at iter {it}", flush=True)
+        elif _gst["on"]:
+            _gst["sx"].copy_(x); _gst["sy"].copy_(y)
+            _gst["g"].replay()       # fwd+loss+bwd (Concord step + Sigma_g noise, fused)
+            aux_opt.step()           # eager, outside the graph
+            if (it + 1) % args.rebalance_every == 0:
+                for m in layers:
+                    m.rebalance()
+            loss = _gst["loss"]
+        else:
+            aux_opt.zero_grad(set_to_none=True)
+            _, loss = model(x, y)
+            loss.backward()              # Concord layers step in backward
+            aux_opt.step()
+            if args.mode == "concord" and (it + 1) % args.rebalance_every == 0:
+                for m in layers:
+                    m.rebalance()
         if args.watch_vproxy_ema and args.mode == "concord":
             for m in layers:
                 vp = _vproxy_only(m)

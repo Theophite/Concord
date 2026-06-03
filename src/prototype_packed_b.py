@@ -210,7 +210,7 @@ def _apply_packed_sgd_kernel(
 
     # ── SR-tick on s_fast ───────────────────────────────────────
     delta_grad = -lr * grad_W * scale_inv     # mantissa units
-    delta_t = delta_grad - beta1 * s_fast.to(tl.float32)
+    delta_t = delta_grad + beta1 * s_fast.to(tl.float32)   # fast-accumulator momentum (+beta1*velocity)
 
     pos_hash = (offs_n[:, None] << 16) ^ offs_k[None, :]
     r1 = _hash_uniform(s_fast, pos_hash, step_salt)
@@ -422,9 +422,12 @@ def _apply_packed_adamw_kernel(
     gf_trust_delta_sq,   # fp32: δ² in step = grad/√(Var + δ²·v̂);
                           # 0 disables (legacy: clamp by step_cap only)
     gate_gain,           # fp32: scalar cosine schedule on the commitment gate
-    chase_floor,         # fp32: ratio-coh fast->slow floor (cosine ->0 over ~1 epoch)
-    leak_floor,          # fp32: ratio-coh slow->v_slow floor
-                          # (1.0 = off). Anneals α·gate·s_fast consolidation.
+    chase_floor_ptr,     # *fp32[1]: ratio-coh fast->slow floor (DEVICE TENSOR so the per-step
+    leak_floor_ptr,      # *fp32[1]: ratio-coh slow->v_slow floor   schedule survives CUDA-graph
+                          # capture). (1.0 = off). Anneals α·gate·s_fast consolidation.
+    v_bc_ptr,            # *fp32 [1]: Adam bias-correction 1/(1-beta2^t) for v_hat
+                          # (device tensor; 1.0 = off). Ported from concord_ratio_coh.
+    gap_inv_scale,       # fp32: 1/gap_scale for the conserved gap-feedback pass/evap split
     step_salt_ptr,
     stride_pn, stride_pk,
     stride_gn, stride_gk,
@@ -438,6 +441,7 @@ def _apply_packed_adamw_kernel(
     USE_COHPRE: tl.constexpr,  # True → coh_pre-gated acceptance (chase)
     USE_FIXED_COH: tl.constexpr,  # True → Wiener coh = S/(S+noise²) (units-correct)
     USE_RATIO_COH: tl.constexpr,  # True -> gate chase+leak by live coh, no coh_pre
+    USE_GAP_FEEDBACK: tl.constexpr,  # True -> conserved gap-magnitude pass/evap split (strips floor)
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -448,6 +452,10 @@ def _apply_packed_adamw_kernel(
     # eps likewise read from a device tensor — lets an eps warmup
     # schedule update it between graph replays (e.g. SGD->precond handoff).
     eps = tl.load(eps_ptr).to(tl.float32)
+    # ratio-coh floors: device tensors too, so the per-step cosine schedule
+    # propagates into a captured graph's replays (no recapture).
+    chase_floor = tl.load(chase_floor_ptr).to(tl.float32)
+    leak_floor = tl.load(leak_floor_ptr).to(tl.float32)
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -494,16 +502,17 @@ def _apply_packed_adamw_kernel(
     # v̂ (Adafactor rank-1, W² units) feeds both the trust region and the
     # consolidation-coherence gate, so load it if either is active.
     coh = 0.0
-    if USE_GF_TRUST_REGION or USE_GF_CONSOLIDATION or USE_COHPRE or USE_RATIO_COH:
+    if (USE_GF_TRUST_REGION or USE_GF_CONSOLIDATION) or (USE_COHPRE or USE_RATIO_COH):
         v_row_tile = tl.load(v_row_ptr + offs_n,
                               mask=n_mask, other=0.0).to(tl.float32)
         v_col_tile = tl.load(v_col_ptr + offs_k,
                               mask=k_mask, other=0.0).to(tl.float32)
         sum_v_inv = tl.load(sum_v_inv_ptr).to(tl.float32)
         v_hat = v_row_tile[:, None] * v_col_tile[None, :] * sum_v_inv
+        v_hat = v_hat * tl.load(v_bc_ptr).to(tl.float32)   # (1) Adam bias-correction 1/(1-b2^t)
     if USE_GF_TRUST_REGION:
         v_proxy = v_proxy + gf_trust_delta_sq * v_hat
-    if USE_GF_CONSOLIDATION or USE_COHPRE or USE_RATIO_COH:
+    if USE_GF_CONSOLIDATION or (USE_COHPRE or USE_RATIO_COH):
         # Momentum = displacement between two time-lagged positions: the
         # mean gradient over v_slow's window is α_v·d_sv (mantissa units),
         # → W units via scale_fwd. Coherence = (mean grad)² / E[g²] ∈ [0,1]
@@ -522,6 +531,13 @@ def _apply_packed_adamw_kernel(
             mean_grad_w = alpha_v_fast * d_sv * scale_fwd
             coh = mean_grad_w * mean_grad_w / (v_hat + 1e-12)
         coh = tl.minimum(tl.maximum(coh, 0.0), 1.0)
+        if USE_GAP_FEEDBACK:
+            # Conserved pass<->evaporate split, gated by the GAP MAGNITUDE |d_sv|:
+            # pass fraction c = min(1, coh + exp(-|d_sv|*gap_inv_scale)). Large gap ->
+            # g~0 -> c=coh (pure coh-gate, the constant floor is STRIPPED); gap->0 ->
+            # g~1 -> c->1 (full pass = the ignition minimum, kept ONLY in this limit).
+            # The (1-c) fraction evaporates -> one rate (alpha) split by c.
+            c_pass = tl.minimum(coh + tl.exp(-tl.abs(d_sv) * gap_inv_scale), 1.0)
 
     # ── AdamW step ─────────────────────────────────────────────
     # Weight decay enters via step_live as `wd * current_weight`. After
@@ -554,7 +570,9 @@ def _apply_packed_adamw_kernel(
     # the wd contribution to s_fast is -lr·wd·s_fast — a simple
     # exponential decay of s_fast with rate lr·wd per step.
     s_fast_in_w = d_fs * scale_fwd
-    if USE_GF_CONSOLIDATION:
+    if USE_GAP_FEEDBACK:
+        evap_mantissa = (1.0 - c_pass) * alpha * d_fs   # conserved: non-passed velocity evaporates
+    elif USE_GF_CONSOLIDATION:
         # gf-gated evaporation REPLACES uniform cautious wd: drain only the
         # INCOHERENT part of the velocity. coh→1 (signal) is preserved and
         # flows to s_slow via the unconditional chase; coh→0 (noise) decays
@@ -570,7 +588,17 @@ def _apply_packed_adamw_kernel(
         step_live = step_live + weight_decay * s_fast_in_w
         evap_mantissa = 0.0
     delta_grad = -lr * step_live * scale_inv     # mantissa units
-    delta_t = delta_grad - beta1 * d_fs - evap_mantissa
+    # FAST-ACCUMULATOR MOMENTUM (beta1), COHERENCE-GATED: the velocity here is
+    # d_fs = s_fast; a heavy-ball term reinforces s_fast by beta1*velocity, applied BACK
+    # to s_fast (NOT carried to s_slow = the slow-momentum chase). UNGATED this amplifies
+    # the NOISE in the velocity and diverges (s_fast is part of the live weight, so it's
+    # a non-mass-preserving acceleration that feeds back through the preconditioner). So
+    # gate by coh = Wiener S/(S+N): reinforce only the COHERENT fraction, beta1*coh*d_fs
+    # -- equivalently the noise fraction (1-coh)*beta1*d_fs is evaporated/cancelled, so
+    # the momentum can't run away on noise. Coherent coords accelerate; incoherent ones
+    # don't. (coh init 0 -> 0 momentum without a gate.) The grad it accumulates is
+    # already RMS-normalized by sqrt(v_hat) (v-hat AdamW).
+    delta_t = delta_grad + beta1 * coh * d_fs - evap_mantissa
 
     # ── SR-tick s_fast ────────────────────────────────────────
     pos_hash = (offs_n[:, None] << 16) ^ offs_k[None, :]
@@ -593,7 +621,9 @@ def _apply_packed_adamw_kernel(
         # the diffusion of noise into s_slow at the source, while holding
         # converged coords (high coh_pre memory) that plain coh would drop.
         gate = 1.0
-        if USE_RATIO_COH:
+        if USE_GAP_FEEDBACK:
+            gate = c_pass   # pass fraction (conserved with the (1-c) evaporate above)
+        elif USE_RATIO_COH:
             gate = chase_floor + (1.0 - chase_floor) * coh   # fast->slow, floored
         elif USE_COHPRE:
             coh_pre = tl.load(coh_pre_ptr + p_off,
@@ -783,6 +813,45 @@ _USE_FIXED_COH = True   # validated default: Wiener coh S/(S+noise^2). False=leg
 # Scalar cosine schedule on the commitment gate (1.0 = off). Set per-step.
 _GATE_GAIN = 1.0
 
+# EXPERIMENTAL (default OFF): centered Sigma_g-shaped gradient-noise injection. Adds a draw
+# shaped like the per-token gradient covariance (mean-subtracted) to grad_W in backward,
+# scaled by _SIGMAG_SIGMA (in units of ||grad_W||). The harness schedules sigma (rising-late
+# is the only config the noise study found helpful). Off => grad_W untouched (bit-identical).
+_SIGMAG_NOISE = False
+_SIGMAG_SIGMA = 0.0     # python mirror (for the enabled-check); the kernel-read value is the tensor
+_SIGMAG_ISO = False     # ablation: True = isotropic white noise instead of Sigma_g-shaped
+# Per-device scalar tensor mirror of sigma so the backward reads a STABLE device pointer ->
+# a captured CUDA graph sees it, and set_sigmag_sigma's .fill_() (outside the graph) propagates
+# to replays. Exactly the lr / nwv-beta device-tensor pattern. Lazily created per device.
+_SIGMAG_SIGMA_T = {}
+
+
+def set_sigmag_noise(enabled, isotropic=False):
+    global _SIGMAG_NOISE, _SIGMAG_ISO
+    _SIGMAG_NOISE = bool(enabled)
+    _SIGMAG_ISO = bool(isotropic)
+
+
+def set_sigmag_sigma(sigma):
+    """Per-step setter for the injection magnitude (units of ||grad_W||). Updates BOTH the
+    python float (gates the enabled-check) and every device-tensor mirror (.fill_(), so it
+    propagates into a captured graph's next replay)."""
+    global _SIGMAG_SIGMA
+    _SIGMAG_SIGMA = float(sigma)
+    for t in _SIGMAG_SIGMA_T.values():
+        t.fill_(_SIGMAG_SIGMA)
+
+
+def _get_sigmag_sigma(device):
+    """The graph-stable sigma tensor for `device` (lazily created from the float)."""
+    key = str(device)
+    t = _SIGMAG_SIGMA_T.get(key)
+    if t is None:
+        t = torch.zeros((), dtype=torch.float32, device=device)
+        t.fill_(_SIGMAG_SIGMA)
+        _SIGMAG_SIGMA_T[key] = t
+    return t
+
 
 def set_fixed_coh(enabled):
     global _USE_FIXED_COH
@@ -792,6 +861,21 @@ def set_fixed_coh(enabled):
 def set_gate_gain(g):
     global _GATE_GAIN
     _GATE_GAIN = float(g)
+
+
+# Conserved GAP-FEEDBACK pass<->evaporate split (replaces the constant floor + gf_consol
+# with one rate alpha, split by pass fraction c = min(1, coh + exp(-|d_sv|/gap_scale))).
+# Strips the steady-state floor; the ignition minimum survives only in the gap->0 limit.
+# gap_scale is in MANTISSA units (|d_sv| = |s_slow_full - v_slow_full|). Off by default.
+_GAP_FEEDBACK = False
+_GAP_SCALE = 500.0
+
+
+def set_gap_feedback(enabled, scale=None):
+    global _GAP_FEEDBACK, _GAP_SCALE
+    _GAP_FEEDBACK = bool(enabled)
+    if scale is not None:
+        _GAP_SCALE = float(scale)
 
 
 # EXPERIMENTAL (default OFF, so the validated default is untouched): gate the
@@ -827,6 +911,11 @@ _RATIO_COH = False
 # over ~one epoch -> pure coherence gating, no permanent noise leak. Global scalars.
 _RATIO_CHASE_FLOOR = 0.9     # fast -> slow  (beta1-like timescale)
 _RATIO_LEAK_FLOOR = 0.999    # slow -> v_slow (beta2-like timescale)
+# Per-device fp32[1] device-tensor mirrors of the floors, so the per-step cosine schedule
+# survives CUDA-graph capture (the kernel reads the pointer; the setter .fill_()s it outside
+# the graph). Same pattern as lr/eps/sigma. Lazily created.
+_RATIO_CHASE_FLOOR_T = {}
+_RATIO_LEAK_FLOOR_T = {}
 
 
 def set_ratio_coh(enabled):
@@ -836,10 +925,67 @@ def set_ratio_coh(enabled):
 
 def set_ratio_coh_floors(chase, leak):
     """Per-step setter for the two bootstrap floors. Schedule: cosine from 0.9
-    (fast->slow) / 0.999 (slow->v_slow) to 0 over ~one epoch."""
+    (fast->slow) / 0.999 (slow->v_slow) to 0 over ~one epoch. Updates both the python
+    floats and every device-tensor mirror (.fill_(), so it rides graph replays)."""
     global _RATIO_CHASE_FLOOR, _RATIO_LEAK_FLOOR
     _RATIO_CHASE_FLOOR = float(chase)
     _RATIO_LEAK_FLOOR = float(leak)
+    for t in _RATIO_CHASE_FLOOR_T.values():
+        t.fill_(_RATIO_CHASE_FLOOR)
+    for t in _RATIO_LEAK_FLOOR_T.values():
+        t.fill_(_RATIO_LEAK_FLOOR)
+
+
+def _ensure_floor_tensors(device):
+    """Return (chase_floor_ptr, leak_floor_ptr) device tensors holding the current floors."""
+    key = str(device)
+    ct = _RATIO_CHASE_FLOOR_T.get(key)
+    if ct is None:
+        ct = torch.zeros(1, dtype=torch.float32, device=device); ct.fill_(_RATIO_CHASE_FLOOR)
+        _RATIO_CHASE_FLOOR_T[key] = ct
+    lt = _RATIO_LEAK_FLOOR_T.get(key)
+    if lt is None:
+        lt = torch.zeros(1, dtype=torch.float32, device=device); lt.fill_(_RATIO_LEAK_FLOOR)
+        _RATIO_LEAK_FLOOR_T[key] = lt
+    return ct, lt
+
+
+# ── (1) Adam bias-correction on the rank-1 v_hat (ported from concord_ratio_coh) ──
+# v_row/v_col EMAs start at 0 -> v_hat biased low early -> oversized cold-start steps
+# (clamped to step_cap). The kernel multiplies v_hat by a per-device 1/(1-beta2^t)
+# buffer (=1 once warm; 1.0 = off). INERT unless a driver calls set_v_bias_correction
+# each step -> existing callers (CIFAR etc.) are byte-unchanged. Validated on T5-small
+# SST-2 (+0.46 deploy, 4/5 seeds, removes LR warmup); this port re-confirms the
+# tiny-shakespeare headline.
+_BIAS_CORRECT_V = False     # finetune lever, not universal (substitutes for LR warmup);
+                            # the nanoGPT harness drives it only under --bias_correct.
+_V_BC_BUFS = {}             # device-str -> bc_buf[1] fp32 (init 1.0 = no correction)
+
+
+def _v_bc_buf(device):
+    key = str(device)
+    buf = _V_BC_BUFS.get(key)
+    if buf is None:
+        buf = torch.ones(1, dtype=torch.float32, device=device)
+        _V_BC_BUFS[key] = buf
+    return buf
+
+
+def set_bias_correct_v(enabled):
+    global _BIAS_CORRECT_V
+    _BIAS_CORRECT_V = bool(enabled)
+
+
+def set_v_bias_correction(factor):
+    """Fill the per-device v_hat bias-correction buffers (= 1/(1-b2^t) when on, 1.0
+    off). Drive once per step from the training loop; buffer default 1.0 = inert."""
+    for buf in _V_BC_BUFS.values():
+        buf.fill_(float(factor))
+
+
+def bias_correction_factor(step, beta2=0.999):
+    """1/(1-beta2^t), t = step+1 (>=1, never divides by zero); -> 1 once warm."""
+    return 1.0 / (1.0 - beta2 ** (int(step) + 1))
 
 
 def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
@@ -898,6 +1044,9 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
                           float(step_cap), int(mantissa_bias))
     lr_ptr = _ensure_lr_tensor(lr, packed_w.device)
     eps_ptr = _ensure_eps_tensor(eps, packed_w.device)
+    _ratio_chase_floor_ptr, _ratio_leak_floor_ptr = _ensure_floor_tensors(packed_w.device)
+    bc_buf = _v_bc_buf(packed_w.device)                   # (1) v_hat bias-correction buffer
+    gap_inv = (1.0 / _GAP_SCALE) if (_GAP_FEEDBACK and _GAP_SCALE > 0) else 0.0
     BLOCK_N, BLOCK_K = 32, 64
     grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K))
     _apply_packed_adamw_kernel[grid](
@@ -914,8 +1063,10 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         float(wd_sv), float(wd_sf),
         float(gf_trust_delta_sq),
         float(_GATE_GAIN),
-        float(_RATIO_CHASE_FLOOR),
-        float(_RATIO_LEAK_FLOOR),
+        _ratio_chase_floor_ptr,
+        _ratio_leak_floor_ptr,
+        bc_buf,
+        float(gap_inv),
         step_counter,
         packed_w.stride(0), packed_w.stride(1),
         grad_W.stride(0), grad_W.stride(1),
@@ -929,6 +1080,7 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         USE_COHPRE=bool(use_cohpre),
         USE_FIXED_COH=bool(_USE_FIXED_COH),
         USE_RATIO_COH=bool(_RATIO_COH),
+        USE_GAP_FEEDBACK=bool(_GAP_FEEDBACK),
     )
 
 
@@ -1252,6 +1404,35 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
         x_flat = x.reshape(-1, in_features)
         grad_y_flat = grad_y.reshape(-1, out_features)
         grad_W = grad_y_flat.transpose(0, 1) @ x_flat
+        # ---- centered Sigma_g-shaped noise injection (EXPERIMENTAL, default off) ----
+        # Add a draw shaped like the per-token gradient covariance, MEAN-SUBTRACTED:
+        #   noise = sum_i eps_i (g_i - gbar) = (eps*grad_y)^T x - (sum eps) gbar,  eps~N(0,1)
+        # one matmul; covariance == empirical Sigma_g (NOT isotropic; isotropic shuts the
+        # coherence gate). sigma is a global the harness schedules (rising-late). The doc's
+        # only-config-that-helps: centered Sigma_g + rising sigma + S+V deploy + LR floor.
+        # NOTE: the _SIGMAG_NOISE gate is a python bool (control flow) -> a captured CUDA
+        # graph bakes the on/off choice at capture time; that is fine (a graphed run is
+        # noise-on for its whole life). The MAGNITUDE rides a device tensor so the rising
+        # schedule still updates across replays. The interior is all-tensor (no python branch
+        # on tensor values) so capture is safe.
+        if _SIGMAG_NOISE:
+            with torch.no_grad():
+                gwf = grad_W.float()
+                if _SIGMAG_ISO:
+                    # ABLATION: isotropic (white) noise, NOT Sigma_g-shaped. Doc claims this
+                    # shuts the coherence gate (raises N uniformly). Same magnitude as below.
+                    noise = torch.randn_like(gwf)
+                else:
+                    gyf = grad_y_flat.float()
+                    M = gyf.shape[0]
+                    eps = torch.randn(M, device=gyf.device, dtype=torch.float32)
+                    gbar = gwf / max(M, 1)
+                    noise = (eps[:, None] * gyf).transpose(0, 1) @ x_flat.float() - eps.sum() * gbar
+                # scale to sigma * ||grad_W|| (sigma in units of the gradient magnitude).
+                # sigma is the device tensor (graph-stable); clamp the norm (no python branch).
+                sig_t = _get_sigmag_sigma(gwf.device)
+                nrm = noise.norm().clamp_min(1e-12)
+                grad_W = gwf + noise * (sig_t * gwf.norm() / nrm)
         if grad_W.dtype != torch.bfloat16:
             grad_W = grad_W.to(torch.bfloat16)
         if not grad_W.is_contiguous():
