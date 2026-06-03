@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from diffusers import StableDiffusionXLPipeline, DDPMScheduler
 
-from concord_winner import ConcordConfig, configure_optimizer, winner_step
+from concord_winner import ConcordConfig, configure_optimizer, winner_step, GatedRebalance
 from control_plane import TokenSpec, apply_token_spec
 
 dev, dt = torch.device("cuda"), torch.bfloat16
@@ -53,6 +53,7 @@ def train(pipe, opt_config, token_specs, lat, prompt, time_ids, steps, sched):
     import gc; gc.collect(); torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()                    # measure the TRAINING peak
 
+    rebalance = GatedRebalance(layers)                      # fire only on actual overflow
     w0 = layers[0].weight.detach().float().clone() if layers else None
     for it in range(steps):
         if layers:
@@ -67,11 +68,13 @@ def train(pipe, opt_config, token_specs, lat, prompt, time_ids, steps, sched):
         F.mse_loss(pred.float(), noise.float()).backward()      # UNet + trainable tokens self-step
         if aux:
             aux.step()
-        for m in layers:
-            m.rebalance()
+        rebalance()                                             # gated: skips the 794 no-op launches
         if it % 30 == 0 or it == steps - 1:
             dw = ((layers[0].weight.detach().float() - w0).norm() / w0.norm()).item() if layers else 0
             print(f"  [{it:3d}] UNet w moved {dw:.2e}")
+    if layers:
+        print(f"  [rebalance] fired {rebalance.fires}/{steps} steps "
+              f"(gated: the rest skipped 794 no-op launches each)")
     return layers, cps
 
 

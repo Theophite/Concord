@@ -203,6 +203,65 @@ def winner_step(it, total_iters, layers, peak_lr=None, warmup=None, floor_horizo
     return lr
 
 
+class GatedRebalance:
+    """Fire rebalance only when a layer's mantissa actually crosses MAX_M.
+
+    Per-step rebalance launches one kernel per Concord layer (~840 ms for SDXL's
+    794 layers) -- but rebalance only *does* anything when a row/col max exceeds
+    MAX_M, which at a finetune lr is ~0% of steps (measured). The launches are
+    almost pure waste.
+
+    The winner's apply kernel already writes each layer's per-row/col mantissa
+    maxima (atomic_max) and the backward zeros+repopulates them every step. So we
+    back every layer's max buffers with slices of two SHARED tensors, and one
+    reduction over them tells us whether ANY layer needs a tick. Common case: no
+    fire -> skip all 794 launches. Rare fire -> run the exact same per-layer
+    rebalance. Math-identical (same MAX_M trigger, same kernel); touches no kernel
+    code -- only repoints the bookkeeping buffers and gates the dispatch.
+
+    Drop-in for `for m in layers: m.rebalance()` -- just call the instance.
+    """
+
+    def __init__(self, layers):
+        self.layers = [m for m in (layers or []) if hasattr(m, "rebalance")]
+        self.MAX_M = max((getattr(m, "MAX_M", 24000) for m in self.layers), default=24000)
+        self.row_all = None
+        self.col_all = None
+        self.fires = 0
+        self.calls = 0
+
+    def _wire(self):
+        """Repoint the per-layer max buffers at slices of two shared tensors.
+        Called once, after the first backward has created the buffers."""
+        dev = self.layers[0].packed_w.device
+        rs = [m._row_max_buf.shape[0] for m in self.layers]
+        cs = [m._col_max_buf.shape[0] for m in self.layers]
+        self.row_all = torch.zeros(sum(rs), dtype=torch.int32, device=dev)
+        self.col_all = torch.zeros(sum(cs), dtype=torch.int32, device=dev)
+        ro = co = 0
+        for m, n, k in zip(self.layers, rs, cs):
+            m._row_max_buf = self.row_all[ro:ro + n]; ro += n
+            m._col_max_buf = self.col_all[co:co + k]; co += k
+
+    def __call__(self):
+        """Call after backward (in place of the per-layer rebalance loop)."""
+        if not self.layers:
+            return False
+        self.calls += 1
+        if self.row_all is None:
+            if not hasattr(self.layers[0], "_row_max_buf"):
+                return False                  # no apply has run yet
+            self._wire()                      # first wired step: buffers just zeroed, safe at init
+            return False
+        peak = torch.maximum(self.row_all.max(), self.col_all.max())
+        if bool((peak > self.MAX_M).item()):  # one reduction + one tiny sync gates 794 layers
+            for m in self.layers:
+                m.rebalance()
+            self.fires += 1
+            return True
+        return False
+
+
 def make_aux_optimizer(params, lr, momentum=0.9, weight_decay=0.0):
     """The aux optimizer for the NON-Concord params (norms/biases/embeddings)
     is plain SGD, NOT AdamW (project owner's call, overriding the README).
