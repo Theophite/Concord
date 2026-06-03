@@ -81,6 +81,12 @@ class TrainOptimizerConfig(BaseConfig):
     use_triton: bool
     warmup_init: bool
     weight_decay: float
+    gf_consol: float
+    noise: bool
+    sigmag_peak: float
+    ratio_coh: bool
+    warmup: int
+    lr_min_frac: float
     weight_lr_power: float
     decoupled_decay: bool
     fixed_decay: bool
@@ -195,6 +201,13 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("use_triton", False, bool, False))
         data.append(("warmup_init", False, bool, False))
         data.append(("weight_decay", None, float, True))
+        # --- Concord winner knobs (read by concord_ot.make_concord_config; None -> winner default) ---
+        data.append(("gf_consol", None, float, True))
+        data.append(("noise", None, bool, True))
+        data.append(("sigmag_peak", None, float, True))
+        data.append(("ratio_coh", None, bool, True))
+        data.append(("warmup", None, int, True))
+        data.append(("lr_min_frac", None, float, True))
         data.append(("weight_lr_power", None, float, True))
         data.append(("decoupled_decay", False, bool, False))
         data.append(("fixed_decay", False, bool, False))

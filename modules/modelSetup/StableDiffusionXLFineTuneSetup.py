@@ -99,7 +99,8 @@ class StableDiffusionXLFineTuneSetup(
         if config.optimizer.optimizer == Optimizer.CONCORD:
             from modules.util.optimizer.concord_ot import ConcordController
             model.concord_controller = ConcordController(
-                model.unet, self.train_device, config.learning_rate, total_steps=1)
+                model.unet, self.train_device, config.learning_rate, total_steps=1,
+                optimizer_config=config.optimizer)
         else:
             model.concord_controller = None
 

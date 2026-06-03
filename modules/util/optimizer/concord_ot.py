@@ -24,11 +24,26 @@ if _CONCORD_DIR not in sys.path:
     sys.path.insert(0, _CONCORD_DIR)
 
 
-def make_concord_config(learning_rate: float):
-    """Map OneTrainer settings onto the validated winner config. Stage 1: take lr from
-    OneTrainer's learning_rate; the rest are the validated sf_060 winner defaults."""
+def make_concord_config(learning_rate: float, optimizer_config=None):
+    """Map OneTrainer settings onto the validated winner config: lr comes from the main
+    learning_rate field; the winner knobs (gf_consol/noise/sigmag_peak/ratio_coh/warmup/
+    lr_min_frac) come from the GUI optimizer-params panel (None -> validated winner default)."""
     from concord_winner import ConcordConfig
-    return ConcordConfig(lr=float(learning_rate))
+    d = ConcordConfig()
+
+    def pick(name, default):
+        v = getattr(optimizer_config, name, None) if optimizer_config is not None else None
+        return default if v is None else v
+
+    return ConcordConfig(
+        lr=float(learning_rate),
+        gf_consol=float(pick("gf_consol", d.gf_consol)),
+        noise=bool(pick("noise", d.noise)),
+        sigmag_peak=float(pick("sigmag_peak", d.sigmag_peak)),
+        ratio_coh=bool(pick("ratio_coh", d.ratio_coh)),
+        warmup=int(pick("warmup", d.warmup)),
+        lr_min_frac=float(pick("lr_min_frac", d.lr_min_frac)),
+    )
 
 
 class ConcordController:
@@ -36,9 +51,9 @@ class ConcordController:
     for one training run. Created in the SDXL setup (after the model is loaded, before the
     optimizer is built); driven by the trainer via before_step()/after_step()."""
 
-    def __init__(self, unet, device, learning_rate: float, total_steps: int):
+    def __init__(self, unet, device, learning_rate: float, total_steps: int, optimizer_config=None):
         from concord_winner import swap_unet_to_winner, GatedRebalance
-        self.config = make_concord_config(learning_rate)
+        self.config = make_concord_config(learning_rate, optimizer_config)
         self.total_steps = max(1, int(total_steps))
         self.layers = swap_unet_to_winner(
             unet, device, self.config.lr, gf_consol=self.config.gf_consol, verbose=False)

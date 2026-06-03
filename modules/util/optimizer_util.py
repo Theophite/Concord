@@ -421,9 +421,16 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
     },
     # Concord: optimizer-visible params are the aux SGD's (norms/biases/embeddings); the
     # swapped UNet layers self-step in backward. lr comes from the main learning_rate field.
+    # The winner knobs default to the validated sf_060 configuration.
     Optimizer.CONCORD: {
         "momentum": 0.9,
         "weight_decay": 0,
+        "gf_consol": 50.0,
+        "noise": True,
+        "sigmag_peak": 0.6,
+        "ratio_coh": True,
+        "warmup": 100,
+        "lr_min_frac": 0.2,
     },
     Optimizer.LION: {
         "beta1": 0.9,

@@ -138,6 +138,13 @@ class OptimizerParamsWindow(ctk.CTkToplevel):
             'use_triton': {'title': 'Use Triton', 'tooltip': 'Whether Triton optimization should be used.', 'type': 'bool'},
             'warmup_init': {'title': 'Warmup Initialization', 'tooltip': 'Whether to warm-up the optimizer initialization.', 'type': 'bool'},
             'weight_decay': {'title': 'Weight Decay', 'tooltip': 'Regularization to prevent overfitting.', 'type': 'float'},
+            # --- Concord winner knobs ---
+            'gf_consol': {'title': 'GF Consolidation', 'tooltip': 'Coherence-gated dissipation: rate at which the slow field consolidates and sheds incoherent mass. Winner default 50.', 'type': 'float'},
+            'noise': {'title': 'Fluctuation Noise', 'tooltip': 'Enable the Concord fluctuation -- isotropic noise injected into the fused backward (the dissipation/fluctuation pair).', 'type': 'bool'},
+            'sigmag_peak': {'title': 'Noise Sigma Peak', 'tooltip': 'Peak magnitude of the rising-late fluctuation noise, in units of the gradient norm. Winner default 0.6.', 'type': 'float'},
+            'ratio_coh': {'title': 'Coherence Gate', 'tooltip': 'Enable the Wiener coherence gate on the chase/leak floors.', 'type': 'bool'},
+            'warmup': {'title': 'Concord Warmup Steps', 'tooltip': 'Linear LR warmup steps for the Concord schedule (winner_step). Winner default 100.', 'type': 'int'},
+            'lr_min_frac': {'title': 'LR Min Fraction', 'tooltip': 'Cosine floor: minimum LR as a fraction of the peak LR over training. Winner default 0.2.', 'type': 'float'},
             'weight_lr_power': {'title': 'Weight LR Power', 'tooltip': 'During warmup, the weights in the average will be equal to lr raised to this power. Set to 0 for no weighting.', 'type': 'float'},
             'decoupled_decay': {'title': 'Decoupled Decay', 'tooltip': 'If set as True, then the optimizer uses decoupled weight decay as in AdamW.', 'type': 'bool'},
             'fixed_decay': {'title': 'Fixed Decay', 'tooltip': '(When Decoupled Decay is True:) Applies fixed weight decay when True; scales decay with learning rate when False.', 'type': 'bool'},
