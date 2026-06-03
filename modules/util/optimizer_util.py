@@ -419,6 +419,12 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
         "maximize": False,
         "differentiable": False,
     },
+    # Concord: optimizer-visible params are the aux SGD's (norms/biases/embeddings); the
+    # swapped UNet layers self-step in backward. lr comes from the main learning_rate field.
+    Optimizer.CONCORD: {
+        "momentum": 0.9,
+        "weight_decay": 0,
+    },
     Optimizer.LION: {
         "beta1": 0.9,
         "beta2": 0.99,

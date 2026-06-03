@@ -60,3 +60,35 @@ class ConcordController:
         """AFTER the optimizer update: gated rebalance (skips the no-op launches), tick."""
         self.gate()
         self.step_idx += 1
+
+    @torch.no_grad()
+    def consolidate_into_unet(self, unet):
+        """DEPLOY: replace the packed Concord layers in-place with standard nn.Linear /
+        nn.Conv2d holding the CONSOLIDATED weights (drops the transient s_fast), so the
+        UNet saves and loads as an ordinary SDXL UNet. Destructive -- call once before the
+        FINAL save; do not keep Concord-training after."""
+        import torch.nn as nn
+        from prototype_packed_b import ConcordConv2dPackedB, ConcordLinearPackedB
+        n = 0
+        for parent in unet.modules():
+            for name, child in list(parent.named_children()):
+                if isinstance(child, ConcordConv2dPackedB):     # subclass -> check first
+                    w = child.consolidated_weight().reshape(
+                        child.out_channels, child.in_channels, child.kh, child.kw)
+                    new = nn.Conv2d(child.in_channels, child.out_channels, (child.kh, child.kw),
+                                    stride=child.stride, padding=child.padding,
+                                    bias=child.bias is not None)
+                elif isinstance(child, ConcordLinearPackedB):
+                    w = child.consolidated_weight()             # [out, in]
+                    new = nn.Linear(child.in_features, child.out_features,
+                                    bias=child.bias is not None)
+                else:
+                    continue
+                new = new.to(device=child.packed_w.device, dtype=w.dtype)
+                new.weight.data.copy_(w)
+                if child.bias is not None:
+                    new.bias.data.copy_(child.bias.detach().to(new.bias.dtype))
+                setattr(parent, name, new)
+                n += 1
+        print(f"[concord] consolidated {n} layers -> standard nn.Linear/nn.Conv2d for deploy")
+        return n
