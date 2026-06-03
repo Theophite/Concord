@@ -82,6 +82,12 @@ class ConcordPackedEmbedding(nn.Module):
     def deploy_weight(self):
         return self.core.consolidated_weight()           # [K, dim], drop s_fast
 
+    @torch.no_grad()
+    def save(self, path):
+        """Save the deployable embedding(s) [K, dim] -- reuse them, or feed back as
+        an init vector (resolve_token_init accepts a tensor) to continue/transfer."""
+        torch.save(self.deploy_weight().detach().cpu(), path)
+
     def forward(self, ids):
         return _PackedEmbStep.apply(ids, self._grad_anchor, self)
 
@@ -110,6 +116,46 @@ class ConcordPackedEmbedding(nn.Module):
         core.packed_w[rows] = (((s_fast & 0xFFFF) << 16)
                                | ((s_slow & 0xFF) << 8) | (v_slow & 0xFF))
         core._resync_weight_buf()
+
+
+def resolve_token_init(specs, tokenizer, base_embedding, device="cuda"):
+    """Resolve a per-new-token initializer list into a [K, dim] init tensor. Each spec:
+      - str  : an INITIALIZER WORD -> mean of its frozen-vocab token embeddings
+               (the new token starts pointing where that word points);
+      - Tensor [dim] : an explicit init vector (e.g. torch.load'd from a saved file);
+      - None : small random.
+    Norm is handled afterward by init_tokens -> _pin_norm (the median target), so only
+    the DIRECTION of the initializer matters here."""
+    dim = base_embedding.weight.shape[1]
+    rows = []
+    for s in specs:
+        if isinstance(s, str):
+            ids = tokenizer(s, add_special_tokens=False).input_ids
+            v = base_embedding.weight[ids].float().mean(0)
+        elif torch.is_tensor(s):
+            v = s.float().reshape(dim)
+        else:
+            v = torch.randn(dim) * 0.05
+        rows.append(v.to(device))
+    return torch.stack(rows)
+
+
+def insert_new_tokens(te, tokenizer, names, init_specs=None, lr=5e-3, device="cuda"):
+    """Add `names` to `tokenizer` and insert a norm-preserving Concord embedding for
+    them into `te` (swap its token_embedding for a HybridCLIPEmbedding). `init_specs`
+    is a per-token initializer (word / vector / None); target norm = the TE's vocab
+    median. Returns the trainable ConcordPackedEmbedding. Centralizes the TI wiring."""
+    from concord_embedding import HybridCLIPEmbedding
+    base = te.get_input_embeddings()
+    vocab, dim = base.weight.shape
+    median = ConcordPackedEmbedding.vocab_median_norm(base.weight)
+    for n in names:
+        tokenizer.add_tokens(n)
+    init = resolve_token_init(init_specs or [None] * len(names), tokenizer, base, device)
+    nm = ConcordPackedEmbedding(len(names), dim, device=device, lr=lr, target_norm=median)
+    nm.init_tokens(init=init)
+    te.text_model.embeddings.token_embedding = HybridCLIPEmbedding(base, nm, vocab)
+    return nm
 
 
 if __name__ == "__main__":
