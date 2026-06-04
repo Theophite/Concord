@@ -193,6 +193,7 @@ class BaseStableDiffusionXLSetup(
             train_progress: TrainProgress,
             *,
             deterministic: bool = False,
+            return_unet_inputs: bool = False,
     ) -> dict:
         with model.autocast_context:
             batch_seed = 0 if deterministic else train_progress.global_step * multi.world_size() + multi.rank()
@@ -280,6 +281,24 @@ class BaseStableDiffusionXLSetup(
                 latent_input = scaled_noisy_latent_image
 
             added_cond_kwargs = {"text_embeds": pooled_text_encoder_2_output, "time_ids": add_time_ids}
+
+            # Stage 3 v2 (Concord CUDA graph): hand the eager prep's UNet inputs + target
+            # back to the caller, which captures UNet->loss->backward in a graph. Additive;
+            # default path (return_unet_inputs=False) is unchanged.
+            if return_unet_inputs:
+                if model.noise_scheduler.config.prediction_type == 'v_prediction':
+                    target = model.noise_scheduler.get_velocity(scaled_latent_image, latent_noise, timestep)
+                else:
+                    target = latent_noise
+                return {
+                    'latent_input': latent_input.to(dtype=model.train_dtype.torch_dtype()),
+                    'timestep': timestep,
+                    'encoder_hidden_states': text_encoder_output.to(dtype=model.train_dtype.torch_dtype()),
+                    'added_cond_kwargs': added_cond_kwargs,
+                    'target': target,
+                    'loss_type': 'target',
+                }
+
             predicted_latent_noise = model.unet(
                 sample=latent_input.to(dtype=model.train_dtype.torch_dtype()),
                 timestep=timestep,
