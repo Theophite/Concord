@@ -17,6 +17,8 @@ Gated on bf16 (no GradScaler) + accum=1 (Concord steps every backward) + single-
 latent caching + gradient checkpointing. EAGER FALLBACK on any failure -- the validated
 non-graph path is never at risk.
 """
+import os
+
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as _ckpt
@@ -56,9 +58,21 @@ class ManualUNetGraph:
     -- the validated standalone pattern, which does NOT corrupt the self-stepping weights
     (the source of v1's NaN).
 
-    NOT YET WIRED INTO GenericTrainer. The remaining cuts (gated on concord_cuda_graph):
-      - call ManualUNetGraph.step(...) in place of predict()->calculate_loss()->backward()
-      - zero_grad(set_to_none=False) so the aux .grad buffers stay static for replay
+    Wired into GenericTrainer (gated on concord_cuda_graph): step() replaces
+    predict()->calculate_loss()->backward(), and the trainer uses zero_grad(set_to_none=
+    False) so the aux .grad buffers stay static for replay.
+
+    GRADIENT BRIDGE (required for embedding / text-encoder training): the captured region
+    has STATIC inputs, but ehs + text_embeds connect upstream to the text encoder + the
+    trainable embeddings. They require grad, so the captured backward produces their input
+    gradients; _bridge() then does ONE eager torch.autograd.backward into the live TE graph
+    each step, so the text encoder + embeddings receive gradients. Without this the captured
+    backward stops at the detached inputs -> embeddings never train, AND (with a live TE
+    forward, i.e. text_encoder.train_embedding=True) the orphaned TE graph + the checkpointed
+    UNet warmup backward double-free ("backward through the graph a second time"). Restoring
+    requires_grad on the inputs (the standalone's "static, needs grad") + consuming the TE
+    graph via the bridge fixes both.
+
     Loss scope here is plain eps-MSE; min-SNR / loss_weight weighting is a follow-up.
     """
 
@@ -76,21 +90,53 @@ class ManualUNetGraph:
     def _alloc(self, prep, model):
         self.unet = model.unet
         ac = prep["added_cond_kwargs"]
+        # ehs + text_embeds connect upstream to the text encoder + the trainable
+        # embeddings. They REQUIRE GRAD so the captured backward produces an input
+        # gradient we bridge (eager) back into the live TE graph each step -> the text
+        # encoder + embeddings train under the graph. latent_input (frozen VAE, cached)
+        # and timestep/time_ids/target have no upstream trainable parents -> stay detached.
         self.static = {
             "sample": prep["latent_input"].detach().clone(),
             "timestep": prep["timestep"].detach().clone(),
-            "ehs": prep["encoder_hidden_states"].detach().clone(),
-            "text_embeds": ac["text_embeds"].detach().clone(),
+            "ehs": prep["encoder_hidden_states"].detach().clone().requires_grad_(True),
+            "text_embeds": ac["text_embeds"].detach().clone().requires_grad_(True),
             "time_ids": ac["time_ids"].detach().clone(),
             "target": prep["target"].detach().clone(),
         }
 
     def _copy_in(self, prep):
         s, ac = self.static, prep["added_cond_kwargs"]
-        s["sample"].copy_(prep["latent_input"]); s["timestep"].copy_(prep["timestep"])
-        s["ehs"].copy_(prep["encoder_hidden_states"])
-        s["text_embeds"].copy_(ac["text_embeds"]); s["time_ids"].copy_(ac["time_ids"])
-        s["target"].copy_(prep["target"])
+        with torch.no_grad():            # ehs/text_embeds are leaves that require grad
+            s["sample"].copy_(prep["latent_input"]); s["timestep"].copy_(prep["timestep"])
+            s["ehs"].copy_(prep["encoder_hidden_states"])
+            s["text_embeds"].copy_(ac["text_embeds"]); s["time_ids"].copy_(ac["time_ids"])
+            s["target"].copy_(prep["target"])
+
+    def _zero_input_grads(self):
+        # the captured backward ACCUMULATES into static-input .grad; zero before each
+        # capture/replay so it holds exactly this step's input-gradient for the bridge.
+        for k in ("ehs", "text_embeds"):
+            g = self.static[k].grad
+            if g is not None:
+                g.zero_()
+
+    def _bridge(self, prep):
+        # Reconnect the captured (detached) UNet inputs to the eager TE graph: backward
+        # the real text-encoder outputs with the captured input-grads, so the text encoder
+        # + trainable embeddings receive gradients. ONE combined backward -- ehs and
+        # text_embeds share the TE graph, so two separate calls would "backward twice".
+        ac = prep["added_cond_kwargs"]
+        tensors, grads = [], []
+        for real, key in ((prep["encoder_hidden_states"], "ehs"), (ac["text_embeds"], "text_embeds")):
+            g = self.static[key].grad
+            if real.requires_grad and g is not None:
+                tensors.append(real); grads.append(g.to(real.dtype))
+        if tensors:
+            torch.autograd.backward(tensors, grads)
+            if os.environ.get("CONCORD_GRAPH_DEBUG"):
+                gn = sum(float(g.float().norm()) for g in grads)
+                print(f"[concord_graph] bridge: TE backward over {len(tensors)} inputs, "
+                      f"grad-norm sum {gn:.5f}", flush=True)
 
     def _step_fn(self):
         s = self.static
@@ -108,19 +154,30 @@ class ManualUNetGraph:
             self._alloc(prep, model)
         self._copy_in(prep)
         if self.graph is None:
-            strm = torch.cuda.Stream(); strm.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(strm):
-                for _ in range(self.warmup):
-                    self._step_fn()                      # real-gradient warmup (no corruption)
-            torch.cuda.current_stream().wait_stream(strm)
+            if os.environ.get("CONCORD_GRAPH_DEBUG"):
+                # eager warmup (no side stream) under anomaly detection -> precise traceback
+                # of the op whose backward is replayed. Diagnostic only; off by default.
+                with torch.autograd.detect_anomaly():
+                    for i in range(self.warmup):
+                        print(f"[concord_graph] anomaly warmup iter {i}", flush=True)
+                        self._step_fn()
+            else:
+                strm = torch.cuda.Stream(); strm.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(strm):
+                    for _ in range(self.warmup):
+                        self._step_fn()                  # real-gradient warmup (no corruption)
+                torch.cuda.current_stream().wait_stream(strm)
             for p in self.aux:                           # discard warmup-accumulated aux grad
                 if p.grad is not None:
                     p.grad.zero_()
+            self._zero_input_grads()                     # fresh static-input grads for capture
             self.graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graph):
                 self.cap_loss = self._step_fn()
         else:
+            self._zero_input_grads()                     # fresh static-input grads for this replay
             self.graph.replay()
+        self._bridge(prep)                               # eager: TE + embeddings receive grad
         return self.cap_loss
 
 
