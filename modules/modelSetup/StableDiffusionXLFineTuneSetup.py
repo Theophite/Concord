@@ -101,6 +101,12 @@ class StableDiffusionXLFineTuneSetup(
             model.concord_controller = ConcordController(
                 model.unet, self.train_device, config.learning_rate, total_steps=1,
                 optimizer_config=config.optimizer)
+            # RESUME: __load_internal rebuilt a STANDARD UNet, so the saved packed_w buffers were
+            # dropped and the swap above just packed RANDOM weights. Re-load the backup's packed
+            # UNet state into the now-swapped layers to restore the exact Concord state (packed_w
+            # + s_fast/s_slow/v_slow); without this, continue silently resumes from ~random.
+            if config.continue_last_backup:
+                self.__restore_concord_unet(model, config)
         else:
             model.concord_controller = None
 
@@ -127,11 +133,47 @@ class StableDiffusionXLFineTuneSetup(
                 model.concord_graph_v2 = ManualUNetGraph(
                     self, aux, config.train_dtype.torch_dtype(), graph_te=should_graph_te(config))
 
+    def __restore_concord_unet(self, model, config):
+        # The INTERNAL backup dumped the swapped UNet's full state_dict (packed_w + s_fast/
+        # s_slow/v_slow) under <backup>/unet/*.safetensors, but __load_internal rebuilt a
+        # STANDARD UNet (those keys discarded) and the swap then packed random weights. Merge
+        # the backup shards and load them into the now-swapped layers (strict=False: packed_w
+        # matches the buffers; non-swapped weights match too) to restore the exact state.
+        import glob
+        import os
+
+        from safetensors.torch import load_file
+
+        if os.environ.get("CONCORD_NO_RESTORE"):     # A/B switch: simulate the unfixed bug
+            print("[concord] resume: CONCORD_NO_RESTORE set -> NOT restoring (random-swap baseline)")
+            return
+        backup = config.get_last_backup_path()
+        files = sorted(glob.glob(os.path.join(backup, "unet", "*.safetensors"))) if backup else []
+        if not files:
+            print("[concord] resume: no backup UNet state found; continuing from loaded weights")
+            return
+        sd = {}
+        for f in files:
+            sd.update(load_file(f))
+        model.unet.load_state_dict(sd, strict=False)
+        n_packed = sum(1 for k in sd if k.endswith("packed_w"))
+        print(f"[concord] resume: restored UNet Concord state from backup "
+              f"({n_packed} packed layers, {len(sd)} tensors)")
+
     def setup_train_device(
             self,
             model: StableDiffusionXLModel,
             config: TrainConfig,
     ):
+        # RESUME (Concord): __load_internal rebuilt a STANDARD UNet, so the packed layers'
+        # 'weight' keys are missing -> from_pretrained left them as META tensors, and the
+        # move-to-device below crashes ("Cannot copy out of meta tensor"). Materialize the UNet
+        # (garbage) here so the move works; setup_model's __restore_concord_unet then reloads the
+        # real packed state over it (it carries the full state_dict, swapped + non-swapped).
+        if config.continue_last_backup and config.optimizer.optimizer == Optimizer.CONCORD \
+                and any(p.is_meta for p in model.unet.parameters()):
+            model.unet.to_empty(device=self.train_device)
+
         vae_on_train_device = not config.latent_caching
         text_encoder_1_on_train_device = \
             config.text_encoder.train \

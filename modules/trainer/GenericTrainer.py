@@ -448,6 +448,13 @@ class GenericTrainer(BaseTrainer):
             torch.clear_autocast_cache()
             self.model.optimizer.eval()
 
+        # Concord v2: release the captured CUDA graph before the backup. The save moves the model
+        # to CPU and torch_gc()s, invalidating the graph's private pool -> the next replay would
+        # segfault coming back from the backup. Recaptured transparently on the next step.
+        _v2 = getattr(self.model, "concord_graph_v2", None)
+        if _v2 is not None:
+            _v2.release()
+
         try:
             if print_msg:
                 print_cb("Creating Backup " + backup_path)
