@@ -284,6 +284,13 @@ class GenericTrainer(BaseTrainer):
         if self.config.optimizer.optimizer.is_schedule_free:
             torch.clear_autocast_cache()
             self.model.optimizer.eval()
+        # Concord v2: release the captured CUDA graph BEFORE sampling. Sampling's
+        # torch_gc()/empty_cache() disturbs the graph's private memory pool, so the next
+        # replay would read freed memory and crash on "coming back" from a sample. Dropping
+        # it here frees the pool for sampling; the next training step transparently recaptures.
+        _v2 = getattr(self.model, "concord_graph_v2", None)
+        if _v2 is not None:
+            _v2.release()
         torch_gc()
 
         self.callbacks.on_update_status("Sampling ...")

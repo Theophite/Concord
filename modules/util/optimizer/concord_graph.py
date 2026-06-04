@@ -109,6 +109,17 @@ class ManualUNetGraph:
         self.ls1 = self.ls2 = 0         # text-encoder layer skips (from config, set in step)
         _ckpt.checkpoint = _capturable_checkpoint
 
+    def release(self):
+        # Drop the captured graph and free its private memory pool. Call this before any
+        # external empty_cache (e.g. sampling's torch_gc) that would otherwise invalidate the
+        # recorded graph -> "coming back from a sample" replay crash. step() transparently
+        # recaptures on the next training step (static buffers are reused).
+        import gc
+        self.graph = None
+        self.cap_loss = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def _alloc(self, prep, model):
         self.unet = model.unet
         self.model = model
