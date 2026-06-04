@@ -159,38 +159,3 @@ def insert_new_tokens(te, tokenizer, names, init_specs=None, lr=5e-3, device="cu
     nm.init_tokens(init=init)
     te.text_model.embeddings.token_embedding = HybridCLIPEmbedding(base, nm, vocab)
     return nm
-
-
-if __name__ == "__main__":
-    import torch.nn.functional as F
-    dev = "cuda"
-    torch.manual_seed(0)
-    D, K = 64, 4
-    base = torch.randn(4000, D, device=dev)
-    base[:1200] *= 0.15
-    med = ConcordPackedEmbedding.vocab_median_norm(base)
-
-    tgt = torch.randn(K, D, device=dev)
-    tgt = tgt / tgt.norm(dim=1, keepdim=True) * 30.0
-    ids = torch.arange(K, device=dev)
-
-    emb = ConcordPackedEmbedding(K, D, device=dev, lr=5e-2, target_norm=med)
-    emb.init_tokens()
-    p0 = emb.core.packed_w.clone()
-    print(f"[init] deploy norm {emb.deploy_weight().norm(dim=1).mean():.2f} "
-          f"(median target {med:.2f}) | storage int32 packed_w {tuple(emb.core.packed_w.shape)} "
-          f"= {emb.core.packed_w.numel()*4} bytes ({emb.core.packed_w.numel()*32//emb.core.packed_w.numel()} b/param)")
-    l0 = None
-    for it in range(300):
-        loss = F.mse_loss(emb(ids).float(), tgt)
-        loss.backward()
-        if l0 is None:
-            l0 = loss.item()
-    dep = emb.deploy_weight()
-    cos = F.cosine_similarity(dep.float(), tgt, dim=1).mean().item()
-    changed = (emb.core.packed_w != p0).float().mean().item()
-    print(f"[trained] loss {l0:.3f}->{loss.item():.3f} | deploy norm "
-          f"{dep.norm(dim=1).mean():.2f} (pinned {med:.2f}) | cos {cos:.3f} | "
-          f"packed_w words changed {changed:.0%} (cascade ran)")
-    print("-> packed (32 b/param) reuse of packed_b's real cascade; deploy norm "
-          "pinned to the vocab median; learns the concept direction.")
