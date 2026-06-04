@@ -40,6 +40,7 @@ class BaseStableDiffusionXLSetup(
     LAYER_PRESETS = {
         "attn-mlp": ["attentions"],
         "attn-only": ["attn"],
+        "cross-attn": ["attn2"],
         "full": [],
     }
 

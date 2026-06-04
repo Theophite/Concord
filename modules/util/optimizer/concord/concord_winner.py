@@ -106,7 +106,7 @@ def _scalar(v, what):
     return int(v)
 
 
-def swap_unet_to_winner(unet, device, lr, gf_consol=None, verbose=True):
+def swap_unet_to_winner(unet, device, lr, gf_consol=None, verbose=True, module_filters=None):
     """Swap every nn.Linear / nn.Conv2d in `unet` (in place) to
     Concord{Linear,Conv2d}PackedB with the validated recipe + dissipation, load
     the pretrained weights, and engage the global winner flags (ratio_coh,
@@ -117,10 +117,21 @@ def swap_unet_to_winner(unet, device, lr, gf_consol=None, verbose=True):
     """
     if gf_consol is None:
         gf_consol = WINNER["gf_consol"]
-    layers, n_lin, n_conv = [], 0, 0
+    layers, n_lin, n_conv, n_skipped = [], 0, 0, 0
+    # Honor OneTrainer's layer_filter (the GUI "Layer Filter" dropdown): only layers the
+    # filter SELECTS get swapped to Concord; unmatched layers stay standard nn.Linear/Conv2d
+    # and are frozen by the normal param-setup path (no packed state, no grads). An empty
+    # filter (preset "full") matches everything -> swap all (the original behaviour). Filter
+    # patterns are path-based, so map each module to its full UNet-relative name.
+    name_of = {id(m): n for n, m in unet.named_modules()} if module_filters else {}
     for parent in list(unet.modules()):
         for name, child in list(parent.named_children()):
             c, W2d = None, None
+            if module_filters and isinstance(child, (nn.Linear, nn.Conv2d)):
+                full = name_of.get(id(child), name)
+                if not any(f.matches(full) for f in module_filters):
+                    n_skipped += 1
+                    continue   # not selected by layer_filter -> leave standard/frozen
             if isinstance(child, nn.Linear):
                 c = ConcordLinearPackedB(
                     child.in_features, child.out_features,
@@ -160,8 +171,9 @@ def swap_unet_to_winner(unet, device, lr, gf_consol=None, verbose=True):
     set_ratio_coh(True)                        # dissipation: live ratio-coh gate
     set_sigmag_noise(True, isotropic=WINNER["sigmag_iso"])  # fluctuation
     if verbose:
+        extra = f"; left {n_skipped} layers standard/frozen (layer_filter)" if n_skipped else ""
         print(f"[winner] swapped {n_lin} Linear + {n_conv} Conv2d -> Concord "
-              f"(gf_consol={gf_consol}, ratio_coh ON, isotropic noise ON)")
+              f"(gf_consol={gf_consol}, ratio_coh ON, isotropic noise ON){extra}")
     return layers
 
 

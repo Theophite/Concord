@@ -90,12 +90,17 @@ class ConcordController:
     for one training run. Created in the SDXL setup (after the model is loaded, before the
     optimizer is built); driven by the trainer via before_step()/after_step()."""
 
-    def __init__(self, unet, device, learning_rate: float, total_steps: int, optimizer_config=None):
+    def __init__(self, unet, device, learning_rate: float, total_steps: int, optimizer_config=None,
+                 module_filters=None):
         from concord_winner import swap_unet_to_winner, GatedRebalance
         self.config = make_concord_config(learning_rate, optimizer_config)
         self.total_steps = max(1, int(total_steps))
+        # module_filters: OneTrainer's layer_filter (ModuleFilter list). When set to a non-"full"
+        # preset (e.g. attn-mlp -> ["attentions"]) only the selected layers are swapped to
+        # Concord; the rest stay standard bf16 and are frozen, dropping their packed state.
         self.layers = swap_unet_to_winner(
-            unet, device, self.config.lr, gf_consol=self.config.gf_consol, verbose=False)
+            unet, device, self.config.lr, gf_consol=self.config.gf_consol, verbose=False,
+            module_filters=module_filters)
         self.gate = GatedRebalance(self.layers)
         self.step_idx = 0
         print(f"[concord] swapped {len(self.layers)} UNet layers | lr={self.config.lr} "
