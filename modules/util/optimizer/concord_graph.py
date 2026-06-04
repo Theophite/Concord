@@ -49,6 +49,81 @@ def should_graph(config) -> bool:
             and config.gradient_checkpointing.enabled())
 
 
+class ManualUNetGraph:
+    """Stage 3 v2: manual CUDA-graph capture of UNet -> loss -> backward, fed by
+    predict(return_unet_inputs=True). Unlike make_graphed_callables (v1), the captured
+    region contains the REAL loss.backward(), so the warmup self-steps on REAL gradients
+    -- the validated standalone pattern, which does NOT corrupt the self-stepping weights
+    (the source of v1's NaN).
+
+    NOT YET WIRED INTO GenericTrainer. The remaining cuts (gated on concord_cuda_graph):
+      - call ManualUNetGraph.step(...) in place of predict()->calculate_loss()->backward()
+      - zero_grad(set_to_none=False) so the aux .grad buffers stay static for replay
+    Loss scope here is plain eps-MSE; min-SNR / loss_weight weighting is a follow-up.
+    """
+
+    def __init__(self, model_setup, aux_params, dtype, warmup: int = 3):
+        self.ms = model_setup
+        self.aux = list(aux_params)
+        self.dtype = dtype
+        self.warmup = warmup
+        self.static = None
+        self.graph = None
+        self.cap_loss = None
+        self.unet = None
+        _ckpt.checkpoint = _capturable_checkpoint
+
+    def _alloc(self, prep, model):
+        self.unet = model.unet
+        ac = prep["added_cond_kwargs"]
+        self.static = {
+            "sample": prep["latent_input"].detach().clone(),
+            "timestep": prep["timestep"].detach().clone(),
+            "ehs": prep["encoder_hidden_states"].detach().clone(),
+            "text_embeds": ac["text_embeds"].detach().clone(),
+            "time_ids": ac["time_ids"].detach().clone(),
+            "target": prep["target"].detach().clone(),
+        }
+
+    def _copy_in(self, prep):
+        s, ac = self.static, prep["added_cond_kwargs"]
+        s["sample"].copy_(prep["latent_input"]); s["timestep"].copy_(prep["timestep"])
+        s["ehs"].copy_(prep["encoder_hidden_states"])
+        s["text_embeds"].copy_(ac["text_embeds"]); s["time_ids"].copy_(ac["time_ids"])
+        s["target"].copy_(prep["target"])
+
+    def _step_fn(self):
+        s = self.static
+        with torch.autocast(device_type="cuda", dtype=self.dtype, cache_enabled=False):
+            pred = self.unet(s["sample"], s["timestep"], encoder_hidden_states=s["ehs"],
+                             added_cond_kwargs={"text_embeds": s["text_embeds"],
+                                                "time_ids": s["time_ids"]}).sample
+        loss = torch.nn.functional.mse_loss(pred.float(), s["target"].float())
+        loss.backward()
+        return loss
+
+    def step(self, model, batch, config, train_progress):
+        prep = self.ms.predict(model, batch, config, train_progress, return_unet_inputs=True)
+        if self.static is None:
+            self._alloc(prep, model)
+        self._copy_in(prep)
+        if self.graph is None:
+            strm = torch.cuda.Stream(); strm.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(strm):
+                for _ in range(self.warmup):
+                    self._step_fn()                      # real-gradient warmup (no corruption)
+            torch.cuda.current_stream().wait_stream(strm)
+            for p in self.aux:                           # discard warmup-accumulated aux grad
+                if p.grad is not None:
+                    p.grad.zero_()
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):
+                self.cap_loss = self._step_fn()
+        else:
+            self.graph.replay()
+        return self.cap_loss
+
+
 class _UNetPositional(nn.Module):
     """make_graphed_callables wants positional tensor args + needs the UNet's params in its
     own module tree (to capture their backward). Holds unet as a submodule for the params,
