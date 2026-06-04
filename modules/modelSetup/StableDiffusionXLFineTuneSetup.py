@@ -116,13 +116,16 @@ class StableDiffusionXLFineTuneSetup(
         self.__setup_requires_grad(model, config)
         init_model_parameters(model, params, self.train_device)
 
-        # Stage 3: capture the UNet fwd+bwd in a CUDA graph when the gate allows (eager
-        # fallback inside). After the optimizer is built so requires_grad is final.
+        # Stage 3 v2: build the manual UNet fwd+bwd graph manager when the gate allows
+        # (concord_cuda_graph). The trainer routes the step through it on the gated path;
+        # the default path is untouched. After the optimizer so requires_grad is final.
+        model.concord_graph_v2 = None
         if config.optimizer.optimizer == Optimizer.CONCORD:
-            from modules.util.optimizer.concord_graph import should_graph, install_graphed_unet
+            from modules.util.optimizer.concord_graph import should_graph, ManualUNetGraph
             if should_graph(config):
-                install_graphed_unet(model, config, self.train_device,
-                                     config.train_dtype.torch_dtype())
+                aux = [p for p in model.unet.parameters() if p.requires_grad]
+                model.concord_graph_v2 = ManualUNetGraph(
+                    self, aux, config.train_dtype.torch_dtype())
 
     def setup_train_device(
             self,

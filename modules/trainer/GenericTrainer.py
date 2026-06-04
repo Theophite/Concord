@@ -742,30 +742,36 @@ class GenericTrainer(BaseTrainer):
                     # schedule onto the layer device tensors the fused backward reads)
                     self.model_setup.before_step(self.model, self.config, train_progress)
 
-                    prior_pred_indices = [i for i in range(self.config.batch_size)
-                                          if ConceptType(batch['concept_type'][i]) == ConceptType.PRIOR_PREDICTION]
-                    if len(prior_pred_indices) > 0 \
-                            or (self.config.masked_training
-                                and self.config.masked_prior_preservation_weight > 0
-                                and self.config.training_method == TrainingMethod.LORA):
-                        with self.model_setup.prior_model(self.model, self.config), torch.no_grad():
-                            #do NOT create a subbatch using the indices, even though it would be more efficient:
-                            #different timesteps are used for a smaller subbatch by predict(), but the conditioning must match exactly:
-                            prior_model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
-                        model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
-                        prior_model_prediction = prior_model_output_data['predicted'].to(dtype=model_output_data['target'].dtype)
-                        model_output_data['target'][prior_pred_indices] = prior_model_prediction[prior_pred_indices]
-                        model_output_data['prior_target'] = prior_model_prediction
+                    _v2 = getattr(self.model, "concord_graph_v2", None)
+                    if _v2 is not None:
+                        # Stage 3 v2: the manual graph does predict-prep (eager) + a captured
+                        # UNet -> loss -> backward replay; loss.backward() happens inside.
+                        loss = _v2.step(self.model, batch, self.config, train_progress)
                     else:
-                        model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                        prior_pred_indices = [i for i in range(self.config.batch_size)
+                                              if ConceptType(batch['concept_type'][i]) == ConceptType.PRIOR_PREDICTION]
+                        if len(prior_pred_indices) > 0 \
+                                or (self.config.masked_training
+                                    and self.config.masked_prior_preservation_weight > 0
+                                    and self.config.training_method == TrainingMethod.LORA):
+                            with self.model_setup.prior_model(self.model, self.config), torch.no_grad():
+                                #do NOT create a subbatch using the indices, even though it would be more efficient:
+                                #different timesteps are used for a smaller subbatch by predict(), but the conditioning must match exactly:
+                                prior_model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                            model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                            prior_model_prediction = prior_model_output_data['predicted'].to(dtype=model_output_data['target'].dtype)
+                            model_output_data['target'][prior_pred_indices] = prior_model_prediction[prior_pred_indices]
+                            model_output_data['prior_target'] = prior_model_prediction
+                        else:
+                            model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
 
-                    loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
+                        loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
 
-                    loss = loss / self.config.gradient_accumulation_steps
-                    if scaler:
-                        scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
+                        loss = loss / self.config.gradient_accumulation_steps
+                        if scaler:
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
 
                     has_gradient = True
                     detached_loss = loss.detach()
@@ -793,7 +799,10 @@ class GenericTrainer(BaseTrainer):
                             self.model.optimizer.step()
 
                         lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
-                        self.model.optimizer.zero_grad(set_to_none=True)
+                        # Stage 3 v2: keep aux .grad buffers static (zero in place) so the
+                        # captured backward writes to the same memory each replay.
+                        self.model.optimizer.zero_grad(
+                            set_to_none=getattr(self.model, "concord_graph_v2", None) is None)
                         has_gradient = False
 
                         if multi.is_master():
