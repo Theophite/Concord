@@ -397,6 +397,7 @@ class TrainConfig(BaseConfig):
     # data settings
     concept_file_name: str
     concord_sanitize_tokens: str          # comma-separated single-token words to zero (sanitize)
+    concord_cuda_graph: bool              # EXPERIMENTAL opt-in: graph the UNet step (default off)
     concepts: list[ConceptConfig]
     aspect_ratio_bucketing: bool
     latent_caching: bool
@@ -993,6 +994,7 @@ class TrainConfig(BaseConfig):
         # data settings
         data.append(("concept_file_name", "training_concepts/concepts.json", str, False))
         data.append(("concord_sanitize_tokens", "", str, False))
+        data.append(("concord_cuda_graph", False, bool, False))
         data.append(("concepts", None, list[ConceptConfig], True))
         data.append(("aspect_ratio_bucketing", True, bool, False))
         data.append(("latent_caching", True, bool, False))
