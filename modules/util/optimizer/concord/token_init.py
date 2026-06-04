@@ -60,5 +60,10 @@ def additional_embeddings_from_list(entries=None):
         cfg.initial_embedding_text = init_string(e)
         cfg.token_count = 1
         cfg.train = True
+        # NEW embedding -> NO base file to load: model_name MUST stay empty. OneTrainer's
+        # train-start gate validates a non-empty model_name as an existing base-embedding
+        # path and refuses to start ("model_name: Input path does not exist"); empty means
+        # "create a new embedding" (seeded from initial_embedding_text). Explicit for clarity.
+        cfg.model_name = ""
         embeddings.append(cfg)
     return embeddings
