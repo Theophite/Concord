@@ -3,9 +3,13 @@
 Run with the OneTrainer venv's Python. Paths are derived from the repo (no absolute
 paths); the only external dependency is an SDXL checkpoint, via env vars:
 
-- `CONCORD_TEST_MODEL` — path to an SDXL `.safetensors` checkpoint (required for the
-  regression run).
-- `CONCORD_TEST_WORKDIR` — scratch dir for the synthetic dataset / config / output
+- `CONCORD_TEST_MODEL` — **input** SDXL `.safetensors` checkpoint (required for the run).
+- `CONCORD_TEST_OUTPUT` — **output** model path (optional; defaults to `<workdir>/output/concord_val.safetensors`).
+- `CONCORD_TEST_DATASET` — **concept**: your own image directory (optional; otherwise a
+  tiny synthetic dataset is generated).
+- `CONCORD_TEST_PROMPT_SOURCE` — caption source for the concept: `filename` (default),
+  `sample`, or `concept`.
+- `CONCORD_TEST_WORKDIR` — scratch dir for the generated config / dataset / cache
   (optional; defaults to a temp dir).
 
 ### `test_stage3_assertions.py` — no model needed

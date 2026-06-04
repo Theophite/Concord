@@ -24,7 +24,7 @@ VENV = sys.executable                                            # the venv runn
 WORK = Path(os.environ.get("CONCORD_TEST_WORKDIR",
                            str(Path(tempfile.gettempdir()) / "concord_ot_test")))
 CONFIG = str(WORK / "config.json")
-CKPT = str(WORK / "output" / "concord_val.safetensors")
+CKPT = os.environ.get("CONCORD_TEST_OUTPUT", str(WORK / "output" / "concord_val.safetensors"))
 LOG = str(WORK / "regression.log")
 
 results = []

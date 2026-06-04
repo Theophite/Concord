@@ -15,20 +15,26 @@ sys.path.insert(0, OT)
 
 VAL = Path(os.environ.get("CONCORD_TEST_WORKDIR",
                           str(Path(tempfile.gettempdir()) / "concord_ot_test")))
-DS = VAL / "dataset"
-for d in (DS, VAL / "workspace", VAL / "cache", VAL / "output"):
+for d in (VAL / "workspace", VAL / "cache", VAL / "output"):
     d.mkdir(parents=True, exist_ok=True)
 
-# 1. dataset: synthetic 512x512 images, filename == caption (prompt_source='filename')
-captions = ["a photo of a red square", "a photo of a blue circle", "a photo of a green field",
-            "a photo of a corgi", "a photo of a mountain", "a photo of a sunset",
-            "a photo of a cat", "a photo of a wooden house"]
-rng = np.random.RandomState(0)
-for i, cap in enumerate(captions):
-    base = np.array([(i * 31) % 256, (i * 61) % 256, (i * 91) % 256], dtype=np.float32)
-    arr = (rng.rand(512, 512, 3) * 70 + base * 0.7).clip(0, 255).astype("uint8")
-    Image.fromarray(arr).save(DS / f"{cap}.png")
-print(f"[dataset] {len(captions)} images -> {DS}")
+# 1. CONCEPT (dataset): point CONCORD_TEST_DATASET at your own image directory; otherwise a
+#    tiny synthetic one is generated (filenames are the captions, prompt_source='filename').
+_user_ds = os.environ.get("CONCORD_TEST_DATASET")
+DS = Path(_user_ds) if _user_ds else VAL / "dataset"
+if _user_ds:
+    print(f"[concept] using your dataset -> {DS}")
+else:
+    DS.mkdir(parents=True, exist_ok=True)
+    captions = ["a photo of a red square", "a photo of a blue circle", "a photo of a green field",
+                "a photo of a corgi", "a photo of a mountain", "a photo of a sunset",
+                "a photo of a cat", "a photo of a wooden house"]
+    rng = np.random.RandomState(0)
+    for i, cap in enumerate(captions):
+        base = np.array([(i * 31) % 256, (i * 61) % 256, (i * 91) % 256], dtype=np.float32)
+        arr = (rng.rand(512, 512, 3) * 70 + base * 0.7).clip(0, 255).astype("uint8")
+        Image.fromarray(arr).save(DS / f"{cap}.png")
+    print(f"[concept] synthesized {len(captions)} images -> {DS}")
 
 # 2. concepts.json (a list of concept dicts)
 from modules.util.config.ConceptConfig import ConceptConfig
@@ -36,7 +42,7 @@ cc = ConceptConfig.default_values()
 cc.name = "val"
 cc.path = str(DS)
 cc.enabled = True
-cc.text.prompt_source = "filename"
+cc.text.prompt_source = os.environ.get("CONCORD_TEST_PROMPT_SOURCE", "filename")  # filename|sample|concept
 concepts_path = VAL / "concepts.json"
 concepts_path.write_text(json.dumps([cc.to_dict()], indent=1, default=str))
 print(f"[concepts] -> {concepts_path}")
@@ -50,7 +56,10 @@ from modules.util.enum.DataType import DataType
 from modules.util.enum.GradientCheckpointingMethod import GradientCheckpointingMethod
 c = TrainConfig.default_values()
 c.model_type = ModelType.STABLE_DIFFUSION_XL_10_BASE
-c.base_model_name = os.environ["CONCORD_TEST_MODEL"]   # path to an SDXL .safetensors checkpoint
+_model = os.environ.get("CONCORD_TEST_MODEL")          # INPUT model
+if not _model:
+    raise SystemExit("Set CONCORD_TEST_MODEL to an SDXL .safetensors checkpoint (the input model).")
+c.base_model_name = _model
 c.training_method = TrainingMethod.FINE_TUNE
 c.optimizer.optimizer = Optimizer.CONCORD
 c.learning_rate = 1e-5
@@ -63,7 +72,8 @@ c.train_dtype = DataType.BFLOAT_16
 c.concept_file_name = str(concepts_path)
 c.workspace_dir = str(VAL / "workspace")
 c.cache_dir = str(VAL / "cache")
-c.output_model_destination = str(VAL / "output" / "concord_val.safetensors")
+c.output_model_destination = os.environ.get(           # OUTPUT model
+    "CONCORD_TEST_OUTPUT", str(VAL / "output" / "concord_val.safetensors"))
 c.unet.train = True
 c.text_encoder.train = False
 c.text_encoder_2.train = False
