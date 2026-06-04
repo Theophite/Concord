@@ -51,6 +51,25 @@ def should_graph(config) -> bool:
             and config.gradient_checkpointing.enabled())
 
 
+def should_graph_te(config) -> bool:
+    # Extends should_graph: capture the text encoder too (encode_text INSIDE the graph), so
+    # the embeddings train in the captured backward and the eager bridge is dropped -> recovers
+    # the full UNet-graph speedup for embedding training. Requires a LIVE TE forward (otherwise
+    # there's nothing to gain) and a capture-legal TE path: NO TE dropout (host RNG) and NO
+    # output embeddings (_apply_output_embeddings uses a data-dependent .nonzero()).
+    if not should_graph(config):
+        return False
+    if not (config.train_text_encoder_or_embedding() or config.train_text_encoder_2_or_embedding()):
+        return False
+    if (config.text_encoder.dropout_probability or 0.0) > 0.0 \
+            or (config.text_encoder_2.dropout_probability or 0.0) > 0.0:
+        return False
+    if config.embedding.is_output_embedding \
+            or any(e.is_output_embedding for e in config.additional_embeddings):
+        return False
+    return True
+
+
 class ManualUNetGraph:
     """Stage 3 v2: manual CUDA-graph capture of UNet -> loss -> backward, fed by
     predict(return_unet_inputs=True). Unlike make_graphed_callables (v1), the captured
@@ -76,19 +95,35 @@ class ManualUNetGraph:
     Loss scope here is plain eps-MSE; min-SNR / loss_weight weighting is a follow-up.
     """
 
-    def __init__(self, model_setup, aux_params, dtype, warmup: int = 3):
+    def __init__(self, model_setup, aux_params, dtype, warmup: int = 3, graph_te: bool = False):
         self.ms = model_setup
         self.aux = list(aux_params)
         self.dtype = dtype
         self.warmup = warmup
+        self.graph_te = graph_te        # True: capture encode_text->UNet (TE in the graph, no bridge)
         self.static = None
         self.graph = None
         self.cap_loss = None
         self.unet = None
+        self.model = None               # set in _alloc; needed for encode_text in TE-graph mode
+        self.ls1 = self.ls2 = 0         # text-encoder layer skips (from config, set in step)
         _ckpt.checkpoint = _capturable_checkpoint
 
     def _alloc(self, prep, model):
         self.unet = model.unet
+        self.model = model
+        if self.graph_te:
+            # TE captured from raw tokens: token IDs are detached int buffers (the trainable
+            # embeddings they index require grad INSIDE the capture, so no bridge is needed).
+            self.static = {
+                "tokens_1": prep["tokens_1"].clone(),
+                "tokens_2": prep["tokens_2"].clone(),
+                "sample": prep["latent_input"].detach().clone(),
+                "timestep": prep["timestep"].detach().clone(),
+                "time_ids": prep["time_ids"].detach().clone(),
+                "target": prep["target"].detach().clone(),
+            }
+            return
         ac = prep["added_cond_kwargs"]
         # ehs + text_embeds connect upstream to the text encoder + the trainable
         # embeddings. They REQUIRE GRAD so the captured backward produces an input
@@ -105,8 +140,14 @@ class ManualUNetGraph:
         }
 
     def _copy_in(self, prep):
-        s, ac = self.static, prep["added_cond_kwargs"]
-        with torch.no_grad():            # ehs/text_embeds are leaves that require grad
+        s = self.static
+        with torch.no_grad():            # ehs/text_embeds (bridge mode) are leaves that require grad
+            if self.graph_te:
+                s["tokens_1"].copy_(prep["tokens_1"]); s["tokens_2"].copy_(prep["tokens_2"])
+                s["sample"].copy_(prep["latent_input"]); s["timestep"].copy_(prep["timestep"])
+                s["time_ids"].copy_(prep["time_ids"]); s["target"].copy_(prep["target"])
+                return
+            ac = prep["added_cond_kwargs"]
             s["sample"].copy_(prep["latent_input"]); s["timestep"].copy_(prep["timestep"])
             s["ehs"].copy_(prep["encoder_hidden_states"])
             s["text_embeds"].copy_(ac["text_embeds"]); s["time_ids"].copy_(ac["time_ids"])
@@ -141,15 +182,35 @@ class ManualUNetGraph:
     def _step_fn(self):
         s = self.static
         with torch.autocast(device_type="cuda", dtype=self.dtype, cache_enabled=False):
-            pred = self.unet(s["sample"], s["timestep"], encoder_hidden_states=s["ehs"],
-                             added_cond_kwargs={"text_embeds": s["text_embeds"],
+            if self.graph_te:
+                # text encoder INSIDE the graph: backward reaches the embeddings here.
+                # dropout off (None) + tokens provided -> capture-legal (gated by should_graph_te).
+                te1, te2, pooled = self.model.encode_text(
+                    train_device=self.ms.train_device, batch_size=s["tokens_1"].shape[0], rand=None,
+                    tokens_1=s["tokens_1"], tokens_2=s["tokens_2"],
+                    text_encoder_1_layer_skip=self.ls1, text_encoder_2_layer_skip=self.ls2,
+                    text_encoder_1_output=None, text_encoder_2_output=None,
+                    pooled_text_encoder_2_output=None,
+                    text_encoder_1_dropout_probability=None, text_encoder_2_dropout_probability=None,
+                )
+                ehs, text_embeds = self.model.combine_text_encoder_output(te1, te2, pooled)
+                ehs = ehs.to(self.dtype); text_embeds = text_embeds.to(self.dtype)
+            else:
+                ehs, text_embeds = s["ehs"], s["text_embeds"]
+            pred = self.unet(s["sample"], s["timestep"], encoder_hidden_states=ehs,
+                             added_cond_kwargs={"text_embeds": text_embeds,
                                                 "time_ids": s["time_ids"]}).sample
         loss = torch.nn.functional.mse_loss(pred.float(), s["target"].float())
         loss.backward()
         return loss
 
     def step(self, model, batch, config, train_progress):
-        prep = self.ms.predict(model, batch, config, train_progress, return_unet_inputs=True)
+        if self.graph_te:
+            self.ls1 = config.text_encoder_layer_skip
+            self.ls2 = config.text_encoder_2_layer_skip
+            prep = self.ms.predict(model, batch, config, train_progress, return_raw_inputs=True)
+        else:
+            prep = self.ms.predict(model, batch, config, train_progress, return_unet_inputs=True)
         if self.static is None:
             self._alloc(prep, model)
         self._copy_in(prep)
@@ -167,18 +228,41 @@ class ManualUNetGraph:
                     for _ in range(self.warmup):
                         self._step_fn()                  # real-gradient warmup (no corruption)
                 torch.cuda.current_stream().wait_stream(strm)
-            for p in self.aux:                           # discard warmup-accumulated aux grad
-                if p.grad is not None:
-                    p.grad.zero_()
-            self._zero_input_grads()                     # fresh static-input grads for capture
+            self._zero_warmup_grads(model)               # discard warmup-accumulated grads
+            if not self.graph_te:
+                self._zero_input_grads()                 # fresh static-input grads for capture
             self.graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graph):
                 self.cap_loss = self._step_fn()
         else:
-            self._zero_input_grads()                     # fresh static-input grads for this replay
+            if not self.graph_te:
+                self._zero_input_grads()                 # fresh static-input grads for this replay
             self.graph.replay()
-        self._bridge(prep)                               # eager: TE + embeddings receive grad
+        if not self.graph_te:
+            self._bridge(prep)                           # eager: TE + embeddings receive grad (bridge mode)
+        elif os.environ.get("CONCORD_GRAPH_DEBUG"):
+            opt = getattr(model, "optimizer", None)
+            if opt is not None:
+                aux_ids = {id(p) for p in self.aux}
+                gn = sum(float(p.grad.float().norm()) for g in opt.param_groups for p in g["params"]
+                         if id(p) not in aux_ids and p.grad is not None)
+                print(f"[concord_graph] TE-graph: embedding/TE grad-norm sum {gn:.5f}", flush=True)
         return self.cap_loss
+
+    def _zero_warmup_grads(self, model):
+        # Discard grads accumulated during warmup so the captured backward writes exactly this
+        # step's grad. graph_te: the captured backward writes UNet-aux AND embedding grads, so
+        # zero the full optimizer param set; bridge mode: only UNet aux (the embeddings get grad
+        # from the eager bridge, which runs after).
+        if self.graph_te and getattr(model, "optimizer", None) is not None:
+            for group in model.optimizer.param_groups:
+                for p in group["params"]:
+                    if p.grad is not None:
+                        p.grad.zero_()
+        else:
+            for p in self.aux:
+                if p.grad is not None:
+                    p.grad.zero_()
 
 
 class _UNetPositional(nn.Module):

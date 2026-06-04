@@ -194,6 +194,7 @@ class BaseStableDiffusionXLSetup(
             *,
             deterministic: bool = False,
             return_unet_inputs: bool = False,
+            return_raw_inputs: bool = False,
     ) -> dict:
         with model.autocast_context:
             batch_seed = 0 if deterministic else train_progress.global_step * multi.world_size() + multi.rank()
@@ -203,23 +204,27 @@ class BaseStableDiffusionXLSetup(
 
             vae_scaling_factor = model.vae.config['scaling_factor']
 
-            text_encoder_output, pooled_text_encoder_2_output = model.combine_text_encoder_output(*model.encode_text(
-                train_device=self.train_device,
-                batch_size=batch['latent_image'].shape[0],
-                rand=rand,
-                tokens_1=batch['tokens_1'],
-                tokens_2=batch['tokens_2'],
-                text_encoder_1_layer_skip=config.text_encoder_layer_skip,
-                text_encoder_2_layer_skip=config.text_encoder_2_layer_skip,
-                text_encoder_1_output=batch[
-                    'text_encoder_1_hidden_state'] if not config.train_text_encoder_or_embedding() else None,
-                text_encoder_2_output=batch[
-                    'text_encoder_2_hidden_state'] if not config.train_text_encoder_2_or_embedding() else None,
-                pooled_text_encoder_2_output=batch[
-                    'text_encoder_2_pooled_state'] if not config.train_text_encoder_2_or_embedding() else None,
-                text_encoder_1_dropout_probability=config.text_encoder.dropout_probability if not deterministic else None,
-                text_encoder_2_dropout_probability=config.text_encoder_2.dropout_probability if not deterministic else None,
-            ))
+            # Stage 3 v2 TE-graph (return_raw_inputs): the text encoder is captured INSIDE
+            # the CUDA graph from the raw tokens, so skip the eager TE forward here.
+            text_encoder_output = pooled_text_encoder_2_output = None
+            if not return_raw_inputs:
+                text_encoder_output, pooled_text_encoder_2_output = model.combine_text_encoder_output(*model.encode_text(
+                    train_device=self.train_device,
+                    batch_size=batch['latent_image'].shape[0],
+                    rand=rand,
+                    tokens_1=batch['tokens_1'],
+                    tokens_2=batch['tokens_2'],
+                    text_encoder_1_layer_skip=config.text_encoder_layer_skip,
+                    text_encoder_2_layer_skip=config.text_encoder_2_layer_skip,
+                    text_encoder_1_output=batch[
+                        'text_encoder_1_hidden_state'] if not config.train_text_encoder_or_embedding() else None,
+                    text_encoder_2_output=batch[
+                        'text_encoder_2_hidden_state'] if not config.train_text_encoder_2_or_embedding() else None,
+                    pooled_text_encoder_2_output=batch[
+                        'text_encoder_2_pooled_state'] if not config.train_text_encoder_2_or_embedding() else None,
+                    text_encoder_1_dropout_probability=config.text_encoder.dropout_probability if not deterministic else None,
+                    text_encoder_2_dropout_probability=config.text_encoder_2.dropout_probability if not deterministic else None,
+                ))
 
             latent_image = batch['latent_image']
             scaled_latent_image = latent_image * vae_scaling_factor
@@ -279,6 +284,24 @@ class BaseStableDiffusionXLSetup(
                 )
             else:
                 latent_input = scaled_noisy_latent_image
+
+            # Stage 3 v2 TE-graph: hand back RAW tokens + the diffusion inputs/target, so the
+            # caller captures encode_text->UNet->loss->backward in ONE graph (the backward
+            # reaches the embeddings inside the capture -> no eager bridge needed).
+            if return_raw_inputs:
+                if model.noise_scheduler.config.prediction_type == 'v_prediction':
+                    target = model.noise_scheduler.get_velocity(scaled_latent_image, latent_noise, timestep)
+                else:
+                    target = latent_noise
+                return {
+                    'tokens_1': batch['tokens_1'],
+                    'tokens_2': batch['tokens_2'],
+                    'latent_input': latent_input.to(dtype=model.train_dtype.torch_dtype()),
+                    'timestep': timestep,
+                    'time_ids': add_time_ids,
+                    'target': target,
+                    'loss_type': 'target',
+                }
 
             added_cond_kwargs = {"text_embeds": pooled_text_encoder_2_output, "time_ids": add_time_ids}
 

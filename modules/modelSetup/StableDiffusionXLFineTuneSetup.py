@@ -121,11 +121,11 @@ class StableDiffusionXLFineTuneSetup(
         # the default path is untouched. After the optimizer so requires_grad is final.
         model.concord_graph_v2 = None
         if config.optimizer.optimizer == Optimizer.CONCORD:
-            from modules.util.optimizer.concord_graph import should_graph, ManualUNetGraph
+            from modules.util.optimizer.concord_graph import should_graph, should_graph_te, ManualUNetGraph
             if should_graph(config):
                 aux = [p for p in model.unet.parameters() if p.requires_grad]
                 model.concord_graph_v2 = ManualUNetGraph(
-                    self, aux, config.train_dtype.torch_dtype())
+                    self, aux, config.train_dtype.torch_dtype(), graph_te=should_graph_te(config))
 
     def setup_train_device(
             self,
