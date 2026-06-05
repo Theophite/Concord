@@ -348,6 +348,25 @@ class GenericTrainer(BaseTrainer):
 
         torch_gc()
 
+        # Concord v2 checkpoint-restart (Windows): the post-sample graph recapture wedges because
+        # sampling fragments the VRAM heap irreversibly -- empty_cache/reset/defrag cannot reclaim
+        # the fragmented-but-not-live reserved memory, so within a few samples the recapture's
+        # warmup thrashes at the 24GB ceiling. The recapture itself is sound (proven: 6 forced
+        # recaptures with NO sampling never hung). Fix: checkpoint here and exit(42); the
+        # scripts/concord_train_restart.py wrapper relaunches a FRESH process (clean allocator)
+        # that resumes from this backup and recaptures cleanly. Opt-in via CONCORD_RESTART_ON_SAMPLE
+        # (the wrapper sets it); plain `python train.py` runs are unaffected.
+        _v2 = getattr(self.model, "concord_graph_v2", None)
+        if _v2 is not None and os.environ.get("CONCORD_RESTART_ON_SAMPLE"):
+            import sys
+            print("[concord-restart] sample done -> checkpoint + exit(42) for fresh-process relaunch",
+                  flush=True)
+            self.__backup(train_progress, True, print)
+            self.__prune_backups(1)   # resume only ever needs the latest -> keep exactly one, no pile-up
+            sys.stdout.flush()
+            sys.stderr.flush()
+            sys.exit(42)
+
     def __validate(self, train_progress: TrainProgress):
         if self.__needs_validate(train_progress):
             self.validation_data_loader.get_data_set().start_next_epoch()
@@ -708,7 +727,14 @@ class GenericTrainer(BaseTrainer):
                 if self.commands.get_stop_command():
                     multi.warn_parameter_divergence(self.parameters, train_device)
 
-                if not self.commands.get_stop_command() and self.__needs_sample(train_progress) or self.commands.get_and_reset_sample_default_command():
+                if os.environ.pop("CONCORD_RESUMING", None):
+                    # Resumed right after a Concord sample-triggered checkpoint-restart: the sample at
+                    # THIS restored step already ran in the prior process. Skip it once (one-shot via
+                    # env pop) -- otherwise we'd re-sample, re-checkpoint and exit again at the same
+                    # step forever, since the "already sampled" state doesn't survive a restart. The
+                    # training step at this step still runs (only the duplicate sample is skipped).
+                    print("[concord-restart] resumed -> skipping the already-done sample at this step", flush=True)
+                elif (not self.commands.get_stop_command() and self.__needs_sample(train_progress)) or self.commands.get_and_reset_sample_default_command():
                     self.__enqueue_sample_during_training(
                         lambda: self.__sample_during_training(train_progress, train_device)
                     )

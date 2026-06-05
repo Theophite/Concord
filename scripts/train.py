@@ -21,6 +21,15 @@ def main():
     with open(args.config_path, "r") as f:
         train_config.from_dict(json.load(f))
 
+    # Concord v2 checkpoint-restart: when scripts/concord_train_restart.py relaunches us after a
+    # sample-triggered exit(42), it sets CONCORD_RESUMING so this fresh process resumes from the
+    # backup the previous process just wrote -- a clean allocator, so the graph recaptures without
+    # the Windows sampling-fragmentation wedge.
+    import os
+    if os.environ.get("CONCORD_RESUMING"):
+        train_config.continue_last_backup = True
+        print("[concord-restart] CONCORD_RESUMING set -> resuming from last backup", flush=True)
+
     try:
         with open("secrets.json" if args.secrets_path is None else args.secrets_path, "r") as f:
             secrets_dict=json.load(f)
