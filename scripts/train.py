@@ -28,7 +28,12 @@ def main():
     import os
     if os.environ.get("CONCORD_RESUMING"):
         train_config.continue_last_backup = True
-        print("[concord-restart] CONCORD_RESUMING set -> resuming from last backup", flush=True)
+        # Reuse the existing latent cache on resume. With clear_cache_before_training=True the trainer
+        # wipes + re-encodes the WHOLE dataset (minutes) at every restart -- that re-cache, not the
+        # graph, is the slow resume. The cache is valid (same dataset), so skip it on resume.
+        train_config.clear_cache_before_training = False
+        print("[concord-restart] CONCORD_RESUMING set -> resume from backup, reuse latent cache",
+              flush=True)
 
     try:
         with open("secrets.json" if args.secrets_path is None else args.secrets_path, "r") as f:
