@@ -756,6 +756,15 @@ class GenericTrainer(BaseTrainer):
                     # schedule onto the layer device tensors the fused backward reads)
                     self.model_setup.before_step(self.model, self.config, train_progress)
 
+                    # Concord gradient accumulation: the fused step lives in the backward, so
+                    # tell it whether THIS micro-step consolidates (full apply) or only ticks
+                    # the gradient into s_fast (weights frozen). __is_update_step is True only
+                    # on the cycle's last micro-step — the same condition that gates
+                    # optimizer.step() below. accum==1 -> always True -> unchanged behavior.
+                    if getattr(self.model, "concord_controller", None) is not None:
+                        from modules.util.optimizer.concord.prototype_packed_b import set_consolidate
+                        set_consolidate(train_device, self.__is_update_step(train_progress))
+
                     _v2 = getattr(self.model, "concord_graph_v2", None)
                     if _v2 is not None:
                         # Stage 3 v2: the manual graph does predict-prep (eager) + a captured

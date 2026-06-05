@@ -42,10 +42,14 @@ def should_graph(config) -> bool:
     # capture (split predict at the UNet seam) -- the Stage-3 v2.
     from modules.util.enum.Optimizer import Optimizer
     from modules.util.enum.DataType import DataType
+    # gradient_accumulation_steps > 1 is now graph-compatible: the fused backward
+    # accumulates into s_fast and only consolidates on the cycle's last micro-step
+    # (gated by the per-device consolidate flag the trainer toggles per replay). The
+    # captured loss is scaled by 1/accum inside _step_fn so the summed micro-grads
+    # equal the averaged full-batch gradient.
     return (getattr(config, "concord_cuda_graph", False)
             and config.optimizer.optimizer == Optimizer.CONCORD
             and config.train_dtype == DataType.BFLOAT_16
-            and int(config.gradient_accumulation_steps) == 1
             and not config.multi_gpu
             and config.latent_caching
             and config.gradient_checkpointing.enabled())
@@ -95,12 +99,14 @@ class ManualUNetGraph:
     Loss scope here is plain eps-MSE; min-SNR / loss_weight weighting is a follow-up.
     """
 
-    def __init__(self, model_setup, aux_params, dtype, warmup: int = 3, graph_te: bool = False):
+    def __init__(self, model_setup, aux_params, dtype, warmup: int = 3, graph_te: bool = False,
+                 accum: int = 1):
         self.ms = model_setup
         self.aux = list(aux_params)
         self.dtype = dtype
         self.warmup = warmup
         self.graph_te = graph_te        # True: capture encode_text->UNet (TE in the graph, no bridge)
+        self._accum = max(1, int(accum))  # grad-accum: scale captured loss by 1/accum (baked at capture)
         self.static = None
         self.graph = None
         self.cap_loss = None
@@ -212,6 +218,11 @@ class ManualUNetGraph:
                              added_cond_kwargs={"text_embeds": text_embeds,
                                                 "time_ids": s["time_ids"]}).sample
         loss = torch.nn.functional.mse_loss(pred.float(), s["target"].float())
+        # grad-accumulation: 1/accum scaling so the summed micro-step gradients equal
+        # the averaged full-batch gradient (mirrors the eager path's loss/=accum). Baked
+        # at capture; accum==1 -> no op -> the validated single-step graph is unchanged.
+        if self._accum > 1:
+            loss = loss / self._accum
         loss.backward()
         return loss
 

@@ -123,6 +123,25 @@ class StableDiffusionXLFineTuneSetup(
         else:
             model.concord_sanitize = None
 
+        # Concord gradient accumulation requires fast_gain == 1.0: the freeze-during-
+        # accumulation semantics rely on the forward reading the cached weight_buf
+        # (FusedConcordLinearPackedB.forward), but fast_gain < 1.0 makes the forward
+        # re-materialize from the live packed_w (which keeps accumulating s_fast mid-
+        # cycle), breaking the frozen-weight invariant. fast_gain is 1.0 by default and
+        # nothing schedules it lower today; this guards a future schedule from silently
+        # corrupting accumulated training rather than failing loudly.
+        if config.optimizer.optimizer == Optimizer.CONCORD \
+                and int(config.gradient_accumulation_steps) > 1:
+            bad = [n for n, m in model.unet.named_modules()
+                   if float(getattr(m, "fast_gain", 1.0)) != 1.0]
+            if bad:
+                raise ValueError(
+                    f"Concord gradient accumulation (accum="
+                    f"{config.gradient_accumulation_steps}) requires fast_gain == 1.0 on all "
+                    f"swapped layers so the forward reads the frozen cached weight; "
+                    f"{len(bad)} layer(s) violate this (e.g. {bad[:3]}). Disable the fast-gain "
+                    f"schedule or set gradient_accumulation_steps = 1.")
+
         params = self.create_parameters(model, config)
         self.__setup_requires_grad(model, config)
         init_model_parameters(model, params, self.train_device)
@@ -136,7 +155,8 @@ class StableDiffusionXLFineTuneSetup(
             if should_graph(config):
                 aux = [p for p in model.unet.parameters() if p.requires_grad]
                 model.concord_graph_v2 = ManualUNetGraph(
-                    self, aux, config.train_dtype.torch_dtype(), graph_te=should_graph_te(config))
+                    self, aux, config.train_dtype.torch_dtype(), graph_te=should_graph_te(config),
+                    accum=config.gradient_accumulation_steps)
 
     def __restore_concord_unet(self, model, config):
         # The INTERNAL backup dumped the swapped UNet's full state_dict (packed_w + s_fast/
