@@ -123,6 +123,19 @@ class StableDiffusionXLFineTuneSetup(
         else:
             model.concord_sanitize = None
 
+        # Fused dequant-matmul (CONCORD_FUSED_MATMUL): dequantize packed_w inside the matmul
+        # and drop the persistent bf16 weight cache (~5 GB). Settable via this config field OR
+        # the env var (env kept so the standalone harnesses still work). Set the module flag
+        # the kernels read; guard accum==1 (the cache was also the accumulation-freeze buffer).
+        if config.optimizer.optimizer == Optimizer.CONCORD:
+            from modules.util.optimizer.concord import prototype_packed_b as _ppb
+            _ppb._FUSED_MATMUL = bool(getattr(config, "concord_fused_matmul", False)) or _ppb._FUSED_MATMUL
+            if _ppb._FUSED_MATMUL and int(config.gradient_accumulation_steps) > 1:
+                raise ValueError(
+                    "concord_fused_matmul requires gradient_accumulation_steps == 1: the fused path "
+                    "drops the bf16 weight cache that also served as the accumulation-freeze buffer. "
+                    "Set gradient_accumulation_steps = 1, or disable concord_fused_matmul.")
+
         # Concord gradient accumulation requires fast_gain == 1.0: the freeze-during-
         # accumulation semantics rely on the forward reading the cached weight_buf
         # (FusedConcordLinearPackedB.forward), but fast_gain < 1.0 makes the forward
