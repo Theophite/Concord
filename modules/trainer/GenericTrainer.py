@@ -726,8 +726,14 @@ class GenericTrainer(BaseTrainer):
                 if os.environ.get("CONCORD_MEMLOG") and train_progress.epoch_step == 0:
                     _a = torch.cuda.memory_allocated() / 1e9
                     _r = torch.cuda.memory_reserved() / 1e9
+                    _pr = torch.cuda.max_memory_reserved() / 1e9
                     print(f"[memlog] epoch {train_progress.epoch}: allocated={_a:.2f}G "
-                          f"reserved={_r:.2f}G gap_frag={_r - _a:.2f}G", flush=True)
+                          f"reserved={_r:.2f}G gap_frag={_r - _a:.2f}G peak_reserved={_pr:.2f}G",
+                          flush=True)
+                    # reset so the NEXT epoch's peak_reserved isolates the training peak
+                    # (graph capture + step activations + any bf16 weight cache) from one-time
+                    # setup/model-load transients.
+                    torch.cuda.reset_peak_memory_stats()
                 multi.sync_commands(self.commands)
                 if self.commands.get_stop_command():
                     multi.warn_parameter_divergence(self.parameters, train_device)

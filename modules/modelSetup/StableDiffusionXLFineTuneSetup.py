@@ -92,6 +92,46 @@ class StableDiffusionXLFineTuneSetup(
         self._setup_embeddings(model, config)
         self._setup_embedding_wrapper(model, config)
 
+        # Fused dequant-matmul flag -- MUST be set before the Concord swap below. The swapped
+        # layers' __init__ -> _ensure_buffers() reads prototype_packed_b._FUSED_MATMUL at
+        # CONSTRUCTION time to choose shared scratch (fused) vs a per-layer bf16 weight cache
+        # (~5 GB). Setting it AFTER the swap leaves the cache already allocated (no saving), so
+        # it must precede the swap. On by default (config field default True); also settable via
+        # the CONCORD_FUSED_MATMUL env var (kept so the standalone harnesses still work). The
+        # fused path drops the bf16 cache that also served as the accumulation-freeze buffer, so
+        # it cannot coexist with accum>1; because it is on by default, yield to accumulation
+        # (disable + warn) rather than failing the run.
+        if config.optimizer.optimizer == Optimizer.CONCORD:
+            import os
+            import sys as _sys
+            from modules.util.optimizer.concord import prototype_packed_b as _ppb
+            want_fused = bool(getattr(config, "concord_fused_matmul", False)) or _ppb._FUSED_MATMUL
+            if want_fused and int(config.gradient_accumulation_steps) > 1:
+                print(
+                    "[concord] concord_fused_matmul disabled: gradient_accumulation_steps="
+                    f"{config.gradient_accumulation_steps} > 1 requires the bf16 weight cache "
+                    "(the accumulation-freeze buffer); falling back to the cached-weight path. "
+                    "Set gradient_accumulation_steps = 1 to enable the fused matmul (~5 GB lighter).")
+                want_fused = False
+            # The Concord internals import prototype_packed_b by its BARE name during the swap
+            # (the concord dir is on sys.path) -- a module object DISTINCT from the package-
+            # qualified import above (verified: `bare is pkg` -> False). The swapped layers read
+            # _FUSED_MATMUL from the bare copy, and _ensure_buffers() reads it at CONSTRUCTION
+            # time, so setting only the package copy here is a no-op (the bug this fixes). Cover
+            # every copy: (1) the env var, so the bare copy -- imported LATER, during the swap --
+            # reads the right value at its import; (2) the attribute on every already-loaded copy
+            # (handles the GUI's long-lived process where the bare copy persists across runs).
+            if want_fused:
+                os.environ["CONCORD_FUSED_MATMUL"] = "1"
+            else:
+                os.environ.pop("CONCORD_FUSED_MATMUL", None)
+            for _m in list(_sys.modules.values()):
+                if getattr(_m, "__name__", "").rsplit(".", 1)[-1] == "prototype_packed_b":
+                    try:
+                        _m._FUSED_MATMUL = want_fused
+                    except Exception:
+                        pass
+
         # Concord: swap the UNet's Linear/Conv2d for packed self-stepping layers BEFORE
         # collecting parameters, so create_parameters() naturally hands the optimizer only
         # the non-swapped (aux) params -- the Concord layers carry no nn.Parameter weight
@@ -123,18 +163,8 @@ class StableDiffusionXLFineTuneSetup(
         else:
             model.concord_sanitize = None
 
-        # Fused dequant-matmul (CONCORD_FUSED_MATMUL): dequantize packed_w inside the matmul
-        # and drop the persistent bf16 weight cache (~5 GB). Settable via this config field OR
-        # the env var (env kept so the standalone harnesses still work). Set the module flag
-        # the kernels read; guard accum==1 (the cache was also the accumulation-freeze buffer).
-        if config.optimizer.optimizer == Optimizer.CONCORD:
-            from modules.util.optimizer.concord import prototype_packed_b as _ppb
-            _ppb._FUSED_MATMUL = bool(getattr(config, "concord_fused_matmul", False)) or _ppb._FUSED_MATMUL
-            if _ppb._FUSED_MATMUL and int(config.gradient_accumulation_steps) > 1:
-                raise ValueError(
-                    "concord_fused_matmul requires gradient_accumulation_steps == 1: the fused path "
-                    "drops the bf16 weight cache that also served as the accumulation-freeze buffer. "
-                    "Set gradient_accumulation_steps = 1, or disable concord_fused_matmul.")
+        # (concord_fused_matmul flag is set ABOVE, before the Concord swap -- see the note
+        # there. It must precede layer construction, so it cannot live here.)
 
         # Concord gradient accumulation requires fast_gain == 1.0: the freeze-during-
         # accumulation semantics rely on the forward reading the cached weight_buf
