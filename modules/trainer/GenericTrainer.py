@@ -723,6 +723,11 @@ class GenericTrainer(BaseTrainer):
             else:
                 batches = self.data_loader.get_data_loader()
             for batch in batches:
+                if os.environ.get("CONCORD_MEMLOG") and train_progress.epoch_step == 0:
+                    _a = torch.cuda.memory_allocated() / 1e9
+                    _r = torch.cuda.memory_reserved() / 1e9
+                    print(f"[memlog] epoch {train_progress.epoch}: allocated={_a:.2f}G "
+                          f"reserved={_r:.2f}G gap_frag={_r - _a:.2f}G", flush=True)
                 multi.sync_commands(self.commands)
                 if self.commands.get_stop_command():
                     multi.warn_parameter_divergence(self.parameters, train_device)
