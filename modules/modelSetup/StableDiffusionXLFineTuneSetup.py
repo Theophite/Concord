@@ -181,9 +181,24 @@ class StableDiffusionXLFineTuneSetup(
         for f in files:
             sd.update(load_file(f))
         model.unet.load_state_dict(sd, strict=False)
+        # The forward reads a CACHED bf16 buffer, _bf16_weight_buf, which is a PLAIN
+        # attribute -- NOT a registered buffer -- so it is absent from the backup and the
+        # load_state_dict above updated only packed_w, leaving the cache holding the random
+        # post-swap weights. _ensure_buffers() materializes that cache exactly once (when
+        # it's None) and never again, so the next forward returns the stale cache -> garbage
+        # output. Re-materialize it from the just-restored packed_w on every swapped layer.
+        # Without this, the plain continue_last_backup / GUI resume produces mud; the
+        # checkpoint-restart wrapper only dodged it by skipping the resumed-step sample
+        # (a training step's apply kernel happens to rewrite the cache first).
+        n_resync = 0
+        for m in model.unet.modules():
+            if hasattr(m, "_resync_weight_buf"):
+                m._resync_weight_buf()
+                n_resync += 1
         n_packed = sum(1 for k in sd if k.endswith("packed_w"))
         print(f"[concord] resume: restored UNet Concord state from backup "
-              f"({n_packed} packed layers, {len(sd)} tensors)")
+              f"({n_packed} packed layers, {len(sd)} tensors); "
+              f"re-materialized {n_resync} weight buffers from restored packed_w")
 
     def setup_train_device(
             self,
