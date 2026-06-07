@@ -216,6 +216,16 @@ class ConfigList(metaclass=ABCMeta):
                     name = os.path.splitext(name)[0]
                     self.configs.append((name, path))
 
+        # Keep an externally-referenced file (e.g. an absolute concept_file_name carried in by a
+        # loaded preset that points outside config_dir) selectable, so the dropdown can hold it and
+        # options_kv() does not reset it to '' / the first entry. Without this the tab desyncs from
+        # the concepts/samples the loaded config actually points at.
+        current = getattr(self.train_config, self.attr_name, "") or ""
+        if current and os.path.isfile(current) and not any(
+                os.path.normcase(os.path.abspath(p)) == os.path.normcase(os.path.abspath(current))
+                for _, p in self.configs):
+            self.configs.append((os.path.splitext(os.path.basename(current))[0], current))
+
         if len(self.configs) == 0:
             name = self.default_config_name.removesuffix(".json")
             self.__create_config(name)
@@ -307,6 +317,28 @@ class ConfigList(metaclass=ABCMeta):
         self.widgets_initialized = False
         self._create_element_list()
         self._update_toggle_button_text()
+
+    def refresh_ui(self):
+        """Re-sync this tab with the current train_config (e.g. after a preset load).
+
+        For a file-backed list, re-read the available files (including the currently-referenced
+        one even if it lives outside config_dir), reload the element list from the bound file
+        path, and rebuild the dropdown so its selection matches train_config.<attr_name>.
+        Without this, loading a config leaves the concept/sample tab showing the previous
+        entries while the file pointer changes underneath -- the desync that ends in the
+        '.write -> ''' save failures. (Re-creating the dropdown is safe: the old widget is
+        destroyed and its stale var-trace no-ops via component.winfo_exists().)"""
+        if self.from_external_file:
+            self.configs = []
+            self.__load_available_config_names()
+            self.__load_current_config(getattr(self.train_config, self.attr_name))
+            self.__create_configs_dropdown()
+        else:
+            if self.element_list is not None:
+                self.element_list.destroy()
+                self.element_list = None
+            self.widgets_initialized = False
+            self._create_element_list()
 
     def save_current_config(self):
         if self.from_external_file:

@@ -598,6 +598,16 @@ class TrainUI(ctk.CTk):
 
         if self.additional_embeddings_tab:
             self.additional_embeddings_tab.refresh_ui()
+        # The concept + sampling tabs are file-backed (concept_file_name /
+        # sample_definition_file_name) and were NOT refreshed on load -- so after loading a
+        # config the tab kept showing the previous concepts while the underlying file pointer
+        # changed, desyncing the GUI from the concepts the loaded config references (and the
+        # stale/empty pointer is what produced the "Failed to save config '.write' -> ''"
+        # errors). Refresh them so the list + dropdown match the loaded config.
+        if self.concepts_tab and hasattr(self.concepts_tab, "refresh_ui"):
+            self.concepts_tab.refresh_ui()
+        if self.sampling_tab and hasattr(self.sampling_tab, "refresh_ui"):
+            self.sampling_tab.refresh_ui()
 
     def open_tensorboard(self):
         webbrowser.open("http://localhost:" + str(self.train_config.tensorboard_port), new=0, autoraise=False)
