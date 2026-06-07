@@ -4,16 +4,36 @@ Each new token is seeded from the MEAN of its surface form's CLIP subword
 embeddings (resolve_token_init's word path) -- it starts where its spelling already
 points, then training moves it. Per-reason handling derives the init STRING:
   - [REDEFINE] (existing words): tokenize to themselves -> init = current meaning;
-  - camelCase: split the form on case boundaries (tok -> "tok") for cleaner subwords;
+  - camelCase: split the form on case boundaries (FooBar -> "foo bar") for cleaner subwords;
   - name / not_in_dictionary: the normalized word, subword-tokenized as-is.
 
 `init_specs_from_list` -> (names, init_specs) feeds straight into
 concord_embedding_packed.insert_new_tokens(te, tokenizer, names, init_specs).
 """
+import os
 import re
 
-# The token list (name, count, reason, forms). Paste-tolerant: parsed by regex.
-LIST = "REDACTED -- token vocabulary kept in gitignored token_list.local.txt"
+# The token vocabulary is deployment-specific and kept OUT of version control. It encodes
+# two very different objectives -- POSITIVE concepts to learn AND sanitize/redefine targets
+# that feed a content-safety pass -- so it is not committed. Put your entries in a gitignored
+# `token_list.local.txt` next to this file, one per line in the format:
+#
+#   <name>  count=<freq>  reason=<camelCase|name|not_in_dictionary|forced>  forms=(<surface forms>)  [REDEFINE]
+#
+# If that file is absent, the placeholder below is used so the module still imports and the
+# tooling (preinit_embeddings.py, etc.) runs against harmless example tokens.
+_PLACEHOLDER = """
+  examplea       count= 100 reason=not_in_dictionary forms=(examplea)
+  exampleb       count=  50 reason=name              forms=(ExampleB)
+  examplestyle   count=  40 reason=camelCase         forms=(ExampleStyle)
+"""
+
+_LOCAL_LIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token_list.local.txt")
+if os.path.exists(_LOCAL_LIST):
+    with open(_LOCAL_LIST, encoding="utf-8") as _f:
+        LIST = _f.read()
+else:
+    LIST = _PLACEHOLDER
 
 
 def parse_list(text=LIST):

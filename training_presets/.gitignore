@@ -5,3 +5,6 @@
 
 # #.json is an exception (from the exception). This file stores the ui state from a previous run.
 \#.json
+
+# personal preset carrying the trained token list (embeddings) -- kept out of VCS
+\#SDXL Concord Overfit 24GB.json

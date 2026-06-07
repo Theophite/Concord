@@ -21,6 +21,9 @@ config.json
 secrets.json
 *.zip
 
+# deployment-specific token vocabulary (positive concepts + sanitize/redefine sets) -- kept out of VCS
+modules/util/optimizer/concord/token_list.local.txt
+
 # environments
 /.venv*
 /venv*
