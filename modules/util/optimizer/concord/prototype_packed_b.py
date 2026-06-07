@@ -2180,6 +2180,70 @@ class ConcordLinearPackedB(nn.Module):
         return y.to(in_dtype)
 
     @torch.no_grad()
+    def apply_grad_step(self, grad_W):
+        """Apply ONE fused self-step for an EXTERNALLY-supplied weight gradient
+        grad_W [out_features, in_features], WITHOUT autograd -- a direct kernel launch.
+
+        Mirrors the apply path of FusedConcordLinearPackedB.backward (the optional
+        adafactor v_row/v_col EMA + the apply_packed_* kernel that mutates packed_w and
+        refreshes weight_buf). This exists so a caller (the packed embedding's self-step)
+        can drive the cascade INSIDE a CUDA-graph capture: a re-entrant
+        torch.autograd.backward() there touches the legacy stream and aborts the capture
+        with cudaErrorStreamCaptureImplicit. The experimental Sigma_g gradient noise is NOT
+        applied here -- it is keyed to the forward's grad_y/x decomposition, which a directly
+        supplied grad_W does not have (noise is default-off and irrelevant for the few
+        textual-inversion rows)."""
+        wbuf, rmbuf, cmbuf = self._ensure_buffers()
+        if grad_W.dtype != torch.bfloat16:
+            grad_W = grad_W.to(torch.bfloat16)
+        if not grad_W.is_contiguous():
+            grad_W = grad_W.contiguous()
+        if self.track_rebalance:
+            rmbuf.zero_()
+            cmbuf.zero_()
+        if self.track_adafactor_v and self.v_row is not None:
+            g2 = grad_W.float() ** 2
+            if _COH_WEIGHTED_V and self._coh_pre is not None:
+                w = self._coh_pre / self._coh_pre.mean().clamp(min=1e-12)
+                g2 = g2 * w
+            b2 = self.adafactor_beta2
+            self.v_row.mul_(b2).add_(g2.sum(dim=1), alpha=1.0 - b2)
+            self.v_col.mul_(b2).add_(g2.sum(dim=0), alpha=1.0 - b2)
+            self._sum_v_inv.fill_(0).add_(1.0 / self.v_row.sum().clamp(min=1e-30))
+        if self.optimizer_kind == 'adamw':
+            apply_packed_adamw(
+                self.packed_w, grad_W, wbuf,
+                self.row_exp, self.col_exp,
+                rmbuf, cmbuf,
+                lr=self._lr_buf, mantissa_bias=self.MANTISSA_BIAS,
+                alpha=self.alpha, beta1=self.beta1,
+                weight_decay=self.weight_decay, eps=self._eps_buf,
+                step_cap=self.step_cap,
+                v_scale=self.v_scale, precond_p=self.precond_p,
+                gf_consol=self.gf_consol,
+                drift_cancel_C=self.drift_cancel_C,
+                alpha_v_fast=self.alpha_v_fast,
+                wd_sv=self.wd_sv, wd_sf=self.wd_sf,
+                mass_preserve=self.mass_preserve_v,
+                apply_chase=self.apply_chase,
+                track_rebalance=self.track_rebalance,
+                v_row=self.v_row, v_col=self.v_col,
+                sum_v_inv=self._sum_v_inv,
+                gf_trust_delta_sq=self.gf_trust_delta_sq,
+                coh_pre=self._coh_pre,
+            )
+        else:
+            apply_packed_sgd(
+                self.packed_w, grad_W, wbuf,
+                self.row_exp, self.col_exp,
+                rmbuf, cmbuf,
+                lr=self._lr_buf, mantissa_bias=self.MANTISSA_BIAS,
+                alpha=self.alpha, beta1=self.beta1,
+                alpha_v_fast=self.alpha_v_fast,
+                mass_preserve=self.mass_preserve_v,
+                track_rebalance=self.track_rebalance)
+
+    @torch.no_grad()
     def rebalance(self):
         """Tick-up rebalance using the row_max/col_max populated by the
         last apply kernel call. Graph-capturable: bumps the seed buffer
