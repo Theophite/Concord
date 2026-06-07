@@ -89,10 +89,30 @@ class StableDiffusionXLModelSaver(
                 and output_model_format in (ModelFormat.SAFETENSORS, ModelFormat.DIFFUSERS):
             model.concord_controller.consolidate_into_unet(model.unet)
 
-        match output_model_format:
-            case ModelFormat.DIFFUSERS:
-                self.__save_diffusers(model, output_model_destination, dtype)
-            case ModelFormat.SAFETENSORS:
-                self.__save_safetensors(model, output_model_destination, dtype)
-            case ModelFormat.INTERNAL:
-                self.__save_internal(model, output_model_destination)
+        # Concord packed embeddings: the control plane replaced each TE's token_embedding, so
+        # its packed buffers would pollute the saved TE state_dict (a standard CLIPTextModel
+        # load on resume expects token_embedding.weight). Materialize the trained tokens into
+        # the embedding .vector (the embedding saver then writes them as the usual
+        # clip_l/clip_g safetensors) and temporarily restore the original token_embedding for
+        # the duration of the save; reinstall the control planes in finally (so a mid-training
+        # save never leaves training in a broken state).
+        _packed_planes = getattr(model, "concord_control_planes", None)
+        if _packed_planes:
+            from modules.util.optimizer.concord_ot import (
+                deactivate_packed_embeddings,
+                materialize_packed_embeddings_to_vectors,
+            )
+            materialize_packed_embeddings_to_vectors(model)
+            deactivate_packed_embeddings(model)
+        try:
+            match output_model_format:
+                case ModelFormat.DIFFUSERS:
+                    self.__save_diffusers(model, output_model_destination, dtype)
+                case ModelFormat.SAFETENSORS:
+                    self.__save_safetensors(model, output_model_destination, dtype)
+                case ModelFormat.INTERNAL:
+                    self.__save_internal(model, output_model_destination)
+        finally:
+            if _packed_planes:
+                from modules.util.optimizer.concord_ot import reactivate_packed_embeddings
+                reactivate_packed_embeddings(model)

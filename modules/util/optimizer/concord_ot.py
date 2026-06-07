@@ -151,3 +151,141 @@ class ConcordController:
                 n += 1
         print(f"[concord] consolidated {n} layers -> standard nn.Linear/nn.Conv2d for deploy")
         return n
+
+
+# ---------------------------------------------------------------------------
+# Norm-preserving packed embeddings (ControlPlaneEmbedding + ConcordPackedEmbedding).
+#
+# Replaces the plain-SGD AdditionalEmbeddingWrapper path for the TRAINABLE new tokens:
+# each token becomes a row of a per-TE ConcordPackedEmbedding that self-steps INSIDE the
+# captured backward and pins its DEPLOY norm to the vocab median -- the regularization the
+# plain-SGD path lacked (embedding_learning_rate=1e-3 + no norm clamp -> overfit). The
+# control plane REPLACES the TE's token_embedding (capture-safe, branch-free forward).
+#
+# OneTrainer's save/load is preserved: at save time the packed deploy vectors are
+# materialized back into embedding.*.vector (-> standard clip_l/clip_g safetensors) and the
+# ORIGINAL token_embedding is temporarily restored so the TE serializes as a plain
+# CLIPTextModel. On resume _setup_embeddings restores .vector from the backup and
+# setup_packed_embeddings re-packs it -> the trained tokens round-trip.
+# ---------------------------------------------------------------------------
+
+def packed_embeddings_active(config) -> bool:
+    """True when the trainable new-token embeddings should route through the packed
+    self-stepping core instead of plain SGD: Concord optimizer + flag on + something
+    (non-output) to train."""
+    from modules.util.enum.Optimizer import Optimizer
+    return (config.optimizer.optimizer == Optimizer.CONCORD
+            and bool(getattr(config, "concord_packed_embeddings", False))
+            and config.train_any_embedding())
+
+
+def _packed_trainable_uuids(config):
+    """uuids of the additional embeddings that train via the packed core (train=True,
+    non-output)."""
+    out = set()
+    for ec in config.all_embedding_configs():
+        if getattr(ec, "train", False) and not getattr(ec, "is_output_embedding", False):
+            out.add(ec.uuid)
+    return out
+
+
+def setup_packed_embeddings(model, config):
+    """Replace each SDXL text encoder's token_embedding with a ControlPlaneEmbedding whose
+    trainable rows are a norm-preserving ConcordPackedEmbedding. Call AFTER _setup_embeddings
+    (so .vector is restored/created + the placeholder tokens are in the tokenizer) and AFTER
+    the fused-matmul flag is set (the packed core reads _FUSED_MATMUL at construction).
+    Stores model.concord_control_planes = [{te_idx, te, cp, base, row_map}, ...]."""
+    import sys
+    from pathlib import Path
+    cdir = str((Path(__file__).parent / "concord").resolve())
+    if cdir not in sys.path:
+        sys.path.insert(0, cdir)
+    from control_plane import ControlPlaneEmbedding
+
+    train_uuids = _packed_trainable_uuids(config)
+    lr = float(config.embedding_learning_rate)
+    specs = [
+        (1, model.text_encoder_1, model.tokenizer_1, model.all_text_encoder_1_embeddings()),
+        (2, model.text_encoder_2, model.tokenizer_2, model.all_text_encoder_2_embeddings()),
+    ]
+    planes = []
+    for te_idx, te, tokenizer, embeddings in specs:
+        base = te.text_model.embeddings.token_embedding
+        if isinstance(base, ControlPlaneEmbedding):          # re-setup on a persisted model
+            base = base.base
+            te.text_model.embeddings.token_embedding = base
+        cp = ControlPlaneEmbedding(base)
+        median = base.weight.float().norm(dim=1).median().item()
+        tids, inits, row_map = [], [], []
+        for emb in embeddings:
+            if emb.uuid not in train_uuids:
+                continue
+            ids = tokenizer.convert_tokens_to_ids(emb.text_tokens)   # token_count ids
+            for k, tid in enumerate(ids):
+                tids.append(int(tid))
+                inits.append(emb.vector[k].detach().float())
+                row_map.append((emb, k))
+        if tids:
+            cp.attach_trainable(tids, torch.stack(inits).to(base.weight.device), lr, median)
+        te.text_model.embeddings.token_embedding = cp
+        planes.append({"te_idx": te_idx, "te": te, "cp": cp, "base": base, "row_map": row_map})
+    model.concord_control_planes = planes
+    # The plain-SGD wrapper path is bypassed; ensure both wrapper refs are None so
+    # after_optimizer_step's preserve_embedding_norm guard short-circuits (the model's
+    # __init__ leaves embedding_wrapper_2 unset).
+    model.embedding_wrapper_1 = None
+    model.embedding_wrapper_2 = None
+    rows = len(planes[0]["row_map"]) if planes else 0
+    print(f"[concord] packed embeddings ON: {rows} trainable token row(s)/TE, lr={lr}; "
+          f"deploy-norm pinned to vocab median; plain-SGD embedding path bypassed")
+
+
+def reenable_packed_embedding_grad(model):
+    """Keep each trainable's dummy _grad_anchor requires_grad=True so its self-step autograd
+    Function fires. The TE freeze in _setup_model_part_requires_grad (text_encoder_* frozen
+    for embedding-only training) turns it off; this restores it. Called at setup AND every
+    after_optimizer_step (both run __setup_requires_grad)."""
+    planes = getattr(model, "concord_control_planes", None)
+    if not planes:
+        return
+    for plane in planes:
+        cp = plane["cp"]
+        if cp.trainable is not None:
+            cp.trainable._grad_anchor.requires_grad_(True)
+
+
+def materialize_packed_embeddings_to_vectors(model):
+    """Copy each trained token's DEPLOY vector (s_slow+v_slow, dropping the noisy s_fast)
+    into the matching embedding.*.vector, so OneTrainer's embedding saver writes them as the
+    standard clip_l/clip_g safetensors (portable). Call before any save."""
+    planes = getattr(model, "concord_control_planes", None)
+    if not planes:
+        return
+    for plane in planes:
+        cp = plane["cp"]
+        if cp.trainable is None:
+            continue
+        deploy = cp.trainable.deploy_weight().detach()           # [K, dim]
+        with torch.no_grad():
+            for row, (emb, k) in enumerate(plane["row_map"]):
+                emb.vector[k].copy_(deploy[row].to(dtype=emb.vector.dtype, device=emb.vector.device))
+
+
+def deactivate_packed_embeddings(model):
+    """Temporarily restore each TE's ORIGINAL token_embedding so it serializes as a standard
+    CLIPTextModel (the control-plane buffers must not enter its state_dict). Pair with
+    reactivate_packed_embeddings in a try/finally around the save."""
+    planes = getattr(model, "concord_control_planes", None)
+    if not planes:
+        return
+    for plane in planes:
+        plane["te"].text_model.embeddings.token_embedding = plane["base"]
+
+
+def reactivate_packed_embeddings(model):
+    """Re-install the control planes after a save (inverse of deactivate_packed_embeddings)."""
+    planes = getattr(model, "concord_control_planes", None)
+    if not planes:
+        return
+    for plane in planes:
+        plane["te"].text_model.embeddings.token_embedding = plane["cp"]

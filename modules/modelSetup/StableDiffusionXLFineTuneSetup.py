@@ -39,7 +39,11 @@ class StableDiffusionXLFineTuneSetup(
         self._create_model_part_parameters(parameter_group_collection, "text_encoder_1", model.text_encoder_1, config.text_encoder)
         self._create_model_part_parameters(parameter_group_collection, "text_encoder_2", model.text_encoder_2, config.text_encoder_2)
 
-        if config.train_any_embedding() or config.train_any_output_embedding():
+        # Concord packed embeddings self-step inside the backward (no optimizer.step), so they
+        # must NOT be handed to the SGD optimizer -- skip the embedding param groups entirely.
+        from modules.util.optimizer.concord_ot import packed_embeddings_active
+        packed_embeddings = packed_embeddings_active(config)
+        if (config.train_any_embedding() or config.train_any_output_embedding()) and not packed_embeddings:
             if config.text_encoder.train_embedding:
                 self._add_embedding_param_groups(
                     model.all_text_encoder_1_embeddings(), parameter_group_collection, config.embedding_learning_rate,
@@ -68,6 +72,12 @@ class StableDiffusionXLFineTuneSetup(
         self._setup_model_part_requires_grad("text_encoder_2", model.text_encoder_2, config.text_encoder_2, model.train_progress)
         self._setup_model_part_requires_grad("unet", model.unet, config.unet, model.train_progress)
 
+        # Concord packed embeddings: the TE freezes above turn off the control-plane
+        # trainable's dummy _grad_anchor (it lives under text_encoder_*); re-enable it so the
+        # self-step autograd Function still fires. Idempotent; runs at setup and every step.
+        from modules.util.optimizer.concord_ot import reenable_packed_embedding_grad
+        reenable_packed_embedding_grad(model)
+
         model.vae.requires_grad_(False)
 
     def setup_model(
@@ -90,7 +100,13 @@ class StableDiffusionXLFineTuneSetup(
         self._remove_added_embeddings_from_tokenizer(model.tokenizer_1)
         self._remove_added_embeddings_from_tokenizer(model.tokenizer_2)
         self._setup_embeddings(model, config)
-        self._setup_embedding_wrapper(model, config)
+        # Concord packed embeddings REPLACE token_embedding outright (see the packed-embedding
+        # block below); the plain-SGD AdditionalEmbeddingWrapper hook must NOT be installed --
+        # it monkeypatches the very module the control plane wraps as its frozen base, which
+        # would make the control plane's base lookup recurse into the wrapper.
+        from modules.util.optimizer.concord_ot import packed_embeddings_active
+        if not packed_embeddings_active(config):
+            self._setup_embedding_wrapper(model, config)
 
         # Fused dequant-matmul flag -- MUST be set before the Concord swap below. The swapped
         # layers' __init__ -> _ensure_buffers() reads prototype_packed_b._FUSED_MATMUL at
@@ -156,6 +172,18 @@ class StableDiffusionXLFineTuneSetup(
             model.concord_sanitize = SanitizePlane(model, config.concord_sanitize_tokens)
         else:
             model.concord_sanitize = None
+
+        # Concord: route the trainable new-token embeddings through the norm-preserving packed
+        # self-stepping core (ControlPlaneEmbedding + ConcordPackedEmbedding) instead of plain
+        # SGD -- pins each token's deploy norm to the vocab median (the anti-overfit property
+        # the SGD path lacked). Must follow _setup_embeddings (restored .vector + tokenizer
+        # placeholder ids) and the fused-matmul flag block above (the packed core reads
+        # _FUSED_MATMUL at construction). Save/restore is bridged in the embedding saver.
+        if packed_embeddings_active(config):
+            from modules.util.optimizer.concord_ot import setup_packed_embeddings
+            setup_packed_embeddings(model, config)
+        else:
+            model.concord_control_planes = None
 
         # (concord_fused_matmul flag is set ABOVE, before the Concord swap -- see the note
         # there. It must precede layer construction, so it cannot live here.)
@@ -303,8 +331,12 @@ class StableDiffusionXLFineTuneSetup(
         if config.preserve_embedding_norm:
             self._normalize_output_embeddings(model.all_text_encoder_1_embeddings())
             self._normalize_output_embeddings(model.all_text_encoder_2_embeddings())
-            model.embedding_wrapper_1.normalize_embeddings()
-            model.embedding_wrapper_2.normalize_embeddings()
+            # Packed embeddings self-pin their deploy norm in backward; their wrapper refs are
+            # None (the plain-SGD wrapper path is bypassed), so guard the wrapper normalize.
+            if model.embedding_wrapper_1 is not None:
+                model.embedding_wrapper_1.normalize_embeddings()
+            if model.embedding_wrapper_2 is not None:
+                model.embedding_wrapper_2.normalize_embeddings()
         self.__setup_requires_grad(model, config)
         # Concord: gated rebalance (skips the no-op launches) + advance the step index.
         if getattr(model, "concord_controller", None) is not None:

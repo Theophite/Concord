@@ -399,6 +399,7 @@ class TrainConfig(BaseConfig):
     concord_sanitize_tokens: str          # comma-separated single-token words to zero (sanitize)
     concord_cuda_graph: bool              # EXPERIMENTAL opt-in: graph the UNet step (default off)
     concord_fused_matmul: bool           # default-on: dequant packed_w inside the matmul, drops the bf16 weight cache (~5 GB); auto-disabled when accum>1
+    concord_packed_embeddings: bool       # default-on: train new-token embeddings via the norm-preserving packed self-stepping core (ConcordPackedEmbedding) instead of plain SGD -- pins the deploy norm to the vocab median (anti-overfit). Concord optimizer only.
     concepts: list[ConceptConfig]
     aspect_ratio_bucketing: bool
     latent_caching: bool
@@ -997,6 +998,7 @@ class TrainConfig(BaseConfig):
         data.append(("concord_sanitize_tokens", "", str, False))
         data.append(("concord_cuda_graph", False, bool, False))
         data.append(("concord_fused_matmul", True, bool, False))
+        data.append(("concord_packed_embeddings", True, bool, False))
         data.append(("concepts", None, list[ConceptConfig], True))
         data.append(("aspect_ratio_bucketing", True, bool, False))
         data.append(("latent_caching", True, bool, False))

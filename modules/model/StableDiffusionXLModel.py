@@ -95,7 +95,7 @@ class StableDiffusionXLModel(BaseModel):
         self.embedding = None
         self.additional_embeddings = []
         self.embedding_wrapper_1 = None
-        self.embedding_wrapper_1 = None
+        self.embedding_wrapper_2 = None
 
         self.text_encoder_1_lora = None
         self.text_encoder_2_lora = None

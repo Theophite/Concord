@@ -67,6 +67,13 @@ class ControlPlaneEmbedding(nn.Module):
         self.register_buffer("static_vals", torch.zeros(1, self.dim, dtype=base.weight.dtype, device=d))
         self.trainable = None                               # ConcordPackedEmbedding (lazily)
 
+    @property
+    def weight(self):
+        # Compat shim: code reading `token_embedding.weight` (e.g. get_input_embeddings()
+        # .weight, sanitize reapply) gets the frozen base vocab. The trainable new tokens
+        # live in `self.trainable` (packed), not here, so the vocab matrix is unchanged.
+        return self.base.weight
+
     @torch.no_grad()
     def _grow(self, max_id):
         n = max_id + 1 - self.kind.shape[0]
