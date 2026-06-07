@@ -205,6 +205,23 @@ class GenericTrainer(BaseTrainer):
             fun()
         self.sample_queue = []
 
+    def _graphmem(self, tag):
+        # Memory probe -- ON BY DEFAULT (disable with CONCORD_GRAPHMEM=0). torch_alloc/reserved =
+        # PyTorch's view; device_committed/free (mem_get_info) = the driver's dedicated-VRAM view.
+        # Used to see whether ManualUNetGraph.release() actually returns the graph's private pool
+        # before sampling (committed should drop), or leaves it resident -> over-commit -> WDDM spill.
+        if os.environ.get("CONCORD_GRAPHMEM", "1").strip().lower() in ("", "0", "false", "no", "off"):
+            return
+        try:
+            a = torch.cuda.memory_allocated() / 1e9
+            r = torch.cuda.memory_reserved() / 1e9
+            free, total = torch.cuda.mem_get_info()
+            print(f"[graphmem] {tag}: torch_alloc={a:.2f}G torch_reserved={r:.2f}G "
+                  f"device_committed={(total - free) / 1e9:.2f}G device_free={free / 1e9:.2f}G",
+                  flush=True)
+        except Exception as e:
+            print(f"[graphmem] {tag}: <error {e}>", flush=True)
+
     def __sample_loop(
             self,
             train_progress: TrainProgress,
@@ -255,6 +272,7 @@ class GenericTrainer(BaseTrainer):
 
                 self.model.to(self.temp_device)
                 self.model.eval()
+                self._graphmem(f"image {i} entry")
 
                 sample_config = copy.copy(sample_config)
                 sample_config.from_train_config(self.config)
@@ -289,9 +307,12 @@ class GenericTrainer(BaseTrainer):
         # replay would read freed memory and crash on "coming back" from a sample. Dropping
         # it here frees the pool for sampling; the next training step transparently recaptures.
         _v2 = getattr(self.model, "concord_graph_v2", None)
+        self._graphmem("pre-release")
         if _v2 is not None:
             _v2.release()
+        self._graphmem("post-release")
         torch_gc()
+        self._graphmem("post-gc")
 
         self.callbacks.on_update_status("Sampling ...")
 
