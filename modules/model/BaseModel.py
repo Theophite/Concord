@@ -1,3 +1,4 @@
+import re
 from abc import ABCMeta, abstractmethod
 from contextlib import nullcontext
 from uuid import uuid4
@@ -112,7 +113,13 @@ class BaseModel(metaclass=ABCMeta):
             prompt: str,
     ) -> str:
         for embedding in additional_embeddings:
-            prompt = prompt.replace(embedding.placeholder, embedding.joint_text_tokens)
+            # Case-insensitive so a caption's casing (StClair, YaDon, ...) need not match the
+            # stored placeholder -- otherwise that token never expands and gets zero gradient.
+            # re.escape guards special chars; the function replacement stops re from
+            # interpreting backreferences inside joint_text_tokens.
+            prompt = re.sub(re.escape(embedding.placeholder),
+                            lambda m, e=embedding: e.joint_text_tokens,
+                            prompt, flags=re.IGNORECASE)
 
         return prompt
 
