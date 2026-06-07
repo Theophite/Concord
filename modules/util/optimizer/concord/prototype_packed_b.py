@@ -157,8 +157,9 @@ def materialize_packed_bf16(packed_w, row_exp, col_exp, out,
 # and grad_x = grad_y @ dequant(packed_w) WITHOUT materializing the full bf16
 # weight. Drops the ~2 B/param persistent _bf16_weight_buf cache (~5 GB across the
 # UNet's Linear layers). Validated to match cuBLAS to bf16 precision. Linear-only
-# (conv keeps the cache -- a fused dequant-conv is a separate kernel). REQUIRES
-# accum==1: the cache was also the accumulation-freeze buffer.
+# (conv keeps the cache -- a fused dequant-conv is a separate kernel). In cached mode the
+# bf16 cache doubles as the gradient-accumulation freeze buffer; fused reads packed_w
+# directly, so s_fast ticks through the accumulation cycle rather than being frozen.
 # ============================================================================
 import os as _os
 _FUSED_MATMUL = bool(_os.environ.get("CONCORD_FUSED_MATMUL"))
@@ -2107,8 +2108,9 @@ class ConcordLinearPackedB(nn.Module):
         if _FUSED_MATMUL and not hasattr(self, 'kh'):
             # Fused dequant-matmul (Linear): no per-layer bf16 cache -- the forward/backward
             # dequant inside the matmul. The apply kernel still writes the materialized weight
-            # as a side effect, so hand it ONE shared throwaway scratch. REQUIRES accum==1
-            # (the cache was also the accumulation-freeze buffer).
+            # as a side effect, so hand it ONE shared throwaway scratch. (In cached mode the
+            # per-layer cache doubles as the accumulation-freeze buffer; fused has no such buffer,
+            # so s_fast ticks through an accumulation cycle rather than being frozen mid-cycle.)
             wbuf = _get_fused_scratch(N, K, self.packed_w.device)
         elif _FUSED_MATMUL:
             # Fused conv (has 'kh'): cuDNN can't dequant inside, so materialize this conv's

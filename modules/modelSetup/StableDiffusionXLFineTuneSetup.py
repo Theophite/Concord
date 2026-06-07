@@ -97,22 +97,16 @@ class StableDiffusionXLFineTuneSetup(
         # CONSTRUCTION time to choose shared scratch (fused) vs a per-layer bf16 weight cache
         # (~5 GB). Setting it AFTER the swap leaves the cache already allocated (no saving), so
         # it must precede the swap. On by default (config field default True); also settable via
-        # the CONCORD_FUSED_MATMUL env var (kept so the standalone harnesses still work). The
-        # fused path drops the bf16 cache that also served as the accumulation-freeze buffer, so
-        # it cannot coexist with accum>1; because it is on by default, yield to accumulation
-        # (disable + warn) rather than failing the run.
+        # the CONCORD_FUSED_MATMUL env var (kept so the standalone harnesses still work). Fused
+        # is honored exactly as selected, including with gradient accumulation: accumulation is
+        # driven by the apply kernel's per-device consolidate gate, not by the bf16 cache, so it
+        # is orthogonal to fused vs cached (fused just dequants packed_w in the forward instead of
+        # reading a mid-cycle-frozen weight_buf).
         if config.optimizer.optimizer == Optimizer.CONCORD:
             import os
             import sys as _sys
             from modules.util.optimizer.concord import prototype_packed_b as _ppb
             want_fused = bool(getattr(config, "concord_fused_matmul", False)) or _ppb._FUSED_MATMUL
-            if want_fused and int(config.gradient_accumulation_steps) > 1:
-                print(
-                    "[concord] concord_fused_matmul disabled: gradient_accumulation_steps="
-                    f"{config.gradient_accumulation_steps} > 1 requires the bf16 weight cache "
-                    "(the accumulation-freeze buffer); falling back to the cached-weight path. "
-                    "Set gradient_accumulation_steps = 1 to enable the fused matmul (~5 GB lighter).")
-                want_fused = False
             # The Concord internals import prototype_packed_b by its BARE name during the swap
             # (the concord dir is on sys.path) -- a module object DISTINCT from the package-
             # qualified import above (verified: `bare is pkg` -> False). The swapped layers read
