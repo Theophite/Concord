@@ -14,6 +14,28 @@ A normal optimizer stores the weights **plus** a separate optimizer state — an
 
 Because the optimizer state is the weight, a full SDXL UNet fine-tune avoids the 3–4× memory overhead a standard Adam fine-tune pays for its master copy and moments — which is what lets a full fine-tune fit where normally only LoRA would.
 
+## How it works
+
+**One int32 per weight.** Each weight is a single 32-bit word holding three integer accumulators at different timescales, with a shared exponent per row and per column carrying the dynamic range:
+
+```text
+bits 31..16   s_fast  (int16)  — fast tick: catches each step's gradient
+bits 15..8    s_slow  (int8)   — coarse consolidated position
+bits  7..0    v_slow  (int8)   — long-time anchor
+
+weight = (s_slow*128 + s_fast + v_slow*128) * 2^(row_exp + col_exp - bias)
+```
+
+The weight the forward pass uses is reconstructed from those on demand. There is no fp32 master copy and no moment buffers — the entire persistent state is 32 bits/param, all integer.
+
+**The accumulators *are* the optimizer.** The fast accumulator catches each gradient; the slower ones consolidate it. The trick is that the **gaps between the timescales** (fast-vs-slow, slow-vs-anchor) carry the same information Adam reads from its second moment — the gradient's variance and drift — without ever storing a second moment. A drift-cancellation term subtracts the steady part so what remains estimates just the noise, and a coherence gate then scales each step by how consistent the gradient direction has been. The net behaviour is a factored, variance-adaptive AdamW (sqrt preconditioner; consolidation that keeps coherent signal and evaporates incoherent jitter) — every piece of it read from and written back into that one int32.
+
+**The step is folded into the backward.** Each swapped layer is an autograd `Function`; the instant its gradient is computed, the *same* Triton kernel folds it into the packed accumulators. There is no `optimizer.step()` over a separate state — the layer steps itself, which is also why it captures cleanly into a CUDA graph.
+
+**Keeping the integers honest.** Stochastic rounding makes the low-bit accumulation unbiased, and the shared row/column exponents are periodically rebalanced so the mantissas stay in range as the weights drift. On the forward, the fused dequant-matmul reconstructs the bf16 weight *inside* the matmul, so a full bf16 copy is never materialized.
+
+The net result is the headline: Adam-class adaptive training at roughly weight-only memory — which is what puts a full SDXL UNet fine-tune on a 24 GB card.
+
 ## Key additions over OneTrainer
 
 | Feature | Config field | What it does |
