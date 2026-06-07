@@ -304,6 +304,37 @@ def _get_step_counter(device):
     return _STEP_COUNTERS[key]
 
 
+# Gradient-accumulation consolidate flag (per device). 1 = consolidate (full apply,
+# the default = today's every-step behavior). 0 = tick-only (accumulate in s_fast,
+# freeze weight_buf). A STABLE device tensor so a captured CUDA graph keeps a fixed
+# pointer while the trainer toggles the value per micro-step via set_consolidate().
+_CONSOLIDATE_FLAGS = {}
+
+
+def _dev_key(device):
+    """Normalize a device to its indexed form so 'cuda' and 'cuda:0' (what
+    apply sees via packed_w.device) map to the SAME flag buffer."""
+    d = torch.device(device)
+    if d.type == "cuda" and d.index is None:
+        d = torch.device("cuda", torch.cuda.current_device())
+    return str(d)
+
+
+def _get_consolidate_flag(device):
+    key = _dev_key(device)
+    if key not in _CONSOLIDATE_FLAGS:
+        _CONSOLIDATE_FLAGS[key] = torch.ones(1, dtype=torch.int32, device=device)
+    return _CONSOLIDATE_FLAGS[key]
+
+
+def set_consolidate(device, consolidate: bool):
+    """Trainer hook: set whether the next backward(s) consolidate (apply) or just
+    accumulate. In an accumulation cycle of N micro-steps, call with False for the
+    first N-1 and True for the last (in-place .fill_, so it propagates into a
+    captured graph's replays). No-op cost when accum==1 (left at the default 1)."""
+    _get_consolidate_flag(device).fill_(1 if consolidate else 0)
+
+
 _LR_SCALAR_CACHE = {}
 
 
@@ -429,6 +460,10 @@ def _apply_packed_adamw_kernel(
                           # (device tensor; 1.0 = off). Ported from concord_ratio_coh.
     gap_inv_scale,       # fp32: 1/gap_scale for the conserved gap-feedback pass/evap split
     step_salt_ptr,
+    consolidate_ptr,     # *int32[1]: gradient-accumulation gate. 1 = consolidate (full apply,
+                          # today's behavior). 0 = tick-only: SR-tick s_fast from this micro-
+                          # batch's grad, but FREEZE weight_buf + skip chase/leak/rebalance, so
+                          # gradients accumulate in s_fast and weights stay frozen mid-cycle.
     stride_pn, stride_pk,
     stride_gn, stride_gk,
     stride_wn, stride_wk,
@@ -456,6 +491,10 @@ def _apply_packed_adamw_kernel(
     # propagates into a captured graph's replays (no recapture).
     chase_floor = tl.load(chase_floor_ptr).to(tl.float32)
     leak_floor = tl.load(leak_floor_ptr).to(tl.float32)
+    # gradient-accumulation gate (1=consolidate/today, 0=tick-only). Device tensor
+    # so a captured graph stays static while the trainer toggles it per micro-step.
+    cons = tl.load(consolidate_ptr).to(tl.int32)
+    consf = cons.to(tl.float32)
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -598,7 +637,10 @@ def _apply_packed_adamw_kernel(
     # the momentum can't run away on noise. Coherent coords accelerate; incoherent ones
     # don't. (coh init 0 -> 0 momentum without a gate.) The grad it accumulates is
     # already RMS-normalized by sqrt(v_hat) (v-hat AdamW).
-    delta_t = delta_grad + beta1 * coh * d_fs - evap_mantissa
+    # delta_grad (the gradient tick) ALWAYS applies -> accumulates in s_fast.
+    # The consolidation terms (momentum reinforcement + evaporation) only fire
+    # on the consolidate step (consf=1); gated to 0 during accumulation.
+    delta_t = delta_grad + consf * (beta1 * coh * d_fs - evap_mantissa)
 
     # ── SR-tick s_fast ────────────────────────────────────────
     pos_hash = (offs_n[:, None] << 16) ^ offs_k[None, :]
@@ -631,7 +673,8 @@ def _apply_packed_adamw_kernel(
             gate = coh + coh_pre * (1.0 - coh)
             coh_pre_new = (1.0 - alpha_v_fast) * coh_pre + alpha_v_fast * coh
             tl.store(coh_pre_ptr + p_off, coh_pre_new, mask=nk_mask)
-        chase_mantissa = alpha * gate * gate_gain * s_fast.to(tl.float32)
+        # consf gate: 0 during accumulation -> no chase (s_fast keeps accumulating).
+        chase_mantissa = alpha * gate * gate_gain * s_fast.to(tl.float32) * consf
         chase_int8_f = chase_mantissa / 128.0
         r2 = _hash_uniform(s_fast, pos_hash, step_salt ^ 0x5A5A5A5A)
         floor_s = tl.floor(chase_int8_f)
@@ -645,7 +688,7 @@ def _apply_packed_adamw_kernel(
         # (s_slow_full), not s_fast (which is now a small velocity).
         s_slow_full_post = s_slow_i8 * 128
         gap_v_full = (s_slow_full_post - v_slow_full).to(tl.float32)
-        delta_v8 = alpha_v_fast * gap_v_full / 128.0
+        delta_v8 = alpha_v_fast * gap_v_full / 128.0 * consf   # gated: no leak mid-cycle
         if USE_RATIO_COH:
             delta_v8 = delta_v8 * (leak_floor + (1.0 - leak_floor) * coh)   # slow->v_slow, floored
         r3 = _hash_uniform(s_fast, pos_hash, step_salt ^ 0x33335555)
@@ -662,7 +705,7 @@ def _apply_packed_adamw_kernel(
         v_slow_full_post = new_v_int8 * 128
         # wd_sv: pull s_slow_i8 toward v_slow_full_post (at int8 scale).
         d_sv_full_post = (s_slow_i8 * 128 - v_slow_full_post).to(tl.float32)
-        wd_sv_delta_int8 = lr * wd_sv * d_sv_full_post / 128.0
+        wd_sv_delta_int8 = lr * wd_sv * d_sv_full_post / 128.0 * consf
         r4 = _hash_uniform(s_fast, pos_hash, step_salt ^ 0x66665555)
         floor_wd_sv = tl.floor(wd_sv_delta_int8)
         frac_wd_sv = wd_sv_delta_int8 - floor_wd_sv
@@ -673,7 +716,7 @@ def _apply_packed_adamw_kernel(
         # v_slow_full_post. Tick goes to s_fast (mantissa units).
         s_fast_logical_post = s_slow_i8 * 128 + s_fast
         d_sf_full_post = (s_fast_logical_post - v_slow_full_post).to(tl.float32)
-        wd_sf_delta = lr * wd_sf * d_sf_full_post
+        wd_sf_delta = lr * wd_sf * d_sf_full_post * consf
         r5 = _hash_uniform(s_fast, pos_hash, step_salt ^ 0x77770000)
         floor_wd_sf = tl.floor(wd_sf_delta)
         frac_wd_sf = wd_sf_delta - floor_wd_sf
@@ -697,8 +740,10 @@ def _apply_packed_adamw_kernel(
     new_m_eff = s_slow_c * 128 + s_fast_c + new_v_int8 * 128
     new_weight = new_m_eff.to(tl.float32) * scale_fwd
     w_off = offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+    # Only emit the new weight on consolidate -> weight_buf stays FROZEN during
+    # accumulation, so every micro-step's forward sees identical weights.
     tl.store(weight_buf_ptr + w_off,
-             new_weight.to(tl.bfloat16), mask=nk_mask)
+             new_weight.to(tl.bfloat16), mask=nk_mask & (cons == 1))
 
     # ── atomic-max for rebalance (gated — skipped when caller knows
     # row/col exponents will never trip the threshold). ──
@@ -711,8 +756,8 @@ def _apply_packed_adamw_kernel(
         abs_eff = tl.where(nk_mask, abs_eff, 0)
         tile_row_max = tl.max(abs_eff, axis=1)
         tile_col_max = tl.max(abs_eff, axis=0)
-        tl.atomic_max(row_max_ptr + offs_n, tile_row_max, mask=n_mask)
-        tl.atomic_max(col_max_ptr + offs_k, tile_col_max, mask=k_mask)
+        tl.atomic_max(row_max_ptr + offs_n, tile_row_max, mask=n_mask & (cons == 1))
+        tl.atomic_max(col_max_ptr + offs_k, tile_col_max, mask=k_mask & (cons == 1))
 
 
 # ── Denominator-term diagnostic ───────────────────────────────────
@@ -1036,6 +1081,7 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         sum_v_inv = sum_v_inv if sum_v_inv is not None else packed_w
     step_counter = _get_step_counter(packed_w.device)
     step_counter.add_(1)
+    consolidate_ptr = _get_consolidate_flag(packed_w.device)
     if _DENOM_DIAG["enabled"]:
         _denom_diagnostic(packed_w, grad_W, row_exp, col_exp,
                           v_row, v_col, sum_v_inv, use_gf_trust,
@@ -1068,6 +1114,7 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         bc_buf,
         float(gap_inv),
         step_counter,
+        consolidate_ptr,
         packed_w.stride(0), packed_w.stride(1),
         grad_W.stride(0), grad_W.stride(1),
         weight_buf.stride(0), weight_buf.stride(1),
