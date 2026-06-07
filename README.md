@@ -1,157 +1,62 @@
-# OneTrainer
+# Concord
 
-OneTrainer is a one-stop solution for all your Diffusion training needs.
+A fork of **[OneTrainer](https://github.com/Nerogar/OneTrainer)** that adds **Concord** — a self-stepping, packed-weight optimizer for SDXL fine-tuning. Concord folds the optimizer state *into the weights themselves*, so a **full UNet fine-tune** (not LoRA) fits comfortably on a 24 GB card.
 
-<a href="https://discord.gg/KwgcQd5scF"><img src="https://discord.com/api/guilds/1102003518203756564/widget.png" alt="OneTrainer Discord"/></a><br>
+Everything OneTrainer does still works exactly as before. Concord is an extra optimizer choice plus the kernels and CUDA-graph machinery that make it fast and memory-light. If you don't select the Concord optimizer, this is just OneTrainer.
 
-## Features
+## What Concord is
 
--   **Supported models**: Ernie Image, Z-Image, Qwen Image, FLUX.1, Flux.2 Dev and Klein, Chroma, Stable Diffusion 1.5, 2.0, 2.1, 3.0, 3.5, SDXL, Würstchen-v2, Stable Cascade,
-    PixArt-Alpha, PixArt-Sigma, Sana, Hunyuan Video and inpainting models
--   **Model formats**: diffusers and ckpt models
--   **Training methods**: Full fine-tuning, LoRA, embeddings
--   **Masked Training**: Let the training focus on just certain parts of the samples
--   **Automatic backups**: Fully back up your training progress regularly during training. This includes all information to seamlessly continue training
--   **Image augmentation**: Apply random transforms such as rotation, brightness, contrast or saturation to each image sample to quickly create a more diverse dataset
--   **TensorBoard**: A simple TensorBoard integration to track the training progress
--   **Multiple prompts per image**: Train the model on multiple different prompts per image sample
--   **Noise Scheduler Rescaling**: From the paper
-    [Common Diffusion Noise Schedules and Sample Steps are Flawed](https://arxiv.org/abs/2305.08891)
--   **EMA**: Train your own EMA model. Optionally keep EMA weights in CPU memory to reduce VRAM usage
--   **Aspect Ratio Bucketing**: Automatically train on multiple aspect ratios at a time. Just select the target resolutions, buckets are created automatically
--   **Multi-Resolution Training**: Train multiple resolutions at the same time
--   **Dataset Tooling**: Automatically caption your dataset using BLIP, BLIP2 and WD-1.4, or create masks for masked training using ClipSeg or Rembg
--   **Model Tooling**: Convert between different model formats from a simple UI
--   **Sampling UI**: Sample the model during training without switching to a different application
+A normal optimizer stores the weights **plus** a separate optimizer state — an fp32 master copy, Adam moments, and so on — several extra bytes per parameter on top of the model. Concord throws that out. It **swaps the UNet's `nn.Linear` / `nn.Conv2d` for packed self-stepping layers** (`ConcordLinearPackedB` / `ConcordConv2dPackedB`):
 
-![OneTrainerGUI.gif](resources/images/OneTrainerGUI.gif)
+- Each weight is a single **int32** (~32 bits/param): a fast / slow / value mantissa packed into one word, sharing a per-row and per-column exponent.
+- The **optimizer step runs inside the autograd backward** — every layer updates its own packed state directly from its own gradient. There is no separate moment or master tensor: the optimizer state *is* the weight.
+- The OneTrainer-visible "optimizer" is just a plain SGD over the **non-swapped** parameters (norms, biases, embeddings). A controller drives the Concord half — its learning-rate schedule, consolidation, and rebalancing.
 
-> [!NOTE]
-> Explore our 📚 wiki for essential tips and tutorials after installing. Start [here!](https://github.com/Nerogar/OneTrainer/wiki).
-> For command-line usage, see the [CLI Mode section](#cli-mode).
+Because the optimizer state is the weight, a full SDXL UNet fine-tune avoids the 3–4× memory overhead a standard Adam fine-tune pays for its master copy and moments — which is what lets a full fine-tune fit where normally only LoRA would.
 
+## Key additions over OneTrainer
 
-## Installation
+| Feature | Config field | What it does |
+| --- | --- | --- |
+| **Fused dequant-matmul** | `concord_fused_matmul` *(on by default)* | Dequantizes the packed weight **inside** a Triton matmul, eliminating the persistent bf16 weight cache (~5 GB on SDXL). Requires `gradient_accumulation_steps == 1`; if accumulation is on it transparently falls back to the cached path. |
+| **CUDA-graph step** | `concord_cuda_graph` | Captures UNet *predict → loss → backward* in a CUDA graph for a batch-size-1 speedup, injecting fresh noise on every replay so the capture doesn't pin the RNG. |
+| **Diffusion recipe** | OneTrainer noise fields | Offset noise, input perturbation, min-SNR-γ and the timestep distributions are wired through **both** the eager and the captured-graph training paths. |
+| **Token control plane** | `concord_sanitize_tokens`, layer filter | Train / freeze / zero-sanitize individual embedding tokens, and restrict the Concord swap to selected layers (the rest stay standard and frozen). |
 
-> [!IMPORTANT]
-> Installing OneTrainer requires Python >=3.10 and <3.14.
-> You can download Python at https://www.python.org/downloads/windows/.
-> Then follow the below steps.
+Measured on a full-UNet SDXL fine-tune (24 GB card): **~15 GB** training footprint with fused on, versus **~20 GB** with the cached path — a ~5 GB saving that is the difference between fitting and spilling.
 
-#### Automatic installation
+## Using it
 
-1. Clone the repository `git clone https://github.com/Nerogar/OneTrainer.git`
-2. Run:
-    - Windows: Double click or execute `install.bat`
-    - Linux and Mac: Execute `install.sh`
+1. **Install** exactly like OneTrainer — clone this repo and run `install.bat` (Windows) or `install.sh` (Linux):
+   ```sh
+   git clone https://github.com/tok/Concord.git
+   ```
+   See the [upstream wiki](https://github.com/Nerogar/OneTrainer/wiki) for full setup and troubleshooting; nothing about installation changes in this fork.
+2. **Pick the optimizer.** In the GUI, choose **CONCORD** as the optimizer for an SDXL fine-tune, or load a preset:
+   - `training_presets/#SDXL Concord Fused 24GB.json` — a blank full-UNet template; set your own base model + dataset.
+3. **Keep `gradient_accumulation_steps = 1`** to use the fused path (it's on by default). With accumulation > 1, fused steps aside automatically and you get the cached path.
 
-#### Manual installation
+> Concord currently targets **SDXL full fine-tuning**. Other model types and training methods fall back to stock OneTrainer behavior.
 
-1. Clone the repository `git clone https://github.com/Nerogar/OneTrainer.git`
-2. Navigate into the cloned directory `cd OneTrainer`
-3. Set up a virtual environment `python -m venv venv`
-4. Activate the new venv:
-    - Windows: `venv\scripts\activate`
-    - Linux and Mac: Depends on your shell, activate the venv accordingly
-5. Install the requirements `pip install -r requirements.txt`
+## Diagnostics
 
-> [!Tip]
-> Some Linux distributions are missing required packages for instance: On Ubuntu you must install `libGL`:
->
-> ```bash
-> sudo apt-get update
-> sudo apt-get install libgl1
-> ```
->
-> Additionally it's been reported Alpine, Arch and Xubuntu Linux may be missing `tkinter`. Install it via `apk add py3-tk` for Alpine and `sudo pacman -S tk` for Arch.
+A few env-gated probes are available on the Concord paths:
 
-## Updating
+- `CONCORD_MEMLOG=1` — per-epoch VRAM (allocated / reserved / peak) at the top of training.
+- `CONCORD_GRAPHMEM` — per-sample memory around the CUDA-graph release/recapture. **On by default**; set `CONCORD_GRAPHMEM=0` to silence the `[graphmem]` lines.
+- `CONCORD_FUSED_MATMUL=1` — force the fused path on from the environment (the `concord_fused_matmul` config field is the normal way).
 
-#### Automatic update
+## Where the code lives
 
--   Run `update.bat` or `update.sh`
+- `modules/util/optimizer/concord/` — the packed self-stepping layers, the Triton kernels, and the fused dequant-matmul.
+- `modules/util/optimizer/concord_ot.py` — the controller and the layer swap.
+- `modules/util/optimizer/concord_graph.py` — the manual CUDA-graph capture of the UNet step.
+- `modules/modelSetup/StableDiffusionXLFineTuneSetup.py` — the SDXL wiring (swap, fused flag, graph gate, resume).
 
-#### Manual update
+## Status
 
-1. Cd to folder containing the repo `cd OneTrainer`
-2. Pull changes `git pull`
-3. Activate the venv `venv/scripts/activate`
-4. Re-install all requirements `pip install -r requirements.txt --force-reinstall`
+Concord SDXL full fine-tuning is functional and has produced validated samples. This is an active research integration on top of OneTrainer, not a separate product — expect rough edges outside the SDXL fine-tune path.
 
-## Usage
+## Attribution & license
 
-OneTrainer can be used in **two primary modes**: a graphical user interface (GUI) and a **command-line interface (CLI)** for finer control.
-
-For a technically focused quick start, see the [Quick Start Guide](docs/QuickStartGuide.md) and for a broader overview, see the [Overview documentation](docs/Overview.md). Otherwise visit [our wiki!](https://github.com/Nerogar/OneTrainer)
-
-### GUI Mode
-
-#### Windows
-
--   To start the UI, navigate to the OneTrainer folder and double-click `start-ui.bat`
-
-#### Unix-based systems
-
--   Execute `start-ui.sh` and the GUI will pop up.
-
-### CLI Mode
-
-If you need more control or a headless approach OT also supports the command-line interface. All commands **need** to be run inside the active venv created during installation.
-
-All functionality is split into different scripts located in the `scripts` directory. This currently includes:
-
--   `train.py` The central training script
--   `train_ui.py` A UI for training
--   `caption_ui.py` A UI for manual or automatic captioning and mask creation for masked training
--   `convert_model_ui.py` A UI for model conversions
--   `convert_model.py` A utility to convert between different model formats
--   `sample.py` A utility to sample any model
--   `create_train_files.py` A utility to create files needed when training only from the CLI
--   `generate_captions.py` A utility to automatically create captions for your dataset
--   `generate_masks.py` A utility to automatically create masks for your dataset
--   `calculate_loss.py` A utility to calculate the training loss of every image in your dataset
-
-To learn more about the different parameters, execute `<script-name> -h`. For example `python scripts\train.py -h`
-
-If you are on Mac or Linux, you can also read [the launch script documentation](LAUNCH-SCRIPTS.md) for detailed information about how to run OneTrainer and its various scripts on your system.
-
-## Troubleshooting
-
-For general troubleshooting or questions, ask in [Discussions](https://github.com/Nerogar/OneTrainer/discussions), check the [Wiki](https://github.com/Nerogar/OneTrainer/wiki) or join our [Discord](https://discord.gg/KwgcQd5scF).
-
-If you encounter a reproducible error you first must run update.bat or update.sh and confirm the issue is still able to be reproduced. Then export anonymized debug information to help us solve an issue you are facing and upload it as part of your Github Issues submission.
-
--   On Windows double click `export_debug.bat`
--   On Unix-based systems execute `./run-cmd.sh generate_debug_report`
-
-These will both create a `debug_report.log`.
-
-> [!WARNING]
-> We require this file for GitHub issues going forward. Failure to provide it or not manually providing the necessary info will lead to the issue being closed in most circumstances
-
-## Contributing
-
-Contributions are always welcome in any form. For new functionality please open a Github discussion or join our discord so that we can align and avoid duplicated work. You can find more information about contributing [here](docs/Contributing.md).
-
-Before you start looking at the code, I recommend reading about the project structure [here](docs/ProjectStructure.md).
-For in depth discussions, you should consider joining the [Discord](https://discord.gg/KwgcQd5scF) server.
-
-You also **NEED** to **install the required developer dependencies** for your current user and enable the Git commit hooks, via the following commands (works on all platforms; Windows, Linux and Mac):
-
-> [!IMPORTANT]
-> Be sure to run those commands _without activating your venv or Conda environment_, since [pre-commit](https://pre-commit.com/) is supposed to be installed outside any environment.
-
-```sh
-cd OneTrainer
-pip install -r requirements-dev.txt
-pre-commit install
-```
-
-Now all of your commits will automatically be verified for common errors and code style issues, so that code reviewers can focus on the architecture of your changes without wasting time on style/formatting issues, thus greatly improving the chances that your pull request will be accepted quickly and effortlessly.
-
-## Related Projects
-
--   **[MGDS](https://github.com/Nerogar/mgds)**: A custom dataset implementation for Pytorch that is built around the idea of a node based graph.
--   **[Stability Matrix](https://github.com/LykosAI/StabilityMatrix)**: A swiss-army knife installer which wraps and installs a broad range of diffusion software packages including OneTrainer
--   **[Visions of Chaos](https://softology.pro/voc.htm)**: A collection of machine learning tools that also includes OneTrainer.
--   **[StableTuner](https://github.com/devilismyfriend/StableTuner)**: A now defunct (archived) training application for Stable Diffusion. OneTrainer takes a lot of inspiration from StableTuner and wouldn't exist without it.
+Built on **[Nerogar/OneTrainer](https://github.com/Nerogar/OneTrainer)**; all of its functionality, documentation, and license are retained (see `LICENSE.txt`). Concord is an additive layer on top — for the base trainer, supported models, the wiki, and the full feature set, refer to the upstream project.
