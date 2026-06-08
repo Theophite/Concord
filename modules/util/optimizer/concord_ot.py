@@ -105,6 +105,7 @@ class ConcordController:
         # Frozen-anchor TE training (CLIP-L): swapped AFTER the UNet so the shared global coh
         # flags are already set; driven with its own lr. Empty unless a text_encoder is passed.
         self.te_lr = float(te_lr) if te_lr else self.config.lr
+        self.text_encoder = text_encoder          # held for the reversible TE deploy bridge
         self.te_layers = (swap_text_encoder_to_anchor(text_encoder, device, self.te_lr, te_wd_anchor)
                           if text_encoder is not None else [])
         self.te_gate = GatedRebalance(self.te_layers) if self.te_layers else None
@@ -162,6 +163,42 @@ class ConcordController:
                 n += 1
         print(f"[concord] consolidated {n} layers -> standard nn.Linear/nn.Conv2d for deploy")
         return n
+
+    @torch.no_grad()
+    def materialize_te_deploy(self):
+        """REVERSIBLE TE deploy: replace each text-encoder ConcordLinearPackedB with a temp
+        nn.Linear holding its get_weight() (keeps s_fast -> the ~16-bit deploy, NOT the
+        s_fast-dropping consolidated_weight), so the TE serializes as a standard CLIPTextModel.
+        Returns a stash; pass it to restore_te_deploy() in a finally so training continues."""
+        import torch.nn as nn
+        from prototype_packed_b import ConcordLinearPackedB
+        if not self.te_layers or self.text_encoder is None:
+            return []
+        # ONLY the swapped TE transformer Linears (te_layers). The control-plane embedding
+        # core is also a ConcordLinearPackedB living inside the TE module tree, but it has its
+        # own save bridge (materialize_packed_embeddings_to_vectors) -> must NOT be clobbered.
+        te_set = {id(m) for m in self.te_layers}
+        stash = []
+        for parent in self.text_encoder.modules():
+            for name, child in list(parent.named_children()):
+                if isinstance(child, ConcordLinearPackedB) and id(child) in te_set:
+                    w = child.get_weight()
+                    lin = nn.Linear(child.in_features, child.out_features,
+                                    bias=child.bias is not None).to(
+                        device=child.packed_w.device, dtype=w.dtype)
+                    lin.weight.data.copy_(w)
+                    if child.bias is not None:
+                        lin.bias.data.copy_(child.bias.detach().to(lin.bias.dtype))
+                    setattr(parent, name, lin)
+                    stash.append((parent, name, child))
+        return stash
+
+    @torch.no_grad()
+    def restore_te_deploy(self, stash):
+        """Undo materialize_te_deploy: put the packed ConcordLinearPackedB modules back so
+        training continues with the exact pre-save state (incl. the frozen v_slow anchor)."""
+        for parent, name, packed in stash:
+            setattr(parent, name, packed)
 
 
 # ---------------------------------------------------------------------------

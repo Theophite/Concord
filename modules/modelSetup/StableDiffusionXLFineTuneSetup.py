@@ -159,7 +159,7 @@ class StableDiffusionXLFineTuneSetup(
                 model.unet, self.train_device, config.learning_rate, total_steps=1,
                 optimizer_config=config.optimizer,
                 module_filters=ModuleFilter.create(config),
-                text_encoder=(model.text_encoder if te_anchor else None),
+                text_encoder=(model.text_encoder_1 if te_anchor else None),
                 te_lr=te_lr, te_wd_anchor=getattr(config, "concord_te_wd_anchor", 0.5))
             # RESUME: __load_internal rebuilt a STANDARD UNet, so the saved packed_w buffers were
             # dropped and the swap above just packed RANDOM weights. Re-load the backup's packed
@@ -167,6 +167,7 @@ class StableDiffusionXLFineTuneSetup(
             # + s_fast/s_slow/v_slow); without this, continue silently resumes from ~random.
             if config.continue_last_backup:
                 self.__restore_concord_unet(model, config)
+                self.__restore_concord_te(model, config)
         else:
             model.concord_controller = None
 
@@ -270,6 +271,46 @@ class StableDiffusionXLFineTuneSetup(
               f"({n_packed} packed layers, {len(sd)} tensors); "
               f"re-materialized {n_resync} weight buffers from restored packed_w")
 
+    def __restore_concord_te(self, model, config):
+        # Mirror of __restore_concord_unet for the frozen-anchor TE (CLIP-L). The INTERNAL
+        # backup dumped the swapped TE's packed state under <backup>/text_encoder/*.safetensors,
+        # but __load_internal rebuilt a standard CLIPTextModel (keys discarded -> meta),
+        # setup_train_device to_empty'd it (garbage), and the swap then packed garbage. Reload the
+        # backup's packed_w (incl. the ORIGINAL v_slow anchor) so resume continues from the exact
+        # pre-backup state -- a naive re-pack would re-anchor to current weights and lose the
+        # anti-drift.
+        import glob
+        import os
+
+        from safetensors.torch import load_file
+
+        if not getattr(config, "concord_te_anchor", False):
+            return
+        ctrl = getattr(model, "concord_controller", None)
+        if ctrl is None or not getattr(ctrl, "te_layers", None):
+            return
+        if os.environ.get("CONCORD_NO_RESTORE"):
+            print("[concord] resume: CONCORD_NO_RESTORE set -> NOT restoring TE")
+            return
+        backup = config.get_last_backup_path()
+        files = sorted(glob.glob(os.path.join(backup, "text_encoder", "*.safetensors"))) if backup else []
+        if not files:
+            print("[concord] resume: no backup text-encoder state found; continuing from loaded weights")
+            return
+        sd = {}
+        for f in files:
+            sd.update(load_file(f))
+        model.text_encoder_1.load_state_dict(sd, strict=False)
+        n_resync = 0
+        for m in model.text_encoder_1.modules():
+            if hasattr(m, "_resync_weight_buf"):
+                m._resync_weight_buf()
+                n_resync += 1
+        n_packed = sum(1 for k in sd if k.endswith("packed_w"))
+        print(f"[concord] resume: restored TE Concord state from backup "
+              f"({n_packed} packed layers, {len(sd)} tensors); "
+              f"re-materialized {n_resync} weight buffers from restored packed_w")
+
     def setup_train_device(
             self,
             model: StableDiffusionXLModel,
@@ -283,6 +324,13 @@ class StableDiffusionXLFineTuneSetup(
         if config.continue_last_backup and config.optimizer.optimizer == Optimizer.CONCORD \
                 and any(p.is_meta for p in model.unet.parameters()):
             model.unet.to_empty(device=self.train_device)
+        # Same for the frozen-anchor TE: its swapped Linears' 'weight' keys are missing from the
+        # backup (only packed_w), so from_pretrained left them meta -> materialize before the move
+        # + swap; __restore_concord_te reloads the real packed state in setup_model.
+        if config.continue_last_backup and config.optimizer.optimizer == Optimizer.CONCORD \
+                and getattr(config, "concord_te_anchor", False) \
+                and any(p.is_meta for p in model.text_encoder_1.parameters()):
+            model.text_encoder_1.to_empty(device=self.train_device)
 
         vae_on_train_device = not config.latent_caching
         text_encoder_1_on_train_device = \

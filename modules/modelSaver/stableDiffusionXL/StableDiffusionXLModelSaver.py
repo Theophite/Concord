@@ -89,6 +89,16 @@ class StableDiffusionXLModelSaver(
                 and output_model_format in (ModelFormat.SAFETENSORS, ModelFormat.DIFFUSERS):
             model.concord_controller.consolidate_into_unet(model.unet)
 
+        # Reversible TE deploy (frozen-anchor CLIP-L): materialize the packed TE Linears to temp
+        # nn.Linear (get_weight, keeps s_fast) for the DEPLOYABLE formats so the TE serializes as
+        # a standard CLIPTextModel; restored in finally so training continues. Unlike the UNet's
+        # destructive consolidate this is REVERSIBLE. No-op for INTERNAL backups -> the packed TE
+        # is raw-dumped and resume reloads it (preserving the original v_slow anchor).
+        _te_stash = []
+        if getattr(model, "concord_controller", None) is not None \
+                and output_model_format in (ModelFormat.SAFETENSORS, ModelFormat.DIFFUSERS):
+            _te_stash = model.concord_controller.materialize_te_deploy()
+
         # Concord packed embeddings: the control plane replaced each TE's token_embedding, so
         # its packed buffers would pollute the saved TE state_dict (a standard CLIPTextModel
         # load on resume expects token_embedding.weight). Materialize the trained tokens into
@@ -116,3 +126,5 @@ class StableDiffusionXLModelSaver(
             if _packed_planes:
                 from modules.util.optimizer.concord_ot import reactivate_packed_embeddings
                 reactivate_packed_embeddings(model)
+            if _te_stash:
+                model.concord_controller.restore_te_deploy(_te_stash)
