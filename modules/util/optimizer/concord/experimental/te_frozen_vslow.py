@@ -105,6 +105,19 @@ def freeze_anchor_config(layer, wd_anchor=0.0):
     layer.wd_anchor = float(wd_anchor)   # kernel-tick L2 of the delta toward the anchor
 
 
+def apply_production_globals(layers):
+    """Replicate what swap_unet_to_winner flips MODULE-WIDE + per layer: the global
+    coherence gates + the per-layer coh_pre drop. The [A]-[E] checks ran with DEFAULT
+    globals + coh_pre ON, where the chase gate = coh_pre (frozen at 1) = ungated. Production
+    sets ratio_coh, so the gate becomes chase_floor + (1-chase_floor)*coh -- and with v_slow
+    pinned + drift_cancel_C=0, coh -> 0, collapsing the gate to chase_floor. [F] re-runs
+    train+restore under that regime to see whether the frozen anchor actually survives it."""
+    ppb.set_fixed_coh(True)
+    ppb.set_ratio_coh(True)
+    for L in layers:
+        L.disable_cohpre()
+
+
 def vslow_fingerprint(layer):
     _, _, v_slow = unpack(layer.packed_w)
     return v_slow.clone()
@@ -177,8 +190,30 @@ def main():
     print(f"[E] trained drift from W0 = {moved:.2e}  -> after anchor-only = {relaxed:.2e}"
           f"   ({'RELAXES to anchor' if relaxed < moved * 0.5 else 'NO relax'})")
 
-    print("\nSUMMARY: init faithful & 16-bit (A), anchor frozen (B), trains (C), "
-          "anchor dial controls drift (D), restoring force works (E).")
+    # ---- F. PRODUCTION coh globals: does the frozen anchor survive what the UNet swap
+    #         flips on module-wide (ratio_coh + fixed_coh + no coh_pre)? THIS is the regime
+    #         the live TE swap would run under -- [A]-[E] above used the default globals. ----
+    Lp = ConcordLinearPackedB(IN, OUT, bias=False, device=dev, alpha=0.1, lr=2e-2)
+    freeze_anchor_config(Lp, wd_anchor=0.0); pack_anchor(Lp, W0)
+    apply_production_globals([Lp])
+    for step in range(400):
+        Lp.apply_grad_step(Lp.get_weight().float() - Wstar)
+    fit_p, drift_p = rel(Lp.get_weight().float(), Wstar), rel(Lp.get_weight().float(), W0)
+    sf, ss, _ = unpack(Lp.packed_w)
+    chase_alive = ss.abs().float().mean().item()   # ~0 => chase collapsed, delta is s_fast-only
+    sat = (sf.abs() > 30000).float().mean().item() # s_fast int16 saturation fraction
+    Lp.wd_anchor = 8.0
+    for step in range(400):
+        Lp.apply_grad_step(zero)
+    relax_p = rel(Lp.get_weight().float(), W0)
+    print(f"[F] PRODUCTION coh globals (ratio_coh + no coh_pre -- the live TE regime):")
+    print(f"    trains: toW*={fit_p:.2e} (default was {fit_err:.2e})  drift={drift_p:.2e}")
+    print(f"    restoring force: {drift_p:.2e} -> {relax_p:.2e} "
+          f"({'RELAXES' if relax_p < drift_p * 0.5 else 'NO relax'})")
+    print(f"    mean|s_slow|={chase_alive:.2f} (0 => chase collapsed)  s_fast sat={sat*100:.1f}%")
+
+    print("\nSUMMARY: init+16bit (A), anchor frozen (B), trains (C), anchor dial (D), "
+          "restoring force (E); [F] = survives the production coh globals the live swap uses.")
 
 
 if __name__ == "__main__":

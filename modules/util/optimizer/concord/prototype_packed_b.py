@@ -1555,7 +1555,7 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
                 optimizer_kind,
                 weight_decay, eps, step_cap,
                 v_scale, precond_p, gf_consol, drift_cancel_C, alpha_v_fast,
-                wd_sv, wd_sf,
+                wd_sv, wd_sf, wd_anchor,
                 mass_preserve, apply_chase, track_rebalance,
                 weight_buf, row_max_buf, col_max_buf,
                 v_row, v_col, sum_v_inv,
@@ -1595,6 +1595,7 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
         ctx.alpha_v_fast = alpha_v_fast
         ctx.wd_sv = wd_sv
         ctx.wd_sf = wd_sf
+        ctx.wd_anchor = wd_anchor
         ctx.mass_preserve = mass_preserve
         ctx.apply_chase = apply_chase
         ctx.track_rebalance = track_rebalance
@@ -1710,7 +1711,7 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
                 gf_consol=ctx.gf_consol,
                 drift_cancel_C=ctx.drift_cancel_C,
                 alpha_v_fast=ctx.alpha_v_fast,
-                wd_sv=ctx.wd_sv, wd_sf=ctx.wd_sf,
+                wd_sv=ctx.wd_sv, wd_sf=ctx.wd_sf, wd_anchor=ctx.wd_anchor,
                 mass_preserve=ctx.mass_preserve,
                 apply_chase=ctx.apply_chase,
                 track_rebalance=ctx.track_rebalance,
@@ -2000,6 +2001,27 @@ class ConcordLinearPackedB(nn.Module):
         self._resync_weight_buf()
 
     @torch.no_grad()
+    def load_weights_anchor(self, W):
+        """Frozen-v_slow anchor init: pack W with its COARSE part in v_slow (the frozen
+        anchor, x128) and the FINE residual in s_fast, s_slow=0. get_weight() reproduces W
+        to ~16-bit; with alpha_v_fast=0 (v_slow pinned) + wd_anchor>0 the trainable delta
+        (s_slow+s_fast) relaxes toward this anchor. DEPLOY via get_weight (keeps s_fast),
+        NOT consolidated_weight (which drops s_fast -> only the coarse 8-bit anchor)."""
+        W = W.to(device=self.packed_w.device, dtype=torch.float32)
+        max_abs = W.abs().amax(dim=1).clamp(min=1e-30)
+        self.row_exp.copy_(torch.ceil(torch.log2(max_abs) + 1.0)
+                           .clamp(self.EXP_MIN, self.EXP_MAX).to(self.row_exp.dtype))
+        self.col_exp.zero_()
+        exp = (self.row_exp[:, None].float() + self.col_exp[None, :].float() - self.MANTISSA_BIAS)
+        scale = torch.pow(2.0, exp)
+        m_total = (W / scale).round().to(torch.int32)
+        v_slow = (m_total.float() / 128.0).round().clamp(INT8_MIN, INT8_MAX).to(torch.int32)
+        s_fast = (m_total - v_slow * 128).clamp(INT16_MIN, INT16_MAX).to(torch.int32)
+        s_slow = torch.zeros_like(s_fast)
+        self.packed_w.copy_(((s_fast & 0xFFFF) << 16) | ((s_slow & 0xFF) << 8) | (v_slow & 0xFF))
+        self._resync_weight_buf()
+
+    @torch.no_grad()
     def _resync_weight_buf(self):
         """Re-materialize the bf16 weight buffer from the current packed_w
         state. Call after any external mutation of packed_w (e.g.,
@@ -2193,7 +2215,7 @@ class ConcordLinearPackedB(nn.Module):
             self.optimizer_kind,
             self.weight_decay, self._eps_buf, self.step_cap,
             self.v_scale, self.precond_p, self.gf_consol, self.drift_cancel_C, self.alpha_v_fast,
-            self.wd_sv, self.wd_sf,
+            self.wd_sv, self.wd_sf, self.wd_anchor,
             self.mass_preserve_v, self.apply_chase, self.track_rebalance,
             wbuf, rmbuf, cmbuf,
             self.v_row, self.v_col, self._sum_v_inv,
@@ -2349,7 +2371,7 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
                 optimizer_kind,
                 weight_decay, eps, step_cap,
                 v_scale, precond_p, gf_consol, drift_cancel_C, alpha_v_fast,
-                wd_sv, wd_sf,
+                wd_sv, wd_sf, wd_anchor,
                 mass_preserve, apply_chase, track_rebalance,
                 weight_buf, row_max_buf, col_max_buf,
                 v_row, v_col, sum_v_inv,
@@ -2396,6 +2418,7 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
         ctx.alpha_v_fast = alpha_v_fast
         ctx.wd_sv = wd_sv
         ctx.wd_sf = wd_sf
+        ctx.wd_anchor = wd_anchor
         ctx.mass_preserve = mass_preserve
         ctx.apply_chase = apply_chase
         ctx.track_rebalance = track_rebalance
@@ -2474,7 +2497,7 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
                 gf_consol=ctx.gf_consol,
                 drift_cancel_C=ctx.drift_cancel_C,
                 alpha_v_fast=ctx.alpha_v_fast,
-                wd_sv=ctx.wd_sv, wd_sf=ctx.wd_sf,
+                wd_sv=ctx.wd_sv, wd_sf=ctx.wd_sf, wd_anchor=ctx.wd_anchor,
                 mass_preserve=ctx.mass_preserve,
                 apply_chase=ctx.apply_chase,
                 track_rebalance=ctx.track_rebalance,
@@ -2547,7 +2570,7 @@ class ConcordConv2dPackedB(ConcordLinearPackedB):
             self.optimizer_kind,
             self.weight_decay, self._eps_buf, self.step_cap,
             self.v_scale, self.precond_p, self.gf_consol, self.drift_cancel_C, self.alpha_v_fast,
-            self.wd_sv, self.wd_sf,
+            self.wd_sv, self.wd_sf, self.wd_anchor,
             self.mass_preserve_v, self.apply_chase, self.track_rebalance,
             wbuf, rmbuf, cmbuf,
             self.v_row, self.v_col, self._sum_v_inv,
