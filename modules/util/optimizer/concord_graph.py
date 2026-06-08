@@ -112,6 +112,8 @@ class ManualUNetGraph:
         self.cap_loss = None
         self.unet = None
         self.model = None               # set in _alloc; needed for encode_text in TE-graph mode
+        self._shape_key = None          # latent geometry the static buffers + graph are bound to
+        self.vhat = None                # ConcordVHatBuckets: per-shape Adafactor v_hat (lazy)
         self.ls1 = self.ls2 = 0         # text-encoder layer skips (from config, set in step)
         _ckpt.checkpoint = _capturable_checkpoint
 
@@ -125,6 +127,28 @@ class ManualUNetGraph:
         self.cap_loss = None
         gc.collect()
         torch.cuda.empty_cache()
+
+    def _ensure_vhat(self, model):
+        # Lazily build the per-shape v_hat cache over every Concord packed module: the swapped
+        # UNet layers (concord_controller.layers) + each trainable embedding core. An empty
+        # module list makes switch_to a harmless no-op. Flat import mirrors the concord package.
+        if self.vhat is None:
+            import sys
+            cdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "concord")
+            if cdir not in sys.path:
+                sys.path.insert(0, cdir)
+            from vhat_buckets import ConcordVHatBuckets
+            mods = []
+            ctrl = getattr(model, "concord_controller", None)
+            if ctrl is not None:
+                mods.extend(ctrl.layers)
+            for plane in getattr(model, "concord_control_planes", None) or []:
+                cp = plane.get("cp") if isinstance(plane, dict) else None
+                core = getattr(getattr(cp, "trainable", None), "core", None)
+                if core is not None:
+                    mods.append(core)
+            self.vhat = ConcordVHatBuckets(mods)
+        return self.vhat
 
     def _alloc(self, prep, model):
         self.unet = model.unet
@@ -233,8 +257,18 @@ class ManualUNetGraph:
             prep = self.ms.predict(model, batch, config, train_progress, return_raw_inputs=True)
         else:
             prep = self.ms.predict(model, batch, config, train_progress, return_unet_inputs=True)
+        # Shape-aware: the static buffers + captured graph are bound to ONE latent geometry.
+        # When aspect-ratio bucketing changes the shape, release the graph (frees its pool +
+        # empty_cache), rebuild the buffers, and restore this shape's cached Concord v_hat
+        # before the recapture warms up. No-op while the shape is constant (single bucket).
+        shape_key = tuple(prep["latent_input"].shape)
+        if self.static is not None and shape_key != self._shape_key:
+            self.release()                       # graph=None, cap_loss=None, gc, empty_cache
+            self.static = None                   # force _alloc to rebuild for the new geometry
         if self.static is None:
             self._alloc(prep, model)
+            self._shape_key = shape_key
+            self._ensure_vhat(model).switch_to(shape_key)   # save outgoing, restore incoming v_hat
         self._copy_in(prep)
         if self.graph is None:
             if os.environ.get("CONCORD_GRAPH_DEBUG"):

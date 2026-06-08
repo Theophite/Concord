@@ -4,6 +4,7 @@ from abc import ABCMeta, abstractmethod
 from collections.abc import Callable
 
 import modules.util.multi_gpu_util as multi
+from modules.dataLoader.ContiguousAspectBatchSorting import ContiguousAspectBatchSorting
 from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
@@ -302,7 +303,10 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
 
         world_size = multi.world_size() if config.multi_gpu else 1  #world_size can be 1 for validation dataloader, even if multi.world_size() returns > 1
         if config.latent_caching:
-            batch_sorting = AspectBatchSorting(resolution_in_name='crop_resolution', names=sort_names, batch_size=config.batch_size * world_size)
+            # Contiguous bucketing (Concord/graph): keep each shape's batches in one run so
+            # the graph + allocator don't churn on every shape change. No-op with one bucket.
+            sorting_class = ContiguousAspectBatchSorting if config.concord_bucket_contiguous else AspectBatchSorting
+            batch_sorting = sorting_class(resolution_in_name='crop_resolution', names=sort_names, batch_size=config.batch_size * world_size)
             distributed_sampler = DistributedSampler(names=sort_names, world_size=world_size, rank=multi.rank())
         else:
             batch_sorting = InlineAspectBatchSorting(resolution_in_name='crop_resolution', names=sort_names, batch_size=config.batch_size * world_size)
