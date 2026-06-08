@@ -602,7 +602,7 @@ def _apply_packed_adamw_kernel(
     lr_ptr, mantissa_bias, alpha, beta1,
     weight_decay, eps_ptr, step_cap,
     v_scale, precond_p, gf_consol, drift_cancel_C, alpha_v_fast,
-    wd_sv, wd_sf,
+    wd_sv, wd_sf, wd_anchor,
     gf_trust_delta_sq,   # fp32: δ² in step = grad/√(Var + δ²·v̂);
                           # 0 disables (legacy: clamp by step_cap only)
     gate_gain,           # fp32: scalar cosine schedule on the commitment gate
@@ -875,6 +875,25 @@ def _apply_packed_adamw_kernel(
         frac_wd_sf = wd_sf_delta - floor_wd_sf
         tick_wd_sf = (floor_wd_sf + (r5 < frac_wd_sf).to(tl.float32)).to(tl.int32)
         s_fast = s_fast - tick_wd_sf
+
+        # ── anchor decay (wd_anchor): L2 on the trainable DELTA toward 0 ──
+        # Decay s_slow AND s_fast toward zero so the live weight relaxes toward the
+        # v_slow anchor (v_slow*128). This is the elastic pull-to-pretrained for
+        # FROZEN-v_slow mode. NOTE it is NOT wd_sv/wd_sf: those pull s_slow TOWARD
+        # v_slow, which — once v_slow is a pinned anchor instead of the usual EMA
+        # half of a mass-preserved (s_slow+v_slow) position — drags the weight to
+        # ~2*anchor. wd_anchor shrinks only the delta. consf-gated; wd_anchor=0
+        # (default) floors both ticks to 0 -> bit-exact no-op for every existing run.
+        anc_s8 = lr * wd_anchor * s_slow_i8.to(tl.float32) * consf
+        r6 = _hash_uniform(s_fast, pos_hash, step_salt ^ 0x13571357)
+        floor_a8 = tl.floor(anc_s8)
+        tick_a8 = (floor_a8 + (r6 < (anc_s8 - floor_a8)).to(tl.float32)).to(tl.int32)
+        s_slow_i8 = s_slow_i8 - tick_a8
+        anc_sf = lr * wd_anchor * s_fast.to(tl.float32) * consf
+        r7 = _hash_uniform(s_fast, pos_hash, step_salt ^ 0x2468ACE1)
+        floor_af = tl.floor(anc_sf)
+        tick_af = (floor_af + (r7 < (anc_sf - floor_af)).to(tl.float32)).to(tl.int32)
+        s_fast = s_fast - tick_af
 
     # ── clamp and repack ──────────────────────────────────────
     s_fast_c = tl.minimum(tl.maximum(s_fast, -32768), 32767)
@@ -1193,7 +1212,7 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
                          v_scale=1.0, precond_p=0.5, gf_consol=0.0,
                          drift_cancel_C=None,
                          alpha_v_fast=0.001,
-                         wd_sv=0.0, wd_sf=0.0,
+                         wd_sv=0.0, wd_sf=0.0, wd_anchor=0.0,
                          mass_preserve=False, apply_chase=True,
                          track_rebalance=True,
                          v_row=None, v_col=None, sum_v_inv=None,
@@ -1259,7 +1278,7 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         float(v_scale), float(precond_p), float(gf_consol),
         float(drift_cancel_C),
         float(alpha_v_fast),
-        float(wd_sv), float(wd_sf),
+        float(wd_sv), float(wd_sf), float(wd_anchor),
         float(gf_trust_delta_sq),
         float(_GATE_GAIN),
         _ratio_chase_floor_ptr,
@@ -1809,6 +1828,10 @@ class ConcordLinearPackedB(nn.Module):
         self.allow_tickdown = False
         self.wd_sv = 0.0
         self.wd_sf = 0.0
+        # L2 decay of the trainable DELTA (s_slow, s_fast) toward 0 -> the live
+        # weight relaxes toward the v_slow anchor (v_slow*128). The elastic
+        # pull-to-pretrained for frozen-v_slow TE mode. 0 = off (no-op kernel tick).
+        self.wd_anchor = 0.0
         self.mass_preserve_v = True   # default to mass-preserving v_slow leak
         self.apply_chase = True
         # Default True for backward-compat. Set False in the cifar driver
@@ -2223,7 +2246,7 @@ class ConcordLinearPackedB(nn.Module):
                 gf_consol=self.gf_consol,
                 drift_cancel_C=self.drift_cancel_C,
                 alpha_v_fast=self.alpha_v_fast,
-                wd_sv=self.wd_sv, wd_sf=self.wd_sf,
+                wd_sv=self.wd_sv, wd_sf=self.wd_sf, wd_anchor=self.wd_anchor,
                 mass_preserve=self.mass_preserve_v,
                 apply_chase=self.apply_chase,
                 track_rebalance=self.track_rebalance,
