@@ -152,9 +152,11 @@ class StableDiffusionXLFineTuneSetup(
             # so the Concord swap only packs the SELECTED layers -- e.g. preset "attn-mlp"
             # (["attentions"]) trains attn+MLP and leaves the conv resnets frozen, dropping
             # their packed state. Empty filter (preset "full") swaps everything as before.
-            te_anchor = getattr(config, "concord_te_anchor", False)
-            te_lr = ((getattr(config.text_encoder, "learning_rate", None) or config.learning_rate)
-                     if te_anchor else None)
+            # On by default when Concord trains TE1 (text_encoder.train); concord_te_anchor=False
+            # opts out. lr comes from the text_encoder LR field (controller falls back to the
+            # UNet lr if it's unset).
+            te_anchor = config.text_encoder.train and getattr(config, "concord_te_anchor", True)
+            te_lr = config.text_encoder.learning_rate if te_anchor else None
             model.concord_controller = ConcordController(
                 model.unet, self.train_device, config.learning_rate, total_steps=1,
                 optimizer_config=config.optimizer,
@@ -284,11 +286,9 @@ class StableDiffusionXLFineTuneSetup(
 
         from safetensors.torch import load_file
 
-        if not getattr(config, "concord_te_anchor", False):
-            return
         ctrl = getattr(model, "concord_controller", None)
         if ctrl is None or not getattr(ctrl, "te_layers", None):
-            return
+            return                                  # gated by the actual swap, not the flag
         if os.environ.get("CONCORD_NO_RESTORE"):
             print("[concord] resume: CONCORD_NO_RESTORE set -> NOT restoring TE")
             return
@@ -328,7 +328,7 @@ class StableDiffusionXLFineTuneSetup(
         # backup (only packed_w), so from_pretrained left them meta -> materialize before the move
         # + swap; __restore_concord_te reloads the real packed state in setup_model.
         if config.continue_last_backup and config.optimizer.optimizer == Optimizer.CONCORD \
-                and getattr(config, "concord_te_anchor", False) \
+                and config.text_encoder.train and getattr(config, "concord_te_anchor", True) \
                 and any(p.is_meta for p in model.text_encoder_1.parameters()):
             model.text_encoder_1.to_empty(device=self.train_device)
 
