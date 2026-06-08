@@ -152,10 +152,15 @@ class StableDiffusionXLFineTuneSetup(
             # so the Concord swap only packs the SELECTED layers -- e.g. preset "attn-mlp"
             # (["attentions"]) trains attn+MLP and leaves the conv resnets frozen, dropping
             # their packed state. Empty filter (preset "full") swaps everything as before.
+            te_anchor = getattr(config, "concord_te_anchor", False)
+            te_lr = ((getattr(config.text_encoder, "learning_rate", None) or config.learning_rate)
+                     if te_anchor else None)
             model.concord_controller = ConcordController(
                 model.unet, self.train_device, config.learning_rate, total_steps=1,
                 optimizer_config=config.optimizer,
-                module_filters=ModuleFilter.create(config))
+                module_filters=ModuleFilter.create(config),
+                text_encoder=(model.text_encoder if te_anchor else None),
+                te_lr=te_lr, te_wd_anchor=getattr(config, "concord_te_wd_anchor", 0.5))
             # RESUME: __load_internal rebuilt a STANDARD UNet, so the saved packed_w buffers were
             # dropped and the swap above just packed RANDOM weights. Re-load the backup's packed
             # UNet state into the now-swapped layers to restore the exact Concord state (packed_w

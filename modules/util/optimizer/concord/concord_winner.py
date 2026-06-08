@@ -177,6 +177,57 @@ def swap_unet_to_winner(unet, device, lr, gf_consol=None, verbose=True, module_f
     return layers
 
 
+def swap_text_encoder_to_anchor(te, device, lr, wd_anchor, verbose=True):
+    """Swap every nn.Linear in `te` (a CLIP text encoder) to ConcordLinearPackedB in
+    FROZEN-V_SLOW ANCHOR mode, for low-drift TE fine-tuning (validated in
+    te_frozen_vslow.py [A]-[F]):
+      - load_weights_anchor: pretrained W -> frozen v_slow anchor (coarse) + s_fast (fine);
+      - alpha_v_fast=0 pins v_slow (the anchor) AND freezes coh_pre;
+      - drift_cancel_C=0, gf_consol=0 (with coh->0, gf-evap would over-drain s_fast);
+      - wd_anchor>0: elastic pull of the trainable (s_slow,s_fast) delta toward the anchor;
+      - wd_sv=wd_sf=0 (those pull s_slow TOWARD v_slow -> double a pinned anchor);
+      - v_hat AdamW precond unchanged (v_scale=0, gf_trust=1).
+    Call AFTER swap_unet_to_winner so the shared global coh flags (ratio_coh / fixed_coh)
+    are set -- the frozen anchor is validated robust to them ([F]). The global sigma_g
+    fluctuation noise is shared too, and [F] did NOT cover it, so the end-to-end GPU run is
+    what confirms the TE under the FULL production globals. DEPLOY via get_weight (keep
+    s_fast), NOT consolidated_weight. CLIP TEs are all-Linear (no Conv). Returns the layers.
+    """
+    import torch.nn as nn
+    from prototype_packed_b import ConcordLinearPackedB
+    layers, n = [], 0
+    for parent in list(te.modules()):
+        for name, child in list(parent.named_children()):
+            if not isinstance(child, nn.Linear):
+                continue
+            c = ConcordLinearPackedB(child.in_features, child.out_features,
+                                     bias=child.bias is not None, device=device,
+                                     alpha=WINNER["alpha"], lr=lr)
+            c.set_optimizer_kind('adamw', weight_decay=WINNER["weight_decay"],
+                                 eps=WINNER["eps"], step_cap=WINNER["step_cap"])
+            c.precond_p = WINNER["precond_p"]
+            c.v_scale = WINNER["v_scale"]
+            c.gf_trust_delta_sq = WINNER["gf_trust_delta_sq"]
+            c.gf_consol = 0.0               # no gf-evap: with coh->0 it would drain s_fast
+            c.alpha_v_fast = 0.0            # pin v_slow (the frozen pretrained anchor)
+            c.drift_cancel_C = 0.0
+            c.wd_sv = 0.0
+            c.wd_sf = 0.0
+            c.wd_anchor = float(wd_anchor)  # elastic pull of the delta toward the anchor
+            with torch.no_grad():
+                c.load_weights_anchor(child.weight.data.float())
+                if child.bias is not None:
+                    c.bias.data.copy_(child.bias.data.to(c.bias.dtype))
+            c.disable_cohpre()
+            setattr(parent, name, c)
+            layers.append(c)
+            n += 1
+    if verbose:
+        print(f"[concord] text encoder: swapped {n} Linear layers to frozen-anchor packed "
+              f"(lr={lr}, wd_anchor={wd_anchor})")
+    return layers
+
+
 def winner_step(it, total_iters, layers, peak_lr=None, warmup=None, floor_horizon=None,
                 sigmag_peak=None, lr_min_frac=None, noise=None, config=None):
     """Advance the per-step winner schedule (call BEFORE backward each step):

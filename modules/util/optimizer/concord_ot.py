@@ -91,8 +91,8 @@ class ConcordController:
     optimizer is built); driven by the trainer via before_step()/after_step()."""
 
     def __init__(self, unet, device, learning_rate: float, total_steps: int, optimizer_config=None,
-                 module_filters=None):
-        from concord_winner import swap_unet_to_winner, GatedRebalance
+                 module_filters=None, text_encoder=None, te_lr=None, te_wd_anchor=0.5):
+        from concord_winner import swap_unet_to_winner, GatedRebalance, swap_text_encoder_to_anchor
         self.config = make_concord_config(learning_rate, optimizer_config)
         self.total_steps = max(1, int(total_steps))
         # module_filters: OneTrainer's layer_filter (ModuleFilter list). When set to a non-"full"
@@ -102,6 +102,12 @@ class ConcordController:
             unet, device, self.config.lr, gf_consol=self.config.gf_consol, verbose=False,
             module_filters=module_filters)
         self.gate = GatedRebalance(self.layers)
+        # Frozen-anchor TE training (CLIP-L): swapped AFTER the UNet so the shared global coh
+        # flags are already set; driven with its own lr. Empty unless a text_encoder is passed.
+        self.te_lr = float(te_lr) if te_lr else self.config.lr
+        self.te_layers = (swap_text_encoder_to_anchor(text_encoder, device, self.te_lr, te_wd_anchor)
+                          if text_encoder is not None else [])
+        self.te_gate = GatedRebalance(self.te_layers) if self.te_layers else None
         self.step_idx = 0
         print(f"[concord] swapped {len(self.layers)} UNet layers | lr={self.config.lr} "
               f"gf_consol={self.config.gf_consol} noise={self.config.noise} "
@@ -113,11 +119,16 @@ class ConcordController:
         tensors (lr / sigma / coherence floors) that the fused backward reads."""
         from concord_winner import winner_step
         winner_step(self.step_idx, self.total_steps, self.layers, config=self.config)
+        if self.te_layers:
+            winner_step(self.step_idx, self.total_steps, self.te_layers,
+                        peak_lr=self.te_lr, config=self.config)
 
     @torch.no_grad()
     def after_step(self):
         """AFTER the optimizer update: gated rebalance (skips the no-op launches), tick."""
         self.gate()
+        if self.te_gate is not None:
+            self.te_gate()
         self.step_idx += 1
 
     @torch.no_grad()
