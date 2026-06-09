@@ -133,7 +133,8 @@ layer per step: backward grad → NS5 pass (transient, per-layer matmuls on the 
 scratch; Frobenius normalization makes it scale-free after one dequant) → apply
 kernel with a `USE_MUON` constexpr consuming the orthogonalized step in place of the
 gradient. Graph-capturable (static shapes); Conv2d flattens to 2D for NS, standard
-Muon practice.
+Muon practice. Full implementation design — kernel diff, NS pass placement, graph
+story, cost model, build order: [`MUON_IMPLEMENTATION.md`](MUON_IMPLEMENTATION.md).
 
 ## 8. Adoption gates
 
