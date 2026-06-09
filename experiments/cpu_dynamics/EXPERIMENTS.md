@@ -70,11 +70,11 @@ coh 0.96**, while the pure-noise control stays at 0.12. The exact fixed-point va
 `C* = L·2α_v/(1 − 2α_v) ≈ 0.018036`.
 
 **The fix is applied on this branch**: `compute_drift_cancel_C` in `concord/packed_b.py`,
-`dist/concord_winner/concord/packed_b.py`, and `src/prototype_packed_b.py` now takes
+`dist/concord_winner/concord/packed_b.py`, and `notebook/src/prototype_packed_b.py` now takes
 `mass_preserve=True` (matching the layer default `mass_preserve_v=True`) and returns the
 corrected value; the legacy formula is preserved under `mass_preserve=False`, and the
 wrapper call sites pass their own `mass_preserve` flag through. (The older
-`src/concord_triton_fused.py` lineage is untouched — different codepath, leak semantics
+`notebook/src/concord_triton_fused.py` lineage is untouched — different codepath, leak semantics
 not re-verified.) Same shape of fix as the one already recorded in that docstring's
 history (the previous constant was 11× off in the other direction). Porting to
 `concord-integration` is the same edit in
@@ -139,7 +139,7 @@ The pattern is consistent and instructive:
 Every Concord arm beats AdamW at matched lr/schedule — but the ablation ordering is
 **reversed** relative to nanoGPT: on a clean task the dissipation costs ~0.7% and the
 noise adds nothing. This is exactly the repo's own regime note
-(`docs/SESSION_NOTES_2026-05-29.md`): near-zero-Bayes-error tasks don't pay for the
+(`notebook/notes/SESSION_NOTES_2026-05-29.md`): near-zero-Bayes-error tasks don't pay for the
 gate; memorization *is* generalization there.
 
 ## Exp 4 — MNIST + 30% label noise, overfitting regime (4k subset, 25 epochs)

@@ -14,11 +14,14 @@ weight-only memory (full SDXL UNet on a 24 GB card).
 **Two unrelated branch histories share this repo:**
 
 - `main` — the research repo. `concord/packed_b.py` is the **canonical package** (the
-  2,200-line single file IS the product). `src/` = prototypes and training harnesses
-  (`prototype_packed_b.py` is the same lineage, older). `sims/` = closed-loop theory
-  sims. `dist/concord_winner/` = a **frozen snapshot** of the validated winner: sync
-  bug fixes into it, never add features. `experiments/cpu_dynamics/` = CPU dynamics
-  campaign (see below).
+  2,200-line single file IS the product). `docs/` = the current reports. `dist/
+  concord_winner/` = a **frozen snapshot** of the validated winner: sync bug fixes into
+  it, never add features. `experiments/cpu_dynamics/` = the active CPU dynamics
+  campaign (see below). `notebook/` = the **research notebook**: prototypes
+  (`notebook/src/` — `prototype_packed_b.py` is the winning lineage, older than the
+  package), theory sims, the `run_*.sh` A/B records (machine-specific, `cd /c/concord`
+  — read for flags, don't execute), and session notes; indexed in
+  `notebook/README.md`, historical, unmaintained except forward-ported bug fixes.
 - `concord-integration` — a full fork of OneTrainer with Concord wired into SDXL
   fine-tuning. The production kernel there is
   `modules/util/optimizer/concord/prototype_packed_b.py` (yes, "prototype" in the name;
@@ -26,10 +29,11 @@ weight-only memory (full SDXL UNet on a 24 GB card).
   `concord_ot.py` (ConcordController), `concord_graph.py` (manual CUDA-graph capture),
   `modules/modelSetup/StableDiffusionXLFineTuneSetup.py` (the SDXL surface).
 
-**Read in this order:** `SDXL_WINNER_REPORT.md` (what it is) → `HOW_IT_WORKS.md` (how
-the kernel realizes it) → `RESULTS.md` (measured dynamics, the C\* fix, autotuning) →
-`WINNING_CONFIG.md` (the exact validated configuration — single source of truth for
-numbers) → `INSTALL_SDXL.md` (porting changes into the fork).
+**Read in this order:** `docs/SDXL_WINNER_REPORT.md` (what it is) →
+`docs/HOW_IT_WORKS.md` (how the kernel realizes it) → `docs/RESULTS.md` (measured
+dynamics, the C\* fix, autotuning) → `WINNING_CONFIG.md` (the exact validated
+configuration — single source of truth for numbers) → `docs/INSTALL_SDXL.md` (porting
+changes into the fork).
 
 ## Invariants that will bite you
 

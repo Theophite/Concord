@@ -4,7 +4,7 @@ Findings from a CPU experimental campaign on the Concord optimizer (June 2026), 
 against the real-valued reference of the kernel's update rule. Companion documents:
 [`SDXL_WINNER_REPORT.md`](SDXL_WINNER_REPORT.md) (what the optimizer is),
 [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md) (how the kernel realizes it), and
-[`experiments/cpu_dynamics/EXPERIMENTS.md`](experiments/cpu_dynamics/EXPERIMENTS.md)
+[`experiments/cpu_dynamics/EXPERIMENTS.md`](../experiments/cpu_dynamics/EXPERIMENTS.md)
 (the full lab log; every number below is reproducible from the scripts there).
 
 ## TL;DR
@@ -26,7 +26,7 @@ against the real-valued reference of the kernel's update rule. Companion documen
    schedule, while AdamW's weight decay does nothing for it.
 
 **Validity bounds, up front**: all results are from a CPU fp32 reference of the kernel
-rule (`experiments/cpu_dynamics/concord_ref.py` — mirrors the kernel's order, gating,
+rule (`/experiments/cpu_dynamics/concord_ref.py` — mirrors the kernel's order, gating,
 schedules, and init line-by-line; stochastic rounding makes the integer kernel equal it
 in expectation), on small MLPs, MNIST-scale tasks, 3 seeds, no per-arm lr tuning. They
 characterize the *dynamics* of the update rule, not SDXL-scale behavior. The adoption
@@ -78,7 +78,7 @@ motion) and displacement selectivity (drift/noise) improves from 45 to 58 (AdamW
 
 Same genus as the bug already recorded in that docstring's history (the constant was
 previously 11× off in the other direction). **Shipped** in `concord/packed_b.py`,
-`dist/concord_winner/concord/packed_b.py`, `src/prototype_packed_b.py`
+`dist/concord_winner/concord/packed_b.py`, `notebook/src/prototype_packed_b.py`
 (`mass_preserve=True` default, matching the layer; legacy formula preserved under
 `mass_preserve=False`). Porting to `concord-integration` is the same one-line edit.
 
@@ -211,11 +211,11 @@ vs AdamW at wd = 0 and wd = 0.01, identical lr/schedule/model/data, 3 seeds)*
 
 | change | where |
 |---|---|
-| C\* mass-preserve correction (2× rescale, legacy preserved) | `concord/packed_b.py`, `dist/concord_winner/concord/packed_b.py`, `src/prototype_packed_b.py` |
+| C\* mass-preserve correction (2× rescale, legacy preserved) | `concord/packed_b.py`, `dist/concord_winner/concord/packed_b.py`, `notebook/src/prototype_packed_b.py` |
 | host-side coherence meter (`gate_coherence_from_fields`, `measure_coherence`) | `concord/packed_b.py` |
 | `DissipationAutoTuner` — probe-then-commit κ + β1 | `concord/packed_b.py` |
 | CPU reference, exps 1–8, parity tests, figures, lab log | `experiments/cpu_dynamics/` |
-| reports | `SDXL_WINNER_REPORT.md`, `HOW_IT_WORKS.md`, this file |
+| reports | `docs/SDXL_WINNER_REPORT.md`, `docs/HOW_IT_WORKS.md`, this file |
 
 ## Threats to validity, and the path to adoption
 

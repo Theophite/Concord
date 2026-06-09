@@ -11,7 +11,7 @@ order of importance:
 
 Reference implementations all live on this branch in `concord/packed_b.py`
 (search markers given below); the evidence is in [`RESULTS.md`](RESULTS.md) and
-[`experiments/cpu_dynamics/EXPERIMENTS.md`](experiments/cpu_dynamics/EXPERIMENTS.md).
+[`experiments/cpu_dynamics/EXPERIMENTS.md`](../experiments/cpu_dynamics/EXPERIMENTS.md).
 
 ---
 

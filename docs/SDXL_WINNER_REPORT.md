@@ -3,7 +3,7 @@
 A condensed map of this repository. Two branches, one idea:
 
 - **`main`** — the research repo where the Concord optimizer was developed and validated:
-  closed-loop simulations (`sims/`), CIFAR/nanoGPT/T5 ablations (`src/`), the distilled
+  closed-loop simulations (`notebook/sims/`), CIFAR/nanoGPT/T5 ablations (`notebook/src/`), the distilled
   winner package (`dist/concord_winner/`, `concord/`), and `WINNING_CONFIG.md` (the exact
   validated configuration, with provenance).
 - **`concord-integration`** — a full fork of [OneTrainer](https://github.com/Nerogar/OneTrainer)
@@ -183,7 +183,7 @@ O(N+K) vectors per layer.
 ### The variational-inference reading
 
 The same dynamics admit a Bayesian interpretation — and it is the one the codebase itself
-uses. `src/concord_polyak.py` (on `main`) states it outright: the packed format carries an
+uses. `notebook/src/concord_polyak.py` (on `main`) states it outright: the packed format carries an
 implicit variational posterior `q(W) = N(μ, τ²·Σ)`, with the mean in the slow fields and
 the spread in the fast/slow gaps.
 
@@ -206,7 +206,7 @@ the spread in the fast/slow gaps.
   Bayesian-anchored decay terms (`wd_sv`/`wd_sf`; `wd_anchor` in the fork's frozen-anchor
   TE) shrink the less-confirmed transients toward it: per-element, confidence-weighted
   regularization, "less decay where the data has spoken, more decay where it hasn't"
-  (`CONCORD_README.md`). For fine-tuning, `load_weights_finetune` /
+  (`notebook/notes/CONCORD_README.md`). For fine-tuning, `load_weights_finetune` /
   `load_weights_anchor` place the *pretrained* weight in `v_slow`, centering the prior on
   the pretrained model — the L2-SP/EWC move, which is exactly the frozen-anchor CLIP-L
   mode in the fork.

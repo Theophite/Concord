@@ -1,8 +1,8 @@
 # Concord — the winning configuration (exact)
 
 Single source of truth for "what is the validated/confirmed best Concord config." Every
-number below is read from committed source (`concord/packed_b.py`, `src/train_nanogpt.py`,
-`tools/run_split_ab.sh`) and the same-seed A/B log — not from memory. File:line refs are to
+number below is read from committed source (`concord/packed_b.py`, `notebook/src/train_nanogpt.py`,
+`notebook/tools/run_split_ab.sh`) and the same-seed A/B log — not from memory. File:line refs are to
 `concord/packed_b.py` unless noted.
 
 ---
@@ -108,7 +108,7 @@ threshold). Harness LR: `--concord_lr 0.05`, cosine to `lr_min_frac 0.1` (the `_
 
 The "split" is the **dissipative half** of the recipe: coherence-gated friction that bleeds
 transient/noisy mass out of the fast field while protecting confident params. Four changes on
-the bare recipe (from `tools/run_split_ab.sh`):
+the bare recipe (from `notebook/tools/run_split_ab.sh`):
 
 ```
 run_arm ab_consol $CONC --ratio_coh \
@@ -176,7 +176,7 @@ The fluctuation term that pairs with §3's dissipation. **Isotropic** white nois
 injected in the backward off the deploy weight. Flags: `--sigmag_iso --sigmag 0.6`.
 
 **Wired in, not bolted on:** the noise lives in the fused backward kernel (`_SIGMAG_NOISE`
-branch, `src/prototype_packed_b.py` L1421) reading a **device-tensor σ** (`_SIGMAG_SIGMA_T`) so
+branch, `notebook/src/prototype_packed_b.py` L1421) reading a **device-tensor σ** (`_SIGMAG_SIGMA_T`) so
 it survives **CUDA-graph replay** — the per-step schedule `.fill_()`s the tensor; the captured
 graph reads the live value, not an iter-0 freeze. Verified graph-correct vs eager (SR-floor gate).
 
@@ -202,16 +202,16 @@ BN-free, which is why only the plain isotropic kick survives here.)
 
 - Storage layout / `m_eff` / evap: `concord/packed_b.py` L126–129, L263–265, L568, L573.
 - Baked defaults: `concord/packed_b.py` `__init__` (L1359 sig; defaults L1365–1423).
-- Split (dissipation) flags + bench: `tools/run_split_ab.sh`; schedule `src/train_nanogpt.py`
+- Split (dissipation) flags + bench: `notebook/tools/run_split_ab.sh`; schedule `notebook/src/train_nanogpt.py`
   L449, L535–536; live-coh / evap kernel `concord/packed_b.py` L440, L568, L596–619.
-- Noise (fluctuation): flags `src/train_nanogpt.py` L243–249, schedule L529–532; kernel branch
-  `src/prototype_packed_b.py` L1421 (`_SIGMAG_NOISE`/`_SIGMAG_ISO`, device-tensor `_SIGMAG_SIGMA_T`).
+- Noise (fluctuation): flags `notebook/src/train_nanogpt.py` L243–249, schedule L529–532; kernel branch
+  `notebook/src/prototype_packed_b.py` L1421 (`_SIGMAG_NOISE`/`_SIGMAG_ISO`, device-tensor `_SIGMAG_SIGMA_T`).
 - Numbers — all same-seed, `--concord_lr 5e-4`, deterministic:
   - dissipation A/B: `[ab_consol] deployed-sv=1.5180` vs `[ab_nogate]=1.5404` (`compare_out/split_ab.log`).
   - fluctuation sweep on the split config: `[sf_060] deployed-sv=1.4967` (best), full curve in
     `compare_out/sigma_sweep.log` + `compare_out/sigma_fine.log`. Noise ablation:
     `compare_out/noise_ablation.log`.
   Concord is bit-deterministic at fixed seed, so the dissipation Δ is real, not noise; the
-  fluctuation Δ carries ~0.01 trajectory jitter (single-seed). Full record: `docs/CONTROL_PLANE.md`.
+  fluctuation Δ carries ~0.01 trajectory jitter (single-seed). Full record: `notebook/notes/CONTROL_PLANE.md`.
 - The clean importable winner package: `concord/` (committed main). The split + noise flags are
   applied by the driver/harness; the package defaults are the bare recipe.

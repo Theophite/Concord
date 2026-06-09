@@ -2,7 +2,7 @@
 
 The mechanism deep-dive. For the condensed, winning-configuration-centered summary see
 [`SDXL_WINNER_REPORT.md`](SDXL_WINNER_REPORT.md); for the exact validated numbers and
-their provenance see [`WINNING_CONFIG.md`](WINNING_CONFIG.md).
+their provenance see [`WINNING_CONFIG.md`](../WINNING_CONFIG.md).
 
 Code references: `concord/packed_b.py` is the distilled winner package on `main`;
 the production kernel in the OneTrainer fork is
