@@ -2066,6 +2066,134 @@ class ConcordConv2dPackedB(ConcordLinearPackedB):
 
 
 # ============================================================
+# Dissipation autotuning: the gate's own coherence as a noise meter
+# ============================================================
+# Rolled in with the C* rescale (mass_preserve correction above): with the
+# recalibrated drift-cancel coefficient, the gate's Wiener gain is an honest
+# per-weight SNR meter, and its mid-training layer mean discriminates
+# gradient-noise levels cleanly (CPU validation:
+# experiments/cpu_dynamics/EXPERIMENTS.md exp 6 — monotone in label-noise
+# fraction with seed spread 10-50x below the separation, and a
+# probe-then-commit controller recovers the oracle kappa*(noise) of exp 5
+# almost exactly: committed 2/103/205/381/400 vs oracle 0/100/200/400/400).
+
+
+def gate_coherence_from_fields(s_fast, s_slow_i8, v_slow_i8, drift_cancel_C):
+    """The kernel's USE_FIXED_COH Wiener gain, computed host-side from the
+    unpacked integer fields (float tensors). Scale-invariant: signal and
+    noise share 2^(row_exp+col_exp), so the exponents cancel in the ratio
+    and are not needed. Returns the per-element coh in [0, 1]."""
+    d_fs = s_fast
+    d_sv = (s_slow_i8 - v_slow_i8) * 128.0
+    sig = drift_cancel_C * d_sv
+    noise = d_fs - sig
+    sig2 = sig * sig
+    return sig2 / (sig2 + noise * noise + 1e-30)
+
+
+@torch.no_grad()
+def measure_coherence(layer):
+    """Mean gate coherence of one Concord layer, read from the packed state
+    (no kernel changes, no per-step cost — call it occasionally during a
+    probe window). Matches the statistic the exp-6 calibration uses: the
+    plain element mean of the kernel's coh."""
+    p = layer.packed_w
+    s_fast = (p >> 16).float()
+    s_slow = ((p << 16) >> 24).float()
+    v_slow = ((p << 24) >> 24).float()
+    coh = gate_coherence_from_fields(s_fast, s_slow, v_slow,
+                                     float(layer.drift_cancel_C))
+    return float(coh.mean())
+
+
+class DissipationAutoTuner:
+    """Probe-then-commit autotuning of the dissipation kappa (gf_consol).
+
+    Train at a default kappa through a probe window, read the mean gate
+    coherence over the window, then commit kappa once from a calibrated
+    piecewise-linear (coh -> kappa) table and leave it for the rest of the
+    run. Lower probe coherence = noisier gradient stream = more friction.
+
+    Usage (eager training loop):
+        tuner = DissipationAutoTuner(layers, probe_start, probe_end, table)
+        ...
+        for t in range(total_steps):
+            tuner.step(t)        # before the forward/backward of step t
+            train_step()
+
+    `table`: [(coh, kappa), ...] with coh strictly descending — e.g. the
+    MNIST-calibrated [(0.387, 0), (0.314, 100), (0.288, 200), (0.274, 400),
+    (0.256, 400)]. The table is TASK-CALIBRATED: measure it once per domain
+    by sweeping kappa at a few known noise levels (exp 5/6 scripts) — the
+    transferable object is the procedure, not these numbers.
+
+    Probe placement matters (exp 6): the window must sit after the warmup /
+    init-consolidation transient (the telescope is empty before ~2 epochs,
+    coherence reads low regardless of noise) and the same window must be
+    used for calibration and probing. Under heavy noise the probe length is
+    the cost — memorization during the probe is not undone by the commit —
+    so keep the window as early as the transient allows.
+
+    CUDA-graph caveat: gf_consol enters the kernel as a launch-time scalar,
+    so eager backward picks the commit up on the next step, but a CAPTURED
+    graph bakes the value at capture time. With the Stage-3 graph, capture
+    after the commit (probe eagerly, then capture), or port kappa to a
+    device tensor like lr/sigma/the floors.
+    """
+
+    def __init__(self, layers, probe_start, probe_end, table,
+                 probe_kappa=50.0, measure_every=10, verbose=True):
+        assert probe_end > probe_start >= 0
+        assert all(c1 > c2 for (c1, _), (c2, _) in zip(table, table[1:])), \
+            "table coh values must be strictly descending"
+        self.layers = list(layers)
+        self.probe_start, self.probe_end = int(probe_start), int(probe_end)
+        self.table = [(float(c), float(k)) for c, k in table]
+        self.probe_kappa = float(probe_kappa)
+        self.measure_every = max(1, int(measure_every))
+        self.verbose = verbose
+        self._samples = []
+        self.committed = None
+        for m in self.layers:
+            m.gf_consol = self.probe_kappa
+
+    def kappa_from_coh(self, c):
+        t = self.table
+        if c >= t[0][0]:
+            return t[0][1]
+        if c <= t[-1][0]:
+            return t[-1][1]
+        for (c1, k1), (c2, k2) in zip(t, t[1:]):
+            if c2 <= c <= c1:
+                return k1 + (c1 - c) / (c1 - c2) * (k2 - k1)
+        return t[-1][1]
+
+    def step(self, t):
+        """Call once per optimizer step, before the backward of step t.
+        Returns the committed kappa once, at t == probe_end; else None."""
+        if self.committed is not None:
+            return None
+        if self.probe_start <= t < self.probe_end \
+                and (t - self.probe_start) % self.measure_every == 0:
+            vals = [measure_coherence(m) for m in self.layers]
+            if vals:
+                self._samples.append(sum(vals) / len(vals))
+        if t >= self.probe_end:
+            coh = (sum(self._samples) / len(self._samples)) \
+                if self._samples else self.table[0][0]
+            self.committed = self.kappa_from_coh(coh)
+            for m in self.layers:
+                m.gf_consol = self.committed
+            if self.verbose:
+                print(f"[concord] dissipation autotune: probe coh={coh:.4f} "
+                      f"-> kappa={self.committed:.0f} "
+                      f"({len(self._samples)} samples, "
+                      f"steps {self.probe_start}-{self.probe_end})")
+            return self.committed
+        return None
+
+
+# ============================================================
 # Smoke test (same shape as prototype_packed.py for direct A/B comparison)
 # ============================================================
 

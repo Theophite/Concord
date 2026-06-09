@@ -265,3 +265,24 @@ transferable object is the *procedure* (the gate's own mid-training coherence is
 reliable, nearly-free noise meter; map it through a κ\* curve measured once per domain).
 In the real optimizer, mean gate coherence is available per layer at zero extra cost —
 the kernel already computes coh per weight; aggregating it is one reduction.
+
+## Rolled into the package (with the C\* rescale)
+
+The autotuner now ships in `concord/packed_b.py` alongside the recalibrated gate it
+depends on:
+
+- `gate_coherence_from_fields(...)` / `measure_coherence(layer)` — the kernel's Wiener
+  gain computed host-side from the packed state (scale-invariant, so the exponents
+  cancel and it never touches the kernel; call it occasionally, zero per-step cost).
+- `DissipationAutoTuner(layers, probe_start, probe_end, table)` — probe-then-commit:
+  train at the default κ through the probe window, read the mean gate coherence, commit
+  κ once from a calibrated piecewise-linear (coh → κ) table.
+
+Validated by `test_autotuner_parity.py` (CPU, execs the shipped source): the package
+formula equals the reference gate including scale invariance under random exponents,
+`measure_coherence` round-trips the packing, and the tuner's probe/commit/interpolation
+match the exp-6 logic that produced the v2.1 table above. Caveats are in the class
+docstring: the table is task-calibrated; the probe window must match the calibration
+window and sit after the init-consolidation transient; under a captured CUDA graph,
+gf_consol is baked at capture time (probe eagerly, then capture — or port κ to a device
+tensor like lr/σ/floors when wiring into the Stage-3 graph).
