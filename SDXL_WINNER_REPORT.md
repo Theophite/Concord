@@ -10,6 +10,9 @@ A condensed map of this repository. Two branches, one idea:
   with that winner wired into the SDXL fine-tuning path. The deliverable: a **full SDXL UNet
   fine-tune (not LoRA) in ~15 GB**, fitting a 24 GB card with headroom.
 
+The full mechanism deep-dive — storage format, kernel pipeline, gating, integer hygiene,
+graph engineering — is in [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md).
+
 ## The idea
 
 A normal AdamW fine-tune pays 3–4× the weight memory for optimizer state: an fp32 master
