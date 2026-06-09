@@ -38,13 +38,17 @@ project's reason to exist.
   optimizer beating AdamW at every label-noise level tested (+0.75 to +1.74) —
   [`docs/RESULTS.md`](docs/RESULTS.md), with reproduction scripts in
   [`experiments/cpu_dynamics/`](experiments/cpu_dynamics/).
+- **The Muon drive**: NS5 orthogonalization with the momentum read from the packed
+  word — best arm in both regimes at zero extra state, trust region and step cap
+  deleted (the spectral bound replaces them), stable capless across 100× of lr —
+  [`docs/MUON_DRIVE.md`](docs/MUON_DRIVE.md).
 
 ## Repository map
 
 | where | what |
 |---|---|
 | [`concord/`](concord/) | **the canonical package** — `packed_b.py` is the optimizer: layers, Triton kernels, coherence meter, dissipation autotuner |
-| [`docs/`](docs/) | [`SDXL_WINNER_REPORT.md`](docs/SDXL_WINNER_REPORT.md) (what it is) → [`HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md) (mechanism deep-dive) → [`RESULTS.md`](docs/RESULTS.md) (measured dynamics & autotuning) → [`INSTALL_SDXL.md`](docs/INSTALL_SDXL.md) (porting into the fork) → [`BIBLIOGRAPHY.md`](docs/BIBLIOGRAPHY.md) (relation to prior work) |
+| [`docs/`](docs/) | [`SDXL_WINNER_REPORT.md`](docs/SDXL_WINNER_REPORT.md) (what it is) → [`HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md) (mechanism deep-dive) → [`RESULTS.md`](docs/RESULTS.md) (measured dynamics & autotuning) → [`INSTALL_SDXL.md`](docs/INSTALL_SDXL.md) (porting into the fork) → [`BIBLIOGRAPHY.md`](docs/BIBLIOGRAPHY.md) (relation to prior work) → [`MUON_DRIVE.md`](docs/MUON_DRIVE.md) (spectral preconditioning from the packed state) |
 | [`WINNING_CONFIG.md`](WINNING_CONFIG.md) | the validated configuration, exact, with provenance |
 | [`experiments/cpu_dynamics/`](experiments/cpu_dynamics/) | active CPU experiment suite: reference implementation of the update rule, exps 1–8, parity tests, lab log |
 | [`dist/concord_winner/`](dist/concord_winner/) | frozen snapshot of the distilled winner (bug fixes synced in; no new features) |

@@ -217,6 +217,18 @@ vs AdamW at wd = 0 and wd = 0.01, identical lr/schedule/model/data, 3 seeds)*
 | CPU reference, exps 1–8, parity tests, figures, lab log | `experiments/cpu_dynamics/` |
 | reports | `docs/SDXL_WINNER_REPORT.md`, `docs/HOW_IT_WORKS.md`, this file |
 
+## Addendum (exps 9–9c): the Muon drive
+
+After this synthesis was written, the campaign continued: replacing the v̂
+preconditioner with Newton–Schulz orthogonalization of the gradient — Muon's spectral
+preconditioning with the momentum read from the packed state, zero additional resident
+bytes. It became the best Concord arm in both regimes (clean 96.07 at its own lr,
+noisy 92.02 at its own κ\*), deleted the trust region, step cap, ε, and v̂'s side
+vectors outright (the NS step is spectrally self-bounded: all-training max 6.7 vs the
+v̂ drive's pre-clamp 406), widened the stable lr range ~10× capless, and converted
+native Muon's 100%-of-wrong-labels memorization failure into the best noisy result
+measured. Full write-up: [`MUON_DRIVE.md`](MUON_DRIVE.md); lab log: exps 9/9b/9c.
+
 ## Threats to validity, and the path to adoption
 
 - **CPU fp32 reference, not the Triton kernel**: equal in expectation by construction
