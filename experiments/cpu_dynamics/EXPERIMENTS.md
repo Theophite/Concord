@@ -326,3 +326,30 @@ autotuner active, clean and 30%-label-noise regimes, 3 seeds
 The β1 = 0 default is vindicated for Concord's target regimes (noisy LM/diffusion
 streams); the measured exception (β1 = 0.1 on clean streams, probe-selected) is one
 task deep — gate any adoption on the nanoGPT A/B, like the rest.
+
+## Exp 8 — the head-to-head: fully autotuned Concord vs AdamW, variable noise (`exp8_vs_adamw.py`)
+
+The complete package as now shipped — fixed-C\* gate, one probe committing both κ
+(exp-6 table) and β1 (0.1 iff probe coh ≥ 0.35) — against AdamW at wd = 0 and wd = 0.01,
+same peak lr and schedule, 4k × 25 epochs, 3 seeds (`exp8_results.json`,
+`exp8_vs_adamw.png`):
+
+| ρ | AdamW | AdamW wd=0.01 | Concord autotuned (deploy) | margin | committed |
+|---|---|---|---|---|---|
+| 0% | 92.78 ± 0.16 | 92.76 | **93.66 ± 0.10** | +0.88 | κ=3, β1=0.1 |
+| 5% | 92.14 ± 0.22 | 92.19 | **93.11 ± 0.11** | +0.92 | κ=67 |
+| 10% | 91.97 ± 0.29 | 91.94 | **92.72 ± 0.21** | +0.75 | κ=101 |
+| 20% | 90.73 ± 0.29 | 90.72 | **91.63 ± 0.44** | +0.90 | κ=202 |
+| 30% | 89.15 ± 0.13 | 89.19 | **90.53 ± 0.21** | +1.34 | κ=381 |
+| 45% | 86.25 ± 0.95 | 86.24 | **87.99 ± 0.68** | +1.74 | κ=400 |
+
+1. **Concord wins every cell**, +0.75 to +1.74, with the margin *growing* with noise —
+   the dissipation pays exactly where AdamW has nothing to answer with (decoupled
+   wd = 0.01 is indistinguishable from wd = 0 here).
+2. The autotuner committed sensible knobs at every level without being told ρ:
+   κ tracking the noise, momentum on only for the clean stream.
+3. The advantage is not only memorization suppression: at 5–10% noise Concord
+   *memorizes more* than AdamW (25% vs 19%) yet generalizes better by ~+0.9 — the
+   preconditioner/deploy-weight machinery contributes independently of the friction.
+4. Same caveats as the whole series: CPU reference, one task/architecture, 3 seeds,
+   task-calibrated probe table; the GPU nanoGPT A/B remains the adoption gate.
