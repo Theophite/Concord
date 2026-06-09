@@ -177,6 +177,45 @@ exponents rebalance (+1, with a stochastically-rounded right shift) only when a 
 mantissa exceeds 24000. The only optimizer state outside the packed word is v̂'s two
 O(N+K) vectors per layer.
 
+### The variational-inference reading
+
+The same dynamics admit a Bayesian interpretation — and it is the one the codebase itself
+uses. `src/concord_polyak.py` (on `main`) states it outright: the packed format carries an
+implicit variational posterior `q(W) = N(μ, τ²·Σ)`, with the mean in the slow fields and
+the spread in the fast/slow gaps.
+
+- **The live weight is a particle, not an estimate.** Injected noise (fluctuation) plus
+  coherence-gated friction (dissipation) make `W`'s dynamics Langevin-like: it explores an
+  approximate posterior whose temperature is set by σ (the code names its knobs
+  accordingly — `v_scale` is documented as "temperature on the preconditioner", and the
+  research harness has a `concord_polyak_temperature` Metropolis accept gate).
+- **`P` is the posterior mean, computed online.** The continuous-Lookahead chase makes `P`
+  an EMA of the sampling trajectory — Polyak averaging, the posterior-mean estimator of
+  constant-lr SGD viewed as approximate inference. Deploying `consolidated_weight()` means
+  shipping the posterior *mean* rather than a posterior *sample* — which is why dropping
+  `s_fast` at save time wins (deployed-sv 1.518 vs live 1.556 on the split arm).
+- **The gate is posterior shrinkage.** Under the Gaussian signal+noise split, `coh·u` is
+  `E[drift | observed velocity]` — the MMSE estimate (the Wiener gain *is* the posterior
+  mean operator). The chase commits exactly this conditional mean into `P`; the
+  dissipation evaporates the posterior-noise remainder instead of letting it consolidate.
+- **The anchor is the prior.** `v_slow` is the long-window mean — in the code's words,
+  "the part of the weight supported by the training distribution" — and the
+  Bayesian-anchored decay terms (`wd_sv`/`wd_sf`; `wd_anchor` in the fork's frozen-anchor
+  TE) shrink the less-confirmed transients toward it: per-element, confidence-weighted
+  regularization, "less decay where the data has spoken, more decay where it hasn't"
+  (`CONCORD_README.md`). For fine-tuning, `load_weights_finetune` /
+  `load_weights_anchor` place the *pretrained* weight in `v_slow`, centering the prior on
+  the pretrained model — the L2-SP/EWC move, which is exactly the frozen-anchor CLIP-L
+  mode in the fork.
+- **The variance map comes free.** The drift-cancelled residual `u − μ` estimates each
+  weight's posterior variance — the "which weights have converged?" diagnostic that the
+  C\* fix restored.
+
+One line: the packed word stores a per-weight Gaussian posterior (mean = slow fields,
+fluctuation = fast field); the kernel explores it at temperature σ, Wiener-shrinks each
+observation to its conditional mean, consolidates that mean, regularizes toward the
+prior, and ships the posterior mean — all as integer ticks on the same 32 bits.
+
 ## As shipped for SDXL (`concord-integration`)
 
 The fork is stock OneTrainer unless you pick the **CONCORD** optimizer. The preset
