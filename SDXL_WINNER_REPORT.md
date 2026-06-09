@@ -111,78 +111,71 @@ better). The winner is a **fluctuation–dissipation pair on top of the bare rec
 
 `WINNING_CONFIG.md` on `main` is the single source of truth for every number above.
 
-## The update rule, exactly
+## The optimizer, in its simplest form
 
-Per swapped layer, per step, at the winner configuration (accumulation 1; UNet path:
-`β1 = 0`, `weight_decay = wd_sv = wd_sf = 0`, `v_scale = 0`, `δ² = 1`, `p = 0.5`,
-`gate_gain = 1`). Kernel: `_apply_packed_adamw_kernel`; noise + v̂ update:
-`PackedLinearFn.backward` (integration `prototype_packed_b.py`).
-
-**State** per element: one int32 = (`s_f` int16, `s_s` int8, `v` int8); per layer:
-exponents `e_r[N]`, `e_c[K]` with scale `s = 2^(e_r + e_c − 15)`, and AdaFactor vectors
-`v_row[N]`, `v_col[K]` (fp32, the only unpacked optimizer state, O(N+K)).
+Per weight, Concord is a **noisy, damped, driven particle** — a fluctuation–dissipation
+pair around a preconditioned gradient flow. The state is a slow position `P` (the weight
+you ship) and a velocity `u` (the live weight the network runs is `W = P + u`), plus one
+rank-1 second moment `v̂` per layer. Everything else in the kernel is the integer
+realization of this rule:
 
 ```text
-live weight    W = (s_f + 128·s_s + 128·v) · s      # what the forward uses
-deploy weight  D = (      128·s_s + 128·v) · s      # what gets saved
-velocity       W − D = s_f · s
+g̃   = g + σ·‖g‖·ξ ,   ξ ~ N(0, I)                   # fluctuation
+v̂   ← rank-1 EMA of g̃²   (AdaFactor, β₂ = 0.999)    # preconditioner
+coh = μ² / (μ² + (u − μ)²) ,   μ = C*·d              # Kalman gain: SNR of the velocity
+
+u ← u − lr·clip( g̃ / √(v̂ + ε), ±c )                 # drive: preconditioned gradient
+      − lr·κ·(1 − coh)·u                             # dissipation: friction on noise
+      + β1·coh·u                                     # optional momentum (default β1 = 0)
+
+P ← P + α·gc·u ,   u ← (1 − α·gc)·u                  # consolidation: continuous Lookahead
+      gc = φc + (1 − φc)·coh
 ```
 
-**Host schedules** (`winner_step`, before each forward; T = total steps, t = step):
+Line by line:
 
-```text
-f_t  = 0.2 + 0.4·(1 + cos(π·t/T))                   # cosine factor, 1 → lr_min_frac=0.2
-lr_t = lr_peak · f_t · min(1, (t+1)/100)            # warmup 100
-σ_t  = 0.6 · (1 − f_t)                              # rising-late noise
-φc_t : 0.9   → 0.1  cosine over T                   # chase gate floor
-φl_t : 0.999 → 0.1  cosine over T                   # leak gate floor
-```
+- **Fluctuation.** Isotropic gradient noise at magnitude σ·‖g‖ per layer, σ ramping
+  0 → 0.6 as the learning rate decays (rising-late). It is injected before v̂, so it passes
+  through the preconditioner. Its job is the classic one: keep shaking coordinates whose
+  gradient signal is incoherent so they can't settle into noise-fit minima.
+- **Preconditioner.** AdaFactor's factored second moment; the step is RMS-normalized and
+  clipped at c = 10. No first moment is stored anywhere.
+- **The gain.** The velocity is split into drift + noise. The drift prediction μ = C*·d
+  reads a telescope `d` maintained *inside* `P`: P's two halves relax toward each other at
+  α_v = 0.001 (gated like the chase, floor 0.999 → 0.1), so their gap is a long-window
+  record of consolidated motion — and `P` itself never moves from this. C* ≈ 0.00908 is
+  derived analytically so that u − μ is zero-mean under a pure-drift gradient stream,
+  which makes `coh = μ²/(μ² + (u−μ)²)` a true Wiener/Kalman gain on the velocity's SNR —
+  computed entirely from state already in the packed word.
+- **Dissipation.** Friction proportional to the estimated noise fraction: incoherent
+  velocity evaporates at rate lr·κ (κ = 50; lr-proportional, so the cosine schedule
+  self-fades the friction in the tail and late small signal isn't over-skimmed). Coherent
+  velocity feels no friction.
+- **Momentum (optional).** A coherence-gated heavy-ball term: only the coherent fraction
+  of the velocity is reinforced, so momentum can't run away on noise (ungated, it
+  diverges — the velocity is part of the live weight and feeds back through the
+  preconditioner). **Off (β1 = 0) in the validated winner.**
+- **Consolidation.** Lookahead's slow-weight update run every step instead of every k:
+  the position absorbs the fraction α·gc of the velocity (α = 0.1), gated by coherence
+  with a floor φc annealing 0.9 → 0.1 over the run. Note the emergent momentum: at full
+  coherence `u` recurses with factor (1 − α) = 0.9, so the chase alone gives coherent
+  weights a classic momentum memory even at β1 = 0 — and that memory *is* `W − P`.
 
-**Backward, per layer** (every integer write below is stochastically rounded, so the
-expectation equals the real-valued rule; quantization error is unbiased):
+**The fluctuation–dissipation pair is the validated win.** Noise pumps incoherent
+coordinates; friction drains them; only statistically coherent gradient signal survives to
+accumulate into `P` — and `P` is what you save (`consolidated_weight()` = drop `u`). On the
+same seed, each half contributed ≈ −0.02 deployed-sv (see the winning configuration above).
 
-```text
-1. g  = ∂L/∂W                                        # bf16 matmul in autograd
-2. g ← g + σ_t · ‖g‖ · ε/‖ε‖ ,  ε ~ N(0, I)          # isotropic noise, pre-everything
-3. v_row ← 0.999·v_row + 0.001·Σ_k g² ;  v_col likewise
-   v̂ = v_row ⊗ v_col / Σ v_row                       # AdaFactor rank-1 second moment
-
-4. in-register kernel, per element (mantissa units; order as written):
-   # Kalman-style gain from the timescale telescope (pre-update values)
-   μ̂   = C*·128·(s_s − v)          C* = L·ρ/(1 − L·α_v) ≈ 0.00908   (L = (1−α)/α = 9, ρ = α_v)
-   n   = s_f − μ̂                                     # innovation residual = noise estimate
-   coh = μ̂² / (μ̂² + n²)            ∈ [0,1]           # Wiener/Kalman gain
-
-   # gradient + dissipation (the only writes that move W)
-   s_f += −lr_t · clip(g/(v̂ + 1e-10)^0.5, ±10) / s   # AdaFactor-preconditioned step
-          −lr_t · 50 · (1 − coh) · s_f               # evaporate incoherent velocity
-
-   # chase = continuous Lookahead (W-invariant: pure mass transfer)
-   c    = α·[φc_t + (1 − φc_t)·coh]·s_f ,  α = 0.1
-   s_s += c/128 ;  s_f −= c
-
-   # leak = nested Lookahead (D-invariant: redistributes inside D, advances the telescope)
-   l    = α_v·[φl_t + (1 − φl_t)·coh]·128·(s_s − v) ,  α_v = 0.001
-   v   += l/128 ;  s_s −= l/128                       # mass-preserved
-
-   clamp s_f→int16, s_s,v→int8 ; repack ; emit W·s → bf16 buffer for the next forward
-
-5. rebalance (gated, post-step): any |mantissa| > 24000 → exponent +1, SR right-shift all fields
-```
-
-**The same rule in live-weight terms** — what the network actually experiences:
-
-```text
-W ← W − lr_t · clip(g̃ /√(v̂ + ε), ±10) − lr_t·κ·(1 − coh)·(W − D)      κ = 50
-D ← D + α·gatec·(W − D)                                               α = 0.1
-(inside D, v chases s_s at α_v — feeds the gate, invisible to W and D)
-```
-
-i.e. **AdaFactor-preconditioned SGD (no first moment — β1 = 0 in the winner), plus a
-coherence-gated decay of the live weight toward its own Lookahead slow weight, plus the
-slow weight continuously absorbing the coherent fraction of the velocity.** The gain
-`coh` is computed from state already in the packed word, the noise term σ_t feeds both
-the step and v̂, and the saved model is `D`, not `W`.
+**Making it exact.** The kernel runs this rule in integers, one int32 per weight: `u` is
+`s_fast`, `P = (s_slow + v_slow)·128`, the telescope `d = (s_slow − v_slow)·128`, all
+scaled by `2^(row_exp + col_exp − 15)`. Every write is stochastically rounded, so the
+expectation equals the rule above and quantization error is unbiased; consolidation
+transfers mass without moving `W`, so `W` changes only through the drive and the friction.
+Host schedules per step: cosine factor f = 0.2 + 0.4·(1 + cos πt/T); lr = lr_peak · f ·
+min(1, (t+1)/100); σ = 0.6·(1 − f); both gate floors anneal on the same cosine. Shared
+exponents rebalance (+1, with a stochastically-rounded right shift) only when a layer's
+mantissa exceeds 24000. The only optimizer state outside the packed word is v̂'s two
+O(N+K) vectors per layer.
 
 ## As shipped for SDXL (`concord-integration`)
 
