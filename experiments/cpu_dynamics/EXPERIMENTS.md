@@ -396,3 +396,30 @@ be re-amplified to unit spectral weight by NS), Muon's clean-data edge over the 
 arm (+0.5 — native's Euclidean β=0.95 momentum; a *pre*-NS gradient EMA would need
 state, which is the one thing this design refuses), Conv2d flattening, and the standard
 gates: multi-seed, the real bench, the GPU A/B.
+
+## Exp 9b — the fluctuation for the Muon drive: after NS, not before (`exp9b_muon_noise.py`)
+
+Exp 9 flagged the σ×NS interaction; this resolves the placement. MuonConcord (c=0) at
+each regime's Muon-arm κ\*, rising-late σ schedule as in the winner:
+
+| arm | clean (κ=0) | 30% noise (κ=100) |
+|---|---|---|
+| no noise (exp 9 ref) | 94.88 ± 0.01 | 92.02 ± 0.28 |
+| post-NS σ=0.3 | 94.87 ± 0.05 | 91.99 ± 0.22 |
+| post-NS σ=0.6 | 94.88 ± 0.06 | 91.98 ± 0.25 |
+| **pre-NS σ=0.6 (control)** | **94.61 ± 0.12** | **91.71 ± 0.28** |
+
+1. **Placement confirmed: pre-NS is the wrong place** — consistently worse in both
+   regimes (−0.27 / −0.31, ~2× seed spread). Noise before NS isn't a fluctuation; it
+   rotates the input direction and NS re-amplifies the rotation to unit spectral
+   weight. Post-NS (a perturbation of the step, σ in step-norm units) is the faithful
+   transplant of the winner's fluctuation.
+2. **Magnitude inert on this task family**: post-NS at σ ∈ {0.3, 0.6} is exactly
+   neutral — consistent with every MNIST test in this campaign (σ added nothing beyond
+   the dissipation in exps 3/4/8) and with the repo's own caveats about where σ earned
+   its keep (the nanoGPT regime: real Bayes error, heavy tails). A structural reading:
+   the cascade is noise-cancelling by design — isotropic post-step noise lands in `u`,
+   reads as incoherent, and is evaporated or averaged away; injected fluctuation only
+   pays when it does exploration work the task actually rewards.
+3. Design decision for the Muon arm: **σ goes after NS if it goes anywhere; whether it
+   goes anywhere is a nanoGPT-bench question.** No divergence at any setting.
