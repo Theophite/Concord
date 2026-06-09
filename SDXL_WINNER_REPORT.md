@@ -111,6 +111,79 @@ better). The winner is a **fluctuation–dissipation pair on top of the bare rec
 
 `WINNING_CONFIG.md` on `main` is the single source of truth for every number above.
 
+## The update rule, exactly
+
+Per swapped layer, per step, at the winner configuration (accumulation 1; UNet path:
+`β1 = 0`, `weight_decay = wd_sv = wd_sf = 0`, `v_scale = 0`, `δ² = 1`, `p = 0.5`,
+`gate_gain = 1`). Kernel: `_apply_packed_adamw_kernel`; noise + v̂ update:
+`PackedLinearFn.backward` (integration `prototype_packed_b.py`).
+
+**State** per element: one int32 = (`s_f` int16, `s_s` int8, `v` int8); per layer:
+exponents `e_r[N]`, `e_c[K]` with scale `s = 2^(e_r + e_c − 15)`, and AdaFactor vectors
+`v_row[N]`, `v_col[K]` (fp32, the only unpacked optimizer state, O(N+K)).
+
+```text
+live weight    W = (s_f + 128·s_s + 128·v) · s      # what the forward uses
+deploy weight  D = (      128·s_s + 128·v) · s      # what gets saved
+velocity       W − D = s_f · s
+```
+
+**Host schedules** (`winner_step`, before each forward; T = total steps, t = step):
+
+```text
+f_t  = 0.2 + 0.4·(1 + cos(π·t/T))                   # cosine factor, 1 → lr_min_frac=0.2
+lr_t = lr_peak · f_t · min(1, (t+1)/100)            # warmup 100
+σ_t  = 0.6 · (1 − f_t)                              # rising-late noise
+φc_t : 0.9   → 0.1  cosine over T                   # chase gate floor
+φl_t : 0.999 → 0.1  cosine over T                   # leak gate floor
+```
+
+**Backward, per layer** (every integer write below is stochastically rounded, so the
+expectation equals the real-valued rule; quantization error is unbiased):
+
+```text
+1. g  = ∂L/∂W                                        # bf16 matmul in autograd
+2. g ← g + σ_t · ‖g‖ · ε/‖ε‖ ,  ε ~ N(0, I)          # isotropic noise, pre-everything
+3. v_row ← 0.999·v_row + 0.001·Σ_k g² ;  v_col likewise
+   v̂ = v_row ⊗ v_col / Σ v_row                       # AdaFactor rank-1 second moment
+
+4. in-register kernel, per element (mantissa units; order as written):
+   # Kalman-style gain from the timescale telescope (pre-update values)
+   μ̂   = C*·128·(s_s − v)          C* = L·ρ/(1 − L·α_v) ≈ 0.00908   (L = (1−α)/α = 9, ρ = α_v)
+   n   = s_f − μ̂                                     # innovation residual = noise estimate
+   coh = μ̂² / (μ̂² + n²)            ∈ [0,1]           # Wiener/Kalman gain
+
+   # gradient + dissipation (the only writes that move W)
+   s_f += −lr_t · clip(g/(v̂ + 1e-10)^0.5, ±10) / s   # AdaFactor-preconditioned step
+          −lr_t · 50 · (1 − coh) · s_f               # evaporate incoherent velocity
+
+   # chase = continuous Lookahead (W-invariant: pure mass transfer)
+   c    = α·[φc_t + (1 − φc_t)·coh]·s_f ,  α = 0.1
+   s_s += c/128 ;  s_f −= c
+
+   # leak = nested Lookahead (D-invariant: redistributes inside D, advances the telescope)
+   l    = α_v·[φl_t + (1 − φl_t)·coh]·128·(s_s − v) ,  α_v = 0.001
+   v   += l/128 ;  s_s −= l/128                       # mass-preserved
+
+   clamp s_f→int16, s_s,v→int8 ; repack ; emit W·s → bf16 buffer for the next forward
+
+5. rebalance (gated, post-step): any |mantissa| > 24000 → exponent +1, SR right-shift all fields
+```
+
+**The same rule in live-weight terms** — what the network actually experiences:
+
+```text
+W ← W − lr_t · clip(g̃ /√(v̂ + ε), ±10) − lr_t·κ·(1 − coh)·(W − D)      κ = 50
+D ← D + α·gatec·(W − D)                                               α = 0.1
+(inside D, v chases s_s at α_v — feeds the gate, invisible to W and D)
+```
+
+i.e. **AdaFactor-preconditioned SGD (no first moment — β1 = 0 in the winner), plus a
+coherence-gated decay of the live weight toward its own Lookahead slow weight, plus the
+slow weight continuously absorbing the coherent fraction of the velocity.** The gain
+`coh` is computed from state already in the packed word, the noise term σ_t feeds both
+the step and v̂, and the saved model is `D`, not `W`.
+
 ## As shipped for SDXL (`concord-integration`)
 
 The fork is stock OneTrainer unless you pick the **CONCORD** optimizer. The preset
