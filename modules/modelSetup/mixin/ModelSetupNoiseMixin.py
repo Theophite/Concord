@@ -83,7 +83,7 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
             timestep: Tensor | None = None,
             betas: Tensor | None = None,
     ) -> Tensor:
-        if getattr(config, "weighted_antithetic_timesteps", False):
+        if getattr(config, "concord_antithetic_noise", False):
             # Antithetic noise eps/-eps: pair sample i with i+B/2 (same split as the antithetic
             # timesteps) so each pair carries both signs -> cancels the odd-in-eps cross term
             # (-2<eps, eps_theta>) variance. Marginally still N(0,I), so the objective is unchanged.
@@ -166,6 +166,41 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
         u = self._draw_quantile_antithetic(batch_size, generator, device)
         idx = torch.searchsorted(cdf, u.to(cdf.dtype)).clamp(max=cdf.numel() - 1)
         return (min_t + idx).to(torch.long)
+
+    def _concord_duplicate_first_half(self, batch):
+        """Same-example antithetic: copy each per-example batch entry's first half over its
+        second half, so example i and i+B/2 are the SAME example. The antithetic timestep/noise
+        pairing (i <-> i+B/2) then pairs each example with itself. Batch size is unchanged; needs
+        even B (no-op otherwise). Handles tensors [B,...] and [...,B] and (nested) lists/tuples of
+        such. A runtime guard asserts the latents + tokens actually paired -- if the batch layout
+        is unexpected, fail loudly rather than train on a silently-mismatched batch."""
+        ref = batch.get('latent_image')
+        if not torch.is_tensor(ref) or ref.shape[0] % 2 != 0:
+            return batch
+        b = ref.shape[0]
+        h = b // 2
+
+        def dup(v):
+            if torch.is_tensor(v):
+                if v.ndim >= 1 and v.shape[0] == b:
+                    return torch.cat([v[:h], v[:h]], dim=0)
+                if v.ndim >= 1 and v.shape[-1] == b:        # e.g. resolutions stored as [.., B]
+                    return torch.cat([v[..., :h], v[..., :h]], dim=-1)
+                return v
+            if isinstance(v, (list, tuple)):
+                return type(v)(dup(e) for e in v)
+            return v
+
+        out = {k: dup(v) for k, v in batch.items()}
+        li = out['latent_image']
+        assert torch.equal(li[:h], li[h:2 * h]), \
+            "concord_antithetic_same_example: latent_image not paired (unexpected batch layout)"
+        for tk in ('tokens_1', 'tokens_2'):
+            t = out.get(tk)
+            if torch.is_tensor(t) and t.ndim >= 1 and t.shape[0] == b:
+                assert torch.equal(t[:h], t[h:2 * h]), \
+                    f"concord_antithetic_same_example: {tk} not paired"
+        return out
 
     def _get_timestep_discrete(
             self,

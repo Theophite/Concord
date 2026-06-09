@@ -206,6 +206,14 @@ class BaseStableDiffusionXLSetup(
 
             vae_scaling_factor = model.vae.config['scaling_factor']
 
+            # Same-example antithetic (opt-in): duplicate the first half of the batch so example
+            # i and i+B/2 are identical -> the antithetic timestep/noise pairing runs each example
+            # through twice at antithetic (t, eps). Done before the text encode so tokens duplicate
+            # too. Default off (cross-example pairing, which tested better).
+            if config.concord_antithetic_same_example and config.concord_antithetic_timesteps \
+                    and not deterministic:
+                batch = self._concord_duplicate_first_half(batch)
+
             # Stage 3 v2 TE-graph (return_raw_inputs): the text encoder is captured INSIDE
             # the CUDA graph from the raw tokens, so skip the eager TE forward here.
             text_encoder_output = pooled_text_encoder_2_output = None
@@ -245,7 +253,7 @@ class BaseStableDiffusionXLSetup(
                     model.noise_scheduler.alphas_cumprod,
                     config.loss_weight_strength,
                     model.noise_scheduler.config.prediction_type == 'v_prediction',
-                ) if (config.weighted_antithetic_timesteps
+                ) if (config.concord_antithetic_timesteps
                       and config.loss_weight_fn == LossWeight.MIN_SNR_GAMMA
                       and not config.resolution_aware_loss_weight) else None,
             )

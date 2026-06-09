@@ -294,7 +294,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 case LossWeight.CONSTANT:
                     pass
                 case LossWeight.MIN_SNR_GAMMA:
-                    if (getattr(config, "weighted_antithetic_timesteps", False)
+                    if (getattr(config, "concord_antithetic_timesteps", False)
                             and not getattr(config, "resolution_aware_loss_weight", False)):
                         # min-SNR weight already folded into the timestep sampler (importance
                         # sampling); apply only the scalar mean-weight rescale so the expected
