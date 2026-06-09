@@ -353,3 +353,46 @@ same peak lr and schedule, 4k × 25 epochs, 3 seeds (`exp8_results.json`,
    preconditioner/deploy-weight machinery contributes independently of the friction.
 4. Same caveats as the whole series: CPU reference, one task/architecture, 3 seeds,
    task-calibrated probe table; the GPU nanoGPT A/B remains the adoption gate.
+
+## Exp 9 — Muon from the packed state (`exp9_muon.py`)
+
+The hypothesis (the manifold-Lookahead argument): the velocity is already the momentum
+buffer, so the spectral preconditioner comes free — orthogonalize via NS5 (a retraction
+onto the polar manifold), let the chase do the averaging. Arms at each regime's own
+κ\* (σ off everywhere; lr untuned per arm; AdamW reference from exp 8):
+
+| arm | clean (own κ\*) | 30% noise (own κ\*) | noise memorized |
+|---|---|---|---|
+| AdamW | 92.78 | 89.15 | 19.3% |
+| Concord, v̂ drive | 93.66 (κ=0) | 90.77 (κ=400) | 12.4% |
+| **Concord, NS drive (c=0)** | **94.88 ± 0.01 (κ=0)** | **92.02 ± 0.28 (κ=100)** | 12.2% |
+| native Muon (Euclidean, β=0.95) | **95.40 ± 0.10** | 82.32 ± 0.60 | **100.0%** |
+
+1. **Native Muon is a memorization machine under label noise**: 100.0% of wrong labels
+   fit, clean-test collapse to 82.3. Spectral whitening democratizes directions — and
+   wrong-label gradients live in exactly the rare directions it amplifies. (It is also
+   the best clean-data optimizer at this protocol, consistent with its LM reputation.)
+2. **The Concord cascade completely tames that pathology**: same NS5 drive inside the
+   gate/friction/deploy machinery memorizes 10–14% instead of 100%, and at its own
+   κ\* = 100 **beats every arm tested under noise** (+1.25 over the v̂ drive's oracle,
+   +2.9 over AdamW) while also beating the v̂ drive on clean (+1.2). Zero additional
+   persistent state — the NS5 pass is transient (and per-element scale-free after
+   dequant; the only resident cost remains the 32-bit word). v̂, its O(N+K) vectors,
+   and its EMA pass are deleted in this arm.
+3. **The momentum blend was wrong; the Lookahead idiom was right.** Blending the
+   velocity into the NS input (NS(c·û + ĝ), c > 0) is a self-reinforcing direction
+   loop — |u| grows ~20×, telescope coherence falls 0.48 → 0.37, consolidation
+   throttles, clean accuracy falls monotonically with c (94.88 / 93.54 / 90.93 at
+   c = 0/1/3). The resolution: the chase already IS the EMA. Positions integrate
+   orthogonalized directions; retraction is needed on *directions*, not positions; so
+   per-step NS(ĝ) + chase is the correct manifold-Lookahead composition, and no
+   Euclidean momentum belongs in the drive.
+4. **κ\* is drive-dependent** (NS: 100; v̂: 400 at this noise level) — the NS tick is
+   unit-RMS by construction, so friction is more effective per unit κ. Any autotune
+   table is per-drive, like everything else about it.
+
+Open before kernel work: the σ/fluctuation interaction (off here; injected noise would
+be re-amplified to unit spectral weight by NS), Muon's clean-data edge over the NS-c0
+arm (+0.5 — native's Euclidean β=0.95 momentum; a *pre*-NS gradient EMA would need
+state, which is the one thing this design refuses), Conv2d flattening, and the standard
+gates: multi-seed, the real bench, the GPU A/B.
