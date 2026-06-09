@@ -27,7 +27,7 @@ fine-tune (not LoRA) in ~15 GB**.
 | where | what |
 |---|---|
 | [`concord/`](concord/) | **the canonical package** — `packed_b.py` is the optimizer (layers, Triton kernels, coherence meter, dissipation autotuner) |
-| [`docs/`](docs/) | current reports: [`SDXL_WINNER_REPORT.md`](docs/SDXL_WINNER_REPORT.md) (what it is) → [`HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md) (mechanism deep-dive) → [`RESULTS.md`](docs/RESULTS.md) (measured dynamics & autotuning) → [`INSTALL_SDXL.md`](docs/INSTALL_SDXL.md) (porting into the fork) |
+| [`docs/`](docs/) | current reports: [`SDXL_WINNER_REPORT.md`](docs/SDXL_WINNER_REPORT.md) (what it is) → [`HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md) (mechanism deep-dive) → [`RESULTS.md`](docs/RESULTS.md) (measured dynamics & autotuning) → [`INSTALL_SDXL.md`](docs/INSTALL_SDXL.md) (porting into the fork), [`BIBLIOGRAPHY.md`](docs/BIBLIOGRAPHY.md) (Concord in the literature) |
 | [`WINNING_CONFIG.md`](WINNING_CONFIG.md) | single source of truth for the validated configuration |
 | [`experiments/cpu_dynamics/`](experiments/cpu_dynamics/) | the active CPU experiment suite: reference implementation, exps 1–8, parity tests, lab log |
 | [`dist/concord_winner/`](dist/concord_winner/) | frozen snapshot of the distilled winner (bug fixes are synced in; no new features) |
