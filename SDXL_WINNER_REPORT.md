@@ -1,0 +1,126 @@
+# Concord: what it does, centered on the SDXL winning configuration
+
+A condensed map of this repository. Two branches, one idea:
+
+- **`main`** — the research repo where the Concord optimizer was developed and validated:
+  closed-loop simulations (`sims/`), CIFAR/nanoGPT/T5 ablations (`src/`), the distilled
+  winner package (`dist/concord_winner/`, `concord/`), and `WINNING_CONFIG.md` (the exact
+  validated configuration, with provenance).
+- **`concord-integration`** — a full fork of [OneTrainer](https://github.com/Nerogar/OneTrainer)
+  with that winner wired into the SDXL fine-tuning path. The deliverable: a **full SDXL UNet
+  fine-tune (not LoRA) in ~15 GB**, fitting a 24 GB card with headroom.
+
+## The idea
+
+A normal AdamW fine-tune pays 3–4× the weight memory for optimizer state: an fp32 master
+copy plus two moment tensors. Concord stores **everything in one int32 per weight** — the
+weight *is* the optimizer state:
+
+```
+bits 31..16  s_fast  (int16)  fast accumulator — catches each step's gradient
+bits 15..8   s_slow  (int8)   consolidated position
+bits  7..0   v_slow  (int8)   long-time anchor
+
+weight = (s_slow·128 + s_fast + v_slow·128) · 2^(row_exp + col_exp − 15)
+```
+
+The shared per-row/per-column exponents give the ~17-bit signed mantissa its dynamic range
+(finer than bf16's 8-bit mantissa, at the same 32 bits/param as the raw weights alone).
+
+Three mechanisms make this an optimizer rather than just a quantization format:
+
+1. **Self-stepping backward.** Every swapped `nn.Linear`/`nn.Conv2d` is an autograd
+   `Function`; the moment its gradient exists, a Triton kernel folds it into the packed
+   accumulators with stochastic rounding (unbiased low-bit accumulation). There is no
+   `optimizer.step()` for these layers — only the non-swapped leftovers (norms, biases,
+   embeddings) see a plain SGD.
+2. **Timescale gaps replace Adam's moments.** The fast→slow "chase" (α = 0.1) and
+   slow→anchor "leak" (α_v = 0.001) are mass-preserving redistributions; the gaps between
+   the fields carry the gradient's variance and drift — the same signal Adam reads from its
+   second moment — without storing one. A coherence gate scales each step by how consistent
+   the gradient direction has been. Net behavior: a factored, variance-adaptive AdamW
+   (rank-1 v̂, sqrt preconditioner) read from and written back into that one int32.
+3. **Fused dequant-matmul.** The forward reconstructs the bf16 weight *inside* the Triton
+   matmul, so no persistent bf16 weight copy exists (~5 GB saved on SDXL: ~15 GB footprint
+   fused vs ~20 GB cached).
+
+## The winning configuration
+
+Validated on `main` by same-seed A/B (nanoGPT-char; metric is deployed-sv, lower is
+better). The winner is a **fluctuation–dissipation pair on top of the bare recipe**:
+
+| arm | deployed-sv | Δ |
+|---|---|---|
+| bare recipe (rank-1 v̂ AdamW + fixed coherence gate) | 1.5404 | — |
+| + split dissipation (`ratio_coh`, chase/leak floors → 0.1, `gf_consol 50`) | 1.5180 | −0.022 |
+| **+ isotropic noise σ = 0.6 (`sf_060`, the winner)** | **1.4967** | −0.021 |
+| AdamW baseline (32 b/param) | ~1.534 | |
+| native Muon | ~1.578 | |
+
+- **Dissipation** — coherence-gated friction. `gf_consol 50` evaporates low-coherence
+  (noisy) mass from the fast field back toward the anchor each step; confident params are
+  untouched. The live coherence-ratio gate (`ratio_coh`) replaces the EMA side-buffer, keeping
+  the state at a true 32 b/param. Chase/leak gate floors cosine-decay 0.9/0.999 → 0.1 over
+  ~1 epoch. This Δ (−0.022) is deterministic same-seed: real.
+- **Fluctuation** — isotropic white noise, peak σ = 0.6, rising-late schedule, injected in
+  the fused backward off the deploy weight. Single-seed Δ (−0.021) with ~0.01 trajectory
+  jitter — mechanism solid, magnitude wants multi-seed confirmation. (The ablation refuted
+  structured Σ_g noise: isotropic ≥ Σ_g.)
+- **Deploy** — exported weights are `consolidated_weight() = (s_slow + v_slow)·128·2^exp`,
+  i.e. **drop `s_fast`**. Shedding the fast velocity at save time is part of the win; saved
+  checkpoints are ordinary SDXL safetensors.
+
+`WINNING_CONFIG.md` on `main` is the single source of truth for every number above.
+
+## As shipped for SDXL (`concord-integration`)
+
+The fork is stock OneTrainer unless you pick the **CONCORD** optimizer. The preset
+`training_presets/#SDXL Concord Fused 24GB.json` is the winner applied to SDXL:
+
+| setting | value | why |
+|---|---|---|
+| optimizer | CONCORD, winner knobs baked in (`gf_consol 50`, `ratio_coh`, `sigmag_peak 0.6`, `warmup 100`, `lr_min_frac 0.2`) | the sf_060 arm |
+| learning rate | 7.5e-5, cosine | fine-tune scale of the validated schedule shape |
+| layer filter | `attn-mlp` preset | swap only attention + MLP Linears (794 layers); the rest stay standard and frozen |
+| precision / batch | bf16, batch 1, accumulation 1, gradient checkpointing, latent caching | the CUDA-graph-capturable configuration |
+| `concord_fused_matmul` | on | dequant inside the matmul; ~15 GB instead of ~20 GB |
+| `concord_cuda_graph` | on | manual capture of predict → loss → backward (+ the fused self-step) for batch-size-1 throughput; fresh noise injected per replay |
+| diffusion recipe | offset noise 0.0357, input perturbation 0.01, inverted-parabola timesteps | wired through both the eager and captured-graph paths |
+
+Supporting machinery added by the integration:
+
+- **Controller** (`concord_winner.py`) — per-step warmup/cosine LR, rising-late σ, decaying
+  coherence floors, all held in device tensors so CUDA-graph replays see live values
+  (a scalar would freeze at its capture-time value — a bug that was actually hit).
+- **Gated rebalance** — the shared exponents re-center only when a layer's mantissa actually
+  approaches overflow (`MAX_M = 24000`); one reduction replaces 794 per-layer kernel
+  launches per step in the common no-op case (~1.8× faster iteration).
+- **Token control plane** — declaratively train / freeze / zero individual text-encoder
+  tokens (`concord_sanitize_tokens`), branch-free and graph-safe; new tokens train through
+  the same packed core.
+- **Frozen-anchor TE** (newest) — CLIP-L trains as an elastic delta around its pretrained
+  weights pinned in `v_slow`, with `wd_anchor` pulling the delta home.
+- **Save/resume bridges** — final saves consolidate packed layers back into standard
+  `nn.Linear`/`nn.Conv2d` (checkpoints load as ordinary SDXL anywhere); backups carry the
+  full packed state and resumes restore it bit-exactly, resyncing the weight cache.
+- **Contiguous aspect bucketing** — keeps each resolution bucket a contiguous run so the
+  CUDA graph isn't recaptured on every shape change.
+
+Where the code lives: `modules/util/optimizer/concord/prototype_packed_b.py` (the packed
+layers + Triton kernels, the core), `concord_winner.py` + `control_plane.py` (controller and
+token plane), `modules/util/optimizer/concord_graph.py` (graph capture),
+`modules/modelSetup/StableDiffusionXLFineTuneSetup.py` (the SDXL wiring).
+
+## Status and caveats
+
+- SDXL full fine-tuning is functional with validated samples; everything outside that path
+  is stock OneTrainer behavior, rough edges expected.
+- The dissipation gain is confirmed deterministic same-seed; the noise gain (σ = 0.6) is
+  single-seed on nanoGPT — multi-seed it on the target task before treating the magnitude
+  as load-bearing.
+- The codebase carries deliberate scar tissue: env-gated probes (`CONCORD_MEMLOG`,
+  `CONCORD_GRAPHMEM`), ablated mechanisms left as off-by-default knobs, comments documenting
+  past failures (int8 `s_fast` saturation, the tick-down oscillation, graph-replay scalar
+  freezing), and a restart-on-sample wrapper that works around CUDA-graph memory-pool
+  fragmentation. Fallbacks are layered: fused → cached matmul, graph → eager, and every
+  save path restores training state in `finally`.
