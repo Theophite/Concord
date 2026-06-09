@@ -423,3 +423,44 @@ each regime's Muon-arm κ\*, rising-late σ schedule as in the winner:
    pays when it does exploration work the task actually rewards.
 3. Design decision for the Muon arm: **σ goes after NS if it goes anywhere; whether it
    goes anywhere is a nanoGPT-bench question.** No divergence at any setting.
+
+## Exp 9c — the Muon drive obsoletes the trust region and step cap (`exp9c_muon_unbounded.py`)
+
+The exp-9 Muon arm already ran with neither (the v̂ denominator IS the winner's trust
+region; the NS drive replaced it wholesale, unclamped). This supplies the receipts.
+
+**(a) Per-element |step| tails over training** (seed 0):
+
+| drive | rms | p99.9 | max | cap=10 binds |
+|---|---|---|---|---|
+| NS, clean | 0.66 | 2.88 | **6.7** | — (no cap) |
+| NS, 30% noise | 0.75 | 3.11 | **6.6** | — (no cap) |
+| v̂ pre-clamp, clean | 1.51 | 9.12 | **323** | 1.58% of elements |
+| v̂ pre-clamp, 30% noise | 2.22 | 12.95 | **406** | 1.73% of elements |
+
+The NS step is self-bounded exactly as the spectral argument predicts: its all-training
+max (6.7) never reaches the old cap, and is noise-level-independent. The v̂ drive's cap
+is meanwhile doing constant, real work — binding on ~1.6% of elements every step, with
+pre-clamp tails 30–40× past it. **Cap and trust region: required by v̂, dead weight for
+NS.**
+
+**(b) lr stability sweep** (κ = 0, clean, deploy acc; v̂ keeps its cap, NS has none):
+
+| lr | 1e-3 | 3e-3 | 1e-2 | 3e-2 | 1e-1 |
+|---|---|---|---|---|---|
+| v̂ (capped) | 93.66 | 94.59 | 94.68 | 93.06 | 78.05 ± 10.31 |
+| **NS (capless)** | 94.84 | 95.89 | **96.07 ± 0.05** | 95.38 | **95.14 ± 0.30** |
+
+1. **The spectral bound is a better trust region than the trust region**: the capless
+   NS drive is stable and strong across two orders of magnitude of lr (95.1–96.1 from
+   1e-3 to 1e-1), while the *capped* v̂ drive degrades past 1e-2 and effectively breaks
+   at 1e-1 (±10.3 seed spread — the cap prevents NaN but not collapse).
+2. **New best on this protocol**: NS at its own lr (1e-2) reaches 96.07 ± 0.05 — above
+   native Muon's 95.40 (lr 1e-3; not lr-swept — caveat) and +1.4 over the v̂ drive's
+   own lr-swept best. Exp 9's Muon-arm numbers were an lr handicap, not a ceiling.
+3. **Kernel implication**: the Muon-arm apply kernel needs no `v_row`/`v_col`/
+   `sum_v_inv`, no `eps`, no `step_cap` — tick + gate + friction + chase + leak only.
+   The lr·κ < 2 friction ceiling is drive-independent and still applies when κ > 0
+   (at lr = 0.1 it caps κ at 20 — high-lr + heavy-noise needs that arithmetic done).
+4. Caveats: sweep is κ = 0 / clean only, 3 seeds, this protocol; the noisy-regime lr
+   envelope (where κ > 0 re-enters) is unswept.
