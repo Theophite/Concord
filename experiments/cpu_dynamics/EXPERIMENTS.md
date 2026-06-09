@@ -286,3 +286,43 @@ docstring: the table is task-calibrated; the probe window must match the calibra
 window and sit after the init-consolidation transient; under a captured CUDA graph,
 gf_consol is baked at capture time (probe eagerly, then capture — or port κ to a device
 tensor like lr/σ/floors when wiring into the Stage-3 graph).
+
+## Exp 7 — coherence-gated momentum (β1) under autotuned dissipation (`exp7_beta1_sweep.py`)
+
+The winner ships β1 = 0 (the kernel notes ungated momentum diverges; the gated term was
+left off). Both decisions predate the C\* rescale, so: sweep β1 ∈ {0…0.8} with the v2.1
+autotuner active, clean and 30%-label-noise regimes, 3 seeds
+(`exp7_results.json`, `exp7_joint_results.json`).
+
+| β1 (coh-gated) | clean deploy | 30%-noise deploy | noise memorized |
+|---|---|---|---|
+| 0.00 | 93.53 ± 0.05 | **90.53 ± 0.21** | 19.1% |
+| 0.05 | 93.52 ± 0.06 | 90.09 ± 0.25 | 21.5% |
+| **0.10** | **93.68 ± 0.04** | 88.83 ± 0.60 | 28.6% |
+| 0.20 | 93.27 ± 0.08 | 87.30 ± 0.96 | 32.6% |
+| 0.40 | 92.98 ± 0.12 | 84.32 ± 1.45 | 38.9% |
+| 0.80 | 92.83 ± 0.06 | 79.54 ± 1.32 | 45.1% |
+
+1. **β1 = 0.10 works on clean streams**: +0.15 over β1 = 0 (outside seed spread), the
+   best clean result in this whole series — and it sits exactly at the linear
+   critical-damping boundary `(1+β1)(1−α) ≈ 1`: coherent velocity is sustained, not
+   amplified.
+2. **No β1 > 0 survives label noise.** Even 0.05 is negative at ρ = 10% (92.47 vs
+   92.71), and 0.10 drives memorization 23% → 43%. The mechanism is the gate's known
+   blind spot: memorization drift is coherent, and momentum is a coherence
+   *amplifier*. A sharper gate (β1·coh², tested) softens but does not fix it
+   (89.44 vs 88.83 vs 90.53-at-β1=0 at ρ = 30%).
+3. **Nothing diverged, even at β1 = 0.8** — not only the gate's self-limiting, but the
+   autotuner acting as a stability governor: excess momentum reads as velocity
+   incoherence at the probe, so the tuner commits high κ and the friction contains it
+   (committed κ on clean: 0 → 41 → 400 as β1 rises past 0.1).
+4. **The probe can pick β1 too.** Joint rule — one probe commits κ from the table *and*
+   β1 = 0.1 iff probe coh ≥ 0.35 — gets the best of both with zero regressions:
+   ρ = 0: 93.66 (β1 on); ρ = 5% (held out): 93.11 (correctly off, κ → 67);
+   ρ = 10%: 92.72; ρ = 30%: 90.53 (both identical to β1 = 0 baselines). Momentum only
+   where the stream is clean, never under noise — selected by measurement, not by the
+   user.
+
+The β1 = 0 default is vindicated for Concord's target regimes (noisy LM/diffusion
+streams); the measured exception (β1 = 0.1 on clean streams, probe-selected) is one
+task deep — gate any adoption on the nanoGPT A/B, like the rest.
