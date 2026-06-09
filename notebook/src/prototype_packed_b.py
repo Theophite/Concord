@@ -50,7 +50,8 @@ V_SLOW_FACTOR = 128
 
 
 def compute_drift_cancel_C(alpha, alpha_v_fast,
-                              alpha_v_slow=0.0, refit_period=1):
+                              alpha_v_slow=0.0, refit_period=1,
+                              mass_preserve=True):
     """Drift-cancellation coefficient C* that zeroes E[noise] under
     a pure-drift gradient stream (μ = E[a_t], no noise).
 
@@ -81,6 +82,23 @@ def compute_drift_cancel_C(alpha, alpha_v_fast,
     """
     L = (1.0 - alpha) / max(alpha, 1e-12)
     rho = alpha_v_fast + alpha_v_slow / max(refit_period, 1)
+    if mass_preserve:
+        # Mass-preserve correction (2026-06-09): the MASS_PRESERVE leak
+        # debits s_slow as well as crediting v_slow, so the telescope
+        # d = s_slow - v_slow relaxes at 2*rho per step. Fixed point of
+        # the kernel recursion (tick -> chase -> leak) under pure drift mu:
+        #     E[d_fs] = mu*L                    (unchanged)
+        #     d' = (1 - 2*rho)*(d + mu)  ->  E[d_sv] = mu*(1 - 2*rho)/(2*rho)
+        #     C* = L*2*rho / (1 - 2*rho)        (~2x the legacy value)
+        # With the legacy C* the drift prediction reads ~half the true lag
+        # and pure-drift coherence saturates near 0.5 (0.3 with the ratio
+        # floors annealed) instead of ~1 -- the gate ran half-blind to
+        # genuine signal. CPU fixed-point + simulation validation:
+        # experiments/cpu_dynamics/EXPERIMENTS.md (drift coh 0.55 -> 0.98,
+        # pure-noise control unchanged). The non-mass-preserve branch keeps
+        # the legacy formula.
+        rho2 = 2.0 * rho
+        return L * rho2 / (1.0 - rho2)
     return L * rho / (1.0 - L * alpha_v_fast)
 
 
@@ -1060,7 +1078,8 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
     same asymptotic max step as the legacy hard clamp, smoothly.
     """
     if drift_cancel_C is None:
-        drift_cancel_C = compute_drift_cancel_C(alpha, alpha_v_fast)
+        drift_cancel_C = compute_drift_cancel_C(alpha, alpha_v_fast,
+                                                mass_preserve=mass_preserve)
     N, K = packed_w.shape
     assert packed_w.dtype == torch.int32
     assert grad_W.dtype == torch.bfloat16
@@ -1620,7 +1639,8 @@ class ConcordLinearPackedB(nn.Module):
         # If callers change alpha or alpha_v_fast (or add periodic leak),
         # they should recompute via compute_drift_cancel_C.
         self.drift_cancel_C = compute_drift_cancel_C(
-            alpha, self.alpha_v_fast)
+            alpha, self.alpha_v_fast,
+            mass_preserve=True)   # matches mass_preserve_v default below
         # Adafactor row/col second-moment EMAs in g² units. Used for
         # the per-weight v̂_ij = v_row_i·v_col_j / Σ_k v_row_k denominator
         # of the garbage fraction Var(ḡ_ij) / E[ḡ_ij²] ∈ [0,1]. β2=0.999

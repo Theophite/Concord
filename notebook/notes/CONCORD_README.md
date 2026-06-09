@@ -1,3 +1,8 @@
+> **HISTORICAL (pre-packed-B).** This documents the predecessor design — 40 bits/param,
+> separate int16+int16+int8 accumulators, `CONCORD_SGD` — superseded by the packed-B
+> winner (32 bits/param, one int32; see `/docs/HOW_IT_WORKS.md`). Kept for the design
+> rationale (Bayesian-anchored wd, drift-cancel derivation history) referenced elsewhere.
+
 # Concord AdamW
 
 Storage-efficient AdamW: **40 bits per parameter** of optimizer state vs

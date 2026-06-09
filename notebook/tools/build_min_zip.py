@@ -15,11 +15,12 @@ Compress-Archive (no `zip` binary on this box).
 import os
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # notebook/
+REPO = os.path.dirname(ROOT)        # repo root (notebook/ holds the research tree)
 SRC = os.path.join(ROOT, "src", "prototype_packed_b.py")
-OUT = os.path.join(ROOT, "dist", "concord_min", "concord_optimizer_min")
+OUT = os.path.join(REPO, "dist", "concord_min", "concord_optimizer_min")
 PKG = os.path.join(OUT, "concord")
-LOG = os.path.join(ROOT, "compare_out", "min_build.log")
+LOG = os.path.join(REPO, "compare_out", "min_build.log")
 
 log_lines = []
 def log(m): log_lines.append(str(m))
