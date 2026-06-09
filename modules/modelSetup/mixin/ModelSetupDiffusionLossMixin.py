@@ -294,7 +294,14 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 case LossWeight.CONSTANT:
                     pass
                 case LossWeight.MIN_SNR_GAMMA:
-                    losses *= self.__min_snr_weight(data['timestep'], config.loss_weight_strength, v_pred, losses.device)
+                    if (getattr(config, "weighted_antithetic_timesteps", False)
+                            and not getattr(config, "resolution_aware_loss_weight", False)):
+                        # min-SNR weight already folded into the timestep sampler (importance
+                        # sampling); apply only the scalar mean-weight rescale so the expected
+                        # gradient AND the effective LR are unchanged (a pure variance reduction).
+                        losses = losses * getattr(self, "_tw_mean_w", 1.0)
+                    else:
+                        losses *= self.__min_snr_weight(data['timestep'], config.loss_weight_strength, v_pred, losses.device)
                 case LossWeight.DEBIASED_ESTIMATION:
                     losses *= self.__debiased_estimation_weight(data['timestep'], v_pred, losses.device)
                 case LossWeight.P2:

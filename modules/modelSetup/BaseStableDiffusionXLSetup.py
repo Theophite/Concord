@@ -18,6 +18,7 @@ from modules.util.checkpointing_util import (
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.conv_util import apply_circular_padding_to_conv2d
 from modules.util.dtype_util import create_autocast_context, disable_fp16_autocast_context
+from modules.util.enum.LossWeight import LossWeight
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.quantization_util import quantize_layers
 from modules.util.torch_util import torch_gc
@@ -240,6 +241,13 @@ class BaseStableDiffusionXLSetup(
                 generator,
                 scaled_latent_image.shape[0],
                 config,
+                snr_weight_ctx=(
+                    model.noise_scheduler.alphas_cumprod,
+                    config.loss_weight_strength,
+                    model.noise_scheduler.config.prediction_type == 'v_prediction',
+                ) if (config.weighted_antithetic_timesteps
+                      and config.loss_weight_fn == LossWeight.MIN_SNR_GAMMA
+                      and not config.resolution_aware_loss_weight) else None,
             )
 
             latent_noise = self._create_noise(

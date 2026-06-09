@@ -467,6 +467,7 @@ class TrainConfig(BaseConfig):
 
     timestep_shift: float
     dynamic_timestep_shifting: bool
+    weighted_antithetic_timesteps: bool
 
     # unet
     unet: TrainModelPartConfig
@@ -1060,6 +1061,7 @@ class TrainConfig(BaseConfig):
         data.append(("noising_bias", 0.0, float, False))
         data.append(("timestep_shift", 1.0, float, False))
         data.append(("dynamic_timestep_shifting", False, bool, False))
+        data.append(("weighted_antithetic_timesteps", False, bool, False))
 
 
         # unet

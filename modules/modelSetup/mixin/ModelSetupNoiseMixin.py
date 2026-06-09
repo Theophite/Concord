@@ -83,12 +83,26 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
             timestep: Tensor | None = None,
             betas: Tensor | None = None,
     ) -> Tensor:
-        noise = torch.randn(
-            source_tensor.shape,
-            generator=generator,
-            device=config.train_device,
-            dtype=source_tensor.dtype
-        )
+        if getattr(config, "weighted_antithetic_timesteps", False):
+            # Antithetic noise eps/-eps: pair sample i with i+B/2 (same split as the antithetic
+            # timesteps) so each pair carries both signs -> cancels the odd-in-eps cross term
+            # (-2<eps, eps_theta>) variance. Marginally still N(0,I), so the objective is unchanged.
+            bsz = source_tensor.shape[0]
+            h = (bsz + 1) // 2
+            eps = torch.randn(
+                (h, *source_tensor.shape[1:]),
+                generator=generator,
+                device=config.train_device,
+                dtype=source_tensor.dtype,
+            )
+            noise = torch.cat([eps, -eps], dim=0)[:bsz]
+        else:
+            noise = torch.randn(
+                source_tensor.shape,
+                generator=generator,
+                device=config.train_device,
+                dtype=source_tensor.dtype
+            )
 
         if config.offset_noise_weight > 0:
             offset_noise = torch.randn(
@@ -119,6 +133,40 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
 
         return noise
 
+    def _timestep_weight_cdf(self, alphas_cumprod, gamma, v_prediction, min_t, max_t, device):
+        """min-SNR weight curve over [min_t, max_t) and its normalized CDF, cached per run (the
+        schedule + gamma are fixed for a run). Mirrors ModelSetupDiffusionLossMixin.__min_snr_weight
+        exactly. Also stores _tw_mean_w (mean weight) for the loss-side mean_w rescale."""
+        key = (int(min_t), int(max_t), float(gamma), bool(v_prediction))
+        if getattr(self, "_tw_cdf_key", None) == key and self._tw_cdf.device == device:
+            return self._tw_cdf
+        ac = alphas_cumprod[min_t:max_t].to(device=device, dtype=torch.float32)
+        snr = ac / (1.0 - ac)                                            # == __snr
+        g = torch.as_tensor(float(gamma), dtype=snr.dtype, device=device)
+        min_snr_gamma = torch.minimum(snr, g)
+        w = min_snr_gamma / (snr + 1.0) if v_prediction else min_snr_gamma / snr   # +1 in denom for v-pred
+        w = torch.clamp(w, min=1e-12)
+        cdf = torch.cumsum(w / w.sum(), dim=0)                           # ascending -> 1.0
+        self._tw_cdf_key = key
+        self._tw_cdf = cdf
+        self._tw_mean_w = float(w.mean())
+        return cdf
+
+    def _draw_quantile_antithetic(self, n, generator, device):
+        """n quantiles in [0,1) as antithetic pairs: second half = 1 - first half (straddle u=0.5)."""
+        h = (n + 1) // 2
+        u = torch.rand(h, generator=generator, device=device)
+        return torch.cat([u, 1.0 - u])[:n]
+
+    def _sample_weighted_antithetic(self, batch_size, generator, alphas_cumprod, gamma,
+                                    v_prediction, min_t, max_t):
+        """Inverse-CDF sample t proportional to the min-SNR weight, antithetic in quantile space."""
+        device = generator.device
+        cdf = self._timestep_weight_cdf(alphas_cumprod, gamma, v_prediction, min_t, max_t, device)
+        u = self._draw_quantile_antithetic(batch_size, generator, device)
+        idx = torch.searchsorted(cdf, u.to(cdf.dtype)).clamp(max=cdf.numel() - 1)
+        return (min_t + idx).to(torch.long)
+
     def _get_timestep_discrete(
             self,
             num_train_timesteps: int,
@@ -127,6 +175,7 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
             batch_size: int,
             config: TrainConfig,
             shift: float = None,
+            snr_weight_ctx: tuple | None = None,
     ) -> Tensor:
         if shift is None:
             shift = config.timestep_shift
@@ -142,6 +191,17 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
             min_timestep = int(num_train_timesteps * config.min_noising_strength)
             max_timestep = int(num_train_timesteps * config.max_noising_strength)
             num_timestep = max_timestep - min_timestep
+
+            # Weighted-antithetic timestep sampling (opt-in; SDXL wires snr_weight_ctx). Importance-
+            # sample t proportional to the min-SNR loss weight, antithetically in quantile space.
+            # The loss side folds the weight into a scalar mean_w rescale, so the expected gradient
+            # AND the effective LR are unchanged -- this only reshapes WHERE timesteps land, to cut
+            # per-step gradient variance. snr_weight_ctx is non-None only when the flag is enabled.
+            if snr_weight_ctx is not None:
+                alphas_cumprod, gamma, v_prediction = snr_weight_ctx
+                return self._sample_weighted_antithetic(
+                    batch_size, generator, alphas_cumprod, gamma, v_prediction,
+                    min_timestep, max_timestep).int()
 
             if config.timestep_distribution in [
                 TimestepDistribution.UNIFORM,
