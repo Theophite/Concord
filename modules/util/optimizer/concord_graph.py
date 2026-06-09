@@ -115,6 +115,13 @@ class ManualUNetGraph:
         self._shape_key = None          # latent geometry the static buffers + graph are bound to
         self.vhat = None                # ConcordVHatBuckets: per-shape Adafactor v_hat (lazy)
         self.ls1 = self.ls2 = 0         # text-encoder layer skips (from config, set in step)
+        # in-graph loss weighting (min-SNR-gamma + resolution cap), baked from config at first step
+        self._loss_cfg_ready = False
+        self._min_snr = False
+        self._gamma = 1.0
+        self._resaware = False
+        self._v_pred = False
+        self._alphas_cumprod = None
         _ckpt.checkpoint = _capturable_checkpoint
 
     def release(self):
@@ -220,6 +227,57 @@ class ManualUNetGraph:
                 print(f"[concord_graph] bridge: TE backward over {len(tensors)} inputs, "
                       f"grad-norm sum {gn:.5f}", flush=True)
 
+    def _ensure_loss_cfg(self, model, config):
+        # Bake the loss-weighting config once (constant across the run). The captured graph
+        # computes the loss from copied-in timestep/time_ids, so the per-sample weight recomputes
+        # each replay -- but the gamma/flags/schedule read here are constants.
+        if self._loss_cfg_ready:
+            return
+        self._min_snr = (config.loss_weight_fn.name == "MIN_SNR_GAMMA")
+        self._gamma = float(config.loss_weight_strength)
+        self._resaware = bool(getattr(config, "resolution_aware_loss_weight", False))
+        self._v_pred = (getattr(getattr(model.noise_scheduler, "config", None),
+                                "prediction_type", "epsilon") == "v_prediction")
+        ac = getattr(model.noise_scheduler, "alphas_cumprod", None)
+        self._alphas_cumprod = ac.to(self.ms.train_device).float() if ac is not None else None
+        self._loss_cfg_ready = True
+
+    def _weighted_loss(self, pred, target, timestep, time_ids):
+        # In-graph equivalent of ModelSetupDiffusionLossMixin's MIN_SNR_GAMMA path: per-sample
+        # eps-MSE weighted by min(snr, gamma_eff)/snr, with gamma_eff = gamma * min(1, orig/crop
+        # area) the spectrum-principled resolution cap (orig/crop read from the SDXL time_ids:
+        # [orig_h, orig_w, crop_top, crop_left, target_h, target_w]). Pure tensor ops on copied-in
+        # buffers -> recomputed each graph replay, no host sync. weight==1 recovers plain MSE.
+        mse = torch.nn.functional.mse_loss(
+            pred.float(), target.float(), reduction="none").mean(dim=list(range(1, pred.dim())))
+        if not self._min_snr or self._alphas_cumprod is None:
+            return mse.mean()
+        ac = self._alphas_cumprod[timestep.long()]
+        snr = ac / (1.0 - ac)
+        if self._resaware:
+            ti = time_ids.float()
+            ratio = (ti[:, 0] * ti[:, 1] / (ti[:, 4] * ti[:, 5]).clamp(min=1.0)).clamp(max=1.0)
+            gamma_t = self._gamma * ratio
+        else:
+            gamma_t = torch.full_like(snr, self._gamma)
+        denom = snr + 1.0 if self._v_pred else snr
+        weight = torch.minimum(snr, gamma_t) / denom
+        return (mse * weight).mean()
+
+    def _log_resaware(self):
+        # Eager (pre-capture) diagnostic of the per-shape resolution cap -- safe to host-sync
+        # here, unlike inside the captured _step_fn. Prints once per (re)capture.
+        ti = self.static["time_ids"].float()
+        oa = ti[:, 0] * ti[:, 1]
+        ca = (ti[:, 4] * ti[:, 5]).clamp(min=1.0)
+        ratio = (oa / ca).clamp(max=1.0) if self._resaware else torch.ones_like(oa)
+        seen = {}
+        for i in range(ti.shape[0]):
+            seen[(int(ti[i, 0]), int(ti[i, 1]), int(ti[i, 4]), int(ti[i, 5]))] = float(self._gamma * ratio[i])
+        msg = " | ".join(f"{a}x{b}->{c}x{d} g_eff={g:.2f}" for (a, b, c, d), g in seen.items())
+        print(f"[resaware-graph] gamma={self._gamma} resaware={self._resaware} v_pred={self._v_pred} {msg}",
+              flush=True)
+
     def _step_fn(self):
         s = self.static
         with torch.autocast(device_type="cuda", dtype=self.dtype, cache_enabled=False):
@@ -241,7 +299,7 @@ class ManualUNetGraph:
             pred = self.unet(s["sample"], s["timestep"], encoder_hidden_states=ehs,
                              added_cond_kwargs={"text_embeds": text_embeds,
                                                 "time_ids": s["time_ids"]}).sample
-        loss = torch.nn.functional.mse_loss(pred.float(), s["target"].float())
+        loss = self._weighted_loss(pred, s["target"], s["timestep"], s["time_ids"])
         # grad-accumulation: 1/accum scaling so the summed micro-step gradients equal
         # the averaged full-batch gradient (mirrors the eager path's loss/=accum). Baked
         # at capture; accum==1 -> no op -> the validated single-step graph is unchanged.
@@ -257,6 +315,7 @@ class ManualUNetGraph:
             prep = self.ms.predict(model, batch, config, train_progress, return_raw_inputs=True)
         else:
             prep = self.ms.predict(model, batch, config, train_progress, return_unet_inputs=True)
+        self._ensure_loss_cfg(model, config)
         # Shape-aware: the static buffers + captured graph are bound to ONE latent geometry.
         # When aspect-ratio bucketing changes the shape, release the graph (frees its pool +
         # empty_cache), rebuild the buffers, and restore this shape's cached Concord v_hat
@@ -271,6 +330,8 @@ class ManualUNetGraph:
             self._ensure_vhat(model).switch_to(shape_key)   # save outgoing, restore incoming v_hat
         self._copy_in(prep)
         if self.graph is None:
+            if os.environ.get("CONCORD_RESAWARE_DEBUG") and self._min_snr:
+                self._log_resaware()
             if os.environ.get("CONCORD_GRAPH_DEBUG"):
                 # eager warmup (no side stream) under anomaly detection -> precise traceback
                 # of the op whose backward is replayed. Diagnostic only; off by default.

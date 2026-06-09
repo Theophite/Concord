@@ -36,6 +36,7 @@ import prototype_packed_b as ppb
 from prototype_packed_b import (
     ConcordLinearPackedB, ConcordConv2dPackedB,
     set_ratio_coh, set_ratio_coh_floors, set_fixed_coh,
+    set_lazy_gate, set_lazy_thresh,
     set_sigmag_noise, set_sigmag_sigma,
 )
 
@@ -82,6 +83,10 @@ class ConcordConfig:
     ratio_chase_floor_min: float = 0.1
     ratio_leak_floor: float = 0.999
     ratio_leak_floor_min: float = 0.1
+    # lazy-update gate: freeze dissipation (gf_consol evap + leak) on coords with no accumulated
+    # signal this window (sparse/lazy-Adam style). Off by default == validated winner behaviour.
+    lazy_gate: bool = False
+    lazy_active_thresh: float = 1e-4
     # dissipation autotuner (probe-then-commit; opt-in). JSON "[[coh, kappa], ...]" with
     # coh strictly DESCENDING; None/empty = off. The table is TASK-CALIBRATED (sweep kappa
     # at known noise levels, read the probe-window coherence) — numbers do not transfer
@@ -377,6 +382,8 @@ def configure_optimizer(unet, device, config):
         m.alpha_v_fast = config.alpha_v_fast
     ppb.set_ratio_coh(config.ratio_coh)                # global flags from the config
     ppb.set_sigmag_noise(config.noise, isotropic=config.sigmag_iso)
+    ppb.set_lazy_gate(config.lazy_gate)
+    ppb.set_lazy_thresh(config.lazy_active_thresh)
     aux = [p for p in unet.parameters() if p.requires_grad]
     print(f"[picker] concord: {len(layers)} layers, lr={config.lr}, gf_consol="
           f"{config.gf_consol}, ratio_coh={config.ratio_coh}, noise={config.noise}, "
@@ -390,6 +397,8 @@ def active_config():
     return dict(
         ratio_coh=ppb._RATIO_COH,
         fixed_coh=ppb._USE_FIXED_COH,
+        lazy_gate=ppb._LAZY_GATE,
+        lazy_thresh=ppb._LAZY_THRESH,
         noise_on=ppb._SIGMAG_NOISE,
         noise_isotropic=ppb._SIGMAG_ISO,
         sigma_now=round(ppb._SIGMAG_SIGMA, 4),

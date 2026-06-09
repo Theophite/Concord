@@ -735,6 +735,10 @@ class GenericTrainer(BaseTrainer):
                     self.model.concord_controller.total_steps = max(1, int(
                         self.config.epochs * self.data_loader.get_data_set().approximate_length()
                         / (self.config.batch_size * max(1, self.config.gradient_accumulation_steps))))
+                    print(f"[concord] schedule horizon = {self.model.concord_controller.total_steps} "
+                          f"steps ({self.config.epochs} epochs, "
+                          f"len~{self.data_loader.get_data_set().approximate_length()}, "
+                          f"bs={self.config.batch_size}, accum={self.config.gradient_accumulation_steps})")
 
             current_epoch_length = self.data_loader.get_data_set().approximate_length()
 

@@ -80,6 +80,8 @@ def make_concord_config(learning_rate: float, optimizer_config=None):
         noise=bool(pick("noise", d.noise)),
         sigmag_peak=float(pick("sigmag_peak", d.sigmag_peak)),
         ratio_coh=bool(pick("ratio_coh", d.ratio_coh)),
+        lazy_gate=bool(pick("lazy_gate", d.lazy_gate)),
+        lazy_active_thresh=float(pick("lazy_active_thresh", d.lazy_active_thresh)),
         warmup=int(pick("warmup", d.warmup)),
         lr_min_frac=float(pick("lr_min_frac", d.lr_min_frac)),
         autotune_table=pick("autotune_table", d.autotune_table),
@@ -96,7 +98,8 @@ class ConcordController:
 
     def __init__(self, unet, device, learning_rate: float, total_steps: int, optimizer_config=None,
                  module_filters=None, text_encoder=None, te_lr=None, te_wd_anchor=0.5):
-        from concord_winner import swap_unet_to_winner, GatedRebalance, swap_text_encoder_to_anchor
+        from concord_winner import swap_unet_to_winner, GatedRebalance, swap_text_encoder_to_anchor, \
+            set_lazy_gate, set_lazy_thresh
         self.config = make_concord_config(learning_rate, optimizer_config)
         self.total_steps = max(1, int(total_steps))
         # module_filters: OneTrainer's layer_filter (ModuleFilter list). When set to a non-"full"
@@ -113,6 +116,10 @@ class ConcordController:
         self.te_layers = (swap_text_encoder_to_anchor(text_encoder, device, self.te_lr, te_wd_anchor)
                           if text_encoder is not None else [])
         self.te_gate = GatedRebalance(self.te_layers) if self.te_layers else None
+        # Lazy-update gate is a module-level global read at every kernel launch; swap_unet_to_winner
+        # forces the coherence/noise flags but not this one, so set it explicitly from config here.
+        set_lazy_gate(self.config.lazy_gate)
+        set_lazy_thresh(self.config.lazy_active_thresh)
         # Legacy (pre mass-preserve-fix) drift-cancel C*: same-seed A/B escape hatch.
         # The layers computed the corrected C* in __init__; recompute with the legacy
         # formula. (TE anchor layers run alpha_v_fast=0 -> C*=0 under both; skip.)
@@ -130,7 +137,8 @@ class ConcordController:
         self.step_idx = 0
         print(f"[concord] swapped {len(self.layers)} UNet layers | lr={self.config.lr} "
               f"gf_consol={self.config.gf_consol} noise={self.config.noise} "
-              f"horizon={self.total_steps} steps")
+              f"lazy_gate={self.config.lazy_gate}@{self.config.lazy_active_thresh} "
+              f"(horizon set at train start)")
 
     def _build_autotuner(self):
         """Deferred autotuner construction: needs the FINAL total_steps (the trainer

@@ -429,6 +429,8 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
         "noise": True,
         "sigmag_peak": 0.6,
         "ratio_coh": True,
+        "lazy_gate": False,
+        "lazy_active_thresh": 0.0001,
         "warmup": 100,
         "lr_min_frac": 0.2,
     },

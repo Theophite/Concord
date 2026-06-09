@@ -85,6 +85,8 @@ class TrainOptimizerConfig(BaseConfig):
     noise: bool
     sigmag_peak: float
     ratio_coh: bool
+    lazy_gate: bool
+    lazy_active_thresh: float
     autotune_table: str
     autotune_beta1_on: float
     autotune_beta1_coh: float
@@ -210,6 +212,8 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("noise", None, bool, True))
         data.append(("sigmag_peak", None, float, True))
         data.append(("ratio_coh", None, bool, True))
+        data.append(("lazy_gate", None, bool, True))
+        data.append(("lazy_active_thresh", None, float, True))
         data.append(("autotune_table", None, str, True))
         data.append(("autotune_beta1_on", None, float, True))
         data.append(("autotune_beta1_coh", None, float, True))
@@ -478,6 +482,7 @@ class TrainConfig(BaseConfig):
     concord_antithetic_timesteps: bool
     concord_antithetic_noise: bool
     concord_antithetic_same_example: bool
+    resolution_aware_loss_weight: bool    # opt-in: fold a spectrum-principled per-image cap into the min-SNR loss weight. A natural image has a ~1/f^2 power spectrum, so an image upscaled by linear factor f (= sqrt(crop/orig area)) carries no real signal beyond its native Nyquist and its representable SNR is ~ gamma/f^2; capping min-SNR gamma there (= gamma * original_area/crop_area) stops the model being rewarded for reconstructing fake interpolated high-freq at low-noise timesteps (upscaling artifacts). Requires loss_weight_fn=MIN_SNR_GAMMA; no-op for native/downscaled images. General SDXL feature, not Concord-specific.
 
     # unet
     unet: TrainModelPartConfig
@@ -1071,6 +1076,7 @@ class TrainConfig(BaseConfig):
         data.append(("noising_bias", 0.0, float, False))
         data.append(("timestep_shift", 1.0, float, False))
         data.append(("dynamic_timestep_shifting", False, bool, False))
+        data.append(("resolution_aware_loss_weight", False, bool, False))
         data.append(("concord_antithetic_timesteps", False, bool, False))
         data.append(("concord_antithetic_noise", False, bool, False))
         data.append(("concord_antithetic_same_example", False, bool, False))

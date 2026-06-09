@@ -1,3 +1,4 @@
+import os
 from abc import ABCMeta
 from collections.abc import Callable
 
@@ -216,12 +217,43 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             device: torch.device
     ) -> Tensor:
         snr = self.__snr(timesteps, device)
-        min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
+        # gamma may be a scalar or a per-image [batch] cap (resolution-aware min-SNR;
+        # see __resolution_capped_gamma).
+        gamma_t = gamma.to(snr.device) if torch.is_tensor(gamma) else torch.full_like(snr, gamma)
+        min_snr_gamma = torch.minimum(snr, gamma_t)
         # Denominator of the snr_weight increased by 1 if v-prediction is being used.
         if v_prediction:
             snr += 1.0
         snr_weight = (min_snr_gamma / snr).to(device)
         return snr_weight
+
+    def __resolution_capped_gamma(
+            self,
+            batch: dict,
+            gamma: float,
+            device: torch.device,
+    ) -> Tensor:
+        """Spectrum-principled per-image min-SNR cap for upscaled images. A natural image has a
+        ~1/f^2 power spectrum, so an image upscaled by linear factor f (= sqrt(crop/orig area))
+        carries no real signal beyond its native Nyquist, and its representable SNR is ~ gamma/f^2.
+        Capping the min-SNR gamma there stops the model from being rewarded for reconstructing the
+        fake interpolated high-freq at the low-noise (high-SNR) timesteps -- the upscaling-artifact
+        source. 1/f^2 = original_area / crop_area; native/downscaled images (ratio >= 1) keep the
+        full gamma, so this is a no-op without aspect-ratio bucketing.
+        """
+        orig_area = batch['original_resolution'][0].float() * batch['original_resolution'][1].float()
+        crop_area = (batch['crop_resolution'][0].float() * batch['crop_resolution'][1].float()).clamp(min=1.0)
+        ratio = (orig_area / crop_area).clamp(max=1.0)              # < 1 = upscaled
+        capped = (gamma * ratio).to(device)                        # [batch] per-image gamma cap
+        if os.environ.get("CONCORD_RESAWARE_DEBUG"):
+            oh, ow = batch['original_resolution'][0].tolist(), batch['original_resolution'][1].tolist()
+            ch, cw = batch['crop_resolution'][0].tolist(), batch['crop_resolution'][1].tolist()
+            seen = {(int(a), int(b), int(c), int(d)): r
+                    for a, b, c, d, r in zip(oh, ow, ch, cw, ratio.tolist())}
+            msg = " | ".join(f"{a}x{b}->{c}x{d} r={r:.3f} g_eff={gamma * r:.2f}"
+                             for (a, b, c, d), r in seen.items())
+            print(f"[resaware] gamma={gamma} {msg}", flush=True)
+        return capped
 
     def __debiased_estimation_weight(
         self,
@@ -294,14 +326,18 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 case LossWeight.CONSTANT:
                     pass
                 case LossWeight.MIN_SNR_GAMMA:
-                    if (getattr(config, "concord_antithetic_timesteps", False)
-                            and not getattr(config, "resolution_aware_loss_weight", False)):
+                    gamma = config.loss_weight_strength
+                    if getattr(config, "resolution_aware_loss_weight", False) \
+                            and 'original_resolution' in batch and 'crop_resolution' in batch:
+                        gamma = self.__resolution_capped_gamma(batch, gamma, losses.device)
+                    if getattr(config, "concord_antithetic_timesteps", False) \
+                            and not getattr(config, "resolution_aware_loss_weight", False):
                         # min-SNR weight already folded into the timestep sampler (importance
                         # sampling); apply only the scalar mean-weight rescale so the expected
                         # gradient AND the effective LR are unchanged (a pure variance reduction).
                         losses = losses * getattr(self, "_tw_mean_w", 1.0)
                     else:
-                        losses *= self.__min_snr_weight(data['timestep'], config.loss_weight_strength, v_pred, losses.device)
+                        losses *= self.__min_snr_weight(data['timestep'], gamma, v_pred, losses.device)
                 case LossWeight.DEBIASED_ESTIMATION:
                     losses *= self.__debiased_estimation_weight(data['timestep'], v_pred, losses.device)
                 case LossWeight.P2:
