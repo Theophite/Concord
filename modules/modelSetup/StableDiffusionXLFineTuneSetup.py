@@ -215,6 +215,18 @@ class StableDiffusionXLFineTuneSetup(
                     f"{len(bad)} layer(s) violate this (e.g. {bad[:3]}). Disable the fast-gain "
                     f"schedule or set gradient_accumulation_steps = 1.")
 
+        # The evaporation term u <- u - lr*gf_consol*(1-coh)*u diverges past
+        # lr*gf_consol ~= 2 (CPU-verified bracketing: 1.5 trains, 2.5 NaNs; on GPU the
+        # int16 clamp saturates instead of NaN-ing, but training is equally dead). The
+        # shipped configs sit two orders inside the bound — guard it anyway.
+        if config.optimizer.optimizer == Optimizer.CONCORD:
+            gf = float(getattr(model.concord_controller.config, "gf_consol", 0.0))
+            if config.learning_rate * gf >= 2.0:
+                raise ValueError(
+                    f"lr*gf_consol = {config.learning_rate * gf:.2f} >= 2: the "
+                    f"dissipation term is linearly unstable (u <- u - lr*k*(1-coh)*u). "
+                    f"Lower the learning rate or gf_consol.")
+
         params = self.create_parameters(model, config)
         self.__setup_requires_grad(model, config)
         init_model_parameters(model, params, self.train_device)

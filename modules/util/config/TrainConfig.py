@@ -85,6 +85,10 @@ class TrainOptimizerConfig(BaseConfig):
     noise: bool
     sigmag_peak: float
     ratio_coh: bool
+    autotune_table: str
+    autotune_beta1_on: float
+    autotune_beta1_coh: float
+    cstar_legacy: bool
     warmup: int
     lr_min_frac: float
     weight_lr_power: float
@@ -206,6 +210,10 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("noise", None, bool, True))
         data.append(("sigmag_peak", None, float, True))
         data.append(("ratio_coh", None, bool, True))
+        data.append(("autotune_table", None, str, True))
+        data.append(("autotune_beta1_on", None, float, True))
+        data.append(("autotune_beta1_coh", None, float, True))
+        data.append(("cstar_legacy", None, bool, True))
         data.append(("warmup", None, int, True))
         data.append(("lr_min_frac", None, float, True))
         data.append(("weight_lr_power", None, float, True))

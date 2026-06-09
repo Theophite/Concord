@@ -82,6 +82,16 @@ class ConcordConfig:
     ratio_chase_floor_min: float = 0.1
     ratio_leak_floor: float = 0.999
     ratio_leak_floor_min: float = 0.1
+    # dissipation autotuner (probe-then-commit; opt-in). JSON "[[coh, kappa], ...]" with
+    # coh strictly DESCENDING; None/empty = off. The table is TASK-CALIBRATED (sweep kappa
+    # at known noise levels, read the probe-window coherence) — numbers do not transfer
+    # across domains. beta1_on=0.0 keeps probe-selected momentum OFF (conservative
+    # default; the beta1 evidence is one task deep).
+    autotune_table: str = None
+    autotune_beta1_on: float = 0.0
+    autotune_beta1_coh: float = 0.35
+    # legacy (pre mass-preserve-fix) drift-cancel C* — same-seed A/B escape hatch only
+    cstar_legacy: bool = False
     # fluctuation (the noise)
     noise: bool = True
     sigmag_iso: bool = True

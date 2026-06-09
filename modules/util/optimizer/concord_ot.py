@@ -82,6 +82,10 @@ def make_concord_config(learning_rate: float, optimizer_config=None):
         ratio_coh=bool(pick("ratio_coh", d.ratio_coh)),
         warmup=int(pick("warmup", d.warmup)),
         lr_min_frac=float(pick("lr_min_frac", d.lr_min_frac)),
+        autotune_table=pick("autotune_table", d.autotune_table),
+        autotune_beta1_on=float(pick("autotune_beta1_on", d.autotune_beta1_on)),
+        autotune_beta1_coh=float(pick("autotune_beta1_coh", d.autotune_beta1_coh)),
+        cstar_legacy=bool(pick("cstar_legacy", d.cstar_legacy)),
     )
 
 
@@ -109,16 +113,80 @@ class ConcordController:
         self.te_layers = (swap_text_encoder_to_anchor(text_encoder, device, self.te_lr, te_wd_anchor)
                           if text_encoder is not None else [])
         self.te_gate = GatedRebalance(self.te_layers) if self.te_layers else None
+        # Legacy (pre mass-preserve-fix) drift-cancel C*: same-seed A/B escape hatch.
+        # The layers computed the corrected C* in __init__; recompute with the legacy
+        # formula. (TE anchor layers run alpha_v_fast=0 -> C*=0 under both; skip.)
+        if getattr(self.config, "cstar_legacy", False):
+            from prototype_packed_b import compute_drift_cancel_C
+            for m in self.layers:
+                m.drift_cancel_C = compute_drift_cancel_C(
+                    m.alpha, m.alpha_v_fast, mass_preserve=False)
+            print("[concord] drift-cancel C*: LEGACY formula (cstar_legacy=true)")
+        # Dissipation autotuner (probe-then-commit), opt-in via optimizer.autotune_table.
+        # Built LAZILY on the first before_step(): total_steps here is a placeholder —
+        # the trainer finalizes the horizon at train start.
+        self.autotuner = None
+        self._autotune_pending = bool(getattr(self.config, "autotune_table", None))
         self.step_idx = 0
         print(f"[concord] swapped {len(self.layers)} UNet layers | lr={self.config.lr} "
               f"gf_consol={self.config.gf_consol} noise={self.config.noise} "
               f"horizon={self.total_steps} steps")
+
+    def _build_autotuner(self):
+        """Deferred autotuner construction: needs the FINAL total_steps (the trainer
+        finalizes the horizon at train start, after __init__). UNet layers ONLY — the
+        frozen-anchor TE runs alpha_v_fast=0, its telescope never advances and its
+        coherence reads ~0 regardless of data quality; including it would drag the
+        probe mean toward "maximum noise"."""
+        import json
+        from prototype_packed_b import DissipationAutoTuner
+        self._autotune_pending = False
+        table = [(float(c), float(k)) for c, k in json.loads(self.config.autotune_table)]
+        max_kappa = max(k for _, k in table)
+        if self.config.lr * max_kappa >= 2.0:
+            raise ValueError(
+                f"autotune_table max kappa {max_kappa:g} at lr {self.config.lr:g}: "
+                f"lr*kappa = {self.config.lr * max_kappa:.2f} >= 2 is linearly unstable "
+                f"(u <- u - lr*k*(1-coh)*u). Lower the table's kappa ceiling or the lr.")
+        if self.config.gf_consol <= 0:
+            raise ValueError(
+                "autotune requires gf_consol > 0 (the probe kappa): the kernel's "
+                "consolidation branch is baked at CUDA-graph capture from the "
+                "capture-time value; gf_consol=0 would bake it OUT and the committed "
+                "kappa would be ignored under replay.")
+        probe_start = int(0.04 * self.total_steps)
+        probe_end = max(int(0.10 * self.total_steps), probe_start + 1)
+        # Probe placement (the calibration doc's hard caveat): the window must clear
+        # warmup AND the ~1/alpha init-consolidation transient, or the meter reads ~0
+        # regardless of data quality and commits the table's max-friction kappa.
+        # Observed on a short bs=2 overfit: probe steps 4-12 -> coh 0.002 -> kappa
+        # ceiling on CLEAN data (visible deploy damage). Warn loudly; short mechanical
+        # smoke runs may proceed knowingly.
+        transient = int(2.0 / max(self.config.alpha, 1e-6))
+        if probe_start < max(int(self.config.warmup), transient):
+            print(f"[concord] WARNING: autotune probe window [{probe_start},{probe_end}) does "
+                  f"not clear warmup ({self.config.warmup}) / the ~{transient}-step init "
+                  f"transient: the coherence meter reads ~0 there and will commit the "
+                  f"table's max kappa regardless of data quality. Lengthen the run or "
+                  f"recalibrate the probe window.")
+        self.autotuner = DissipationAutoTuner(
+            self.layers,
+            probe_start=probe_start,
+            probe_end=probe_end,
+            table=table,
+            probe_kappa=self.config.gf_consol,
+            beta1_on=self.config.autotune_beta1_on,
+            beta1_coh_threshold=self.config.autotune_beta1_coh)
 
     @torch.no_grad()
     def before_step(self):
         """BEFORE forward/backward: advance the winner schedule onto the layer device
         tensors (lr / sigma / coherence floors) that the fused backward reads."""
         from concord_winner import winner_step
+        if self._autotune_pending:
+            self._build_autotuner()
+        if self.autotuner is not None:
+            self.autotuner.step(self.step_idx)
         winner_step(self.step_idx, self.total_steps, self.layers, config=self.config)
         if self.te_layers:
             winner_step(self.step_idx, self.total_steps, self.te_layers,

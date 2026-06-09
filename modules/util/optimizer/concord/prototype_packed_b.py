@@ -50,7 +50,8 @@ V_SLOW_FACTOR = 128
 
 
 def compute_drift_cancel_C(alpha, alpha_v_fast,
-                              alpha_v_slow=0.0, refit_period=1):
+                              alpha_v_slow=0.0, refit_period=1,
+                              mass_preserve=True):
     """Drift-cancellation coefficient C* that zeroes E[noise] under
     a pure-drift gradient stream (μ = E[a_t], no noise).
 
@@ -81,6 +82,23 @@ def compute_drift_cancel_C(alpha, alpha_v_fast,
     """
     L = (1.0 - alpha) / max(alpha, 1e-12)
     rho = alpha_v_fast + alpha_v_slow / max(refit_period, 1)
+    if mass_preserve:
+        # Mass-preserve correction (2026-06-09): the MASS_PRESERVE leak
+        # debits s_slow as well as crediting v_slow, so the telescope
+        # d = s_slow - v_slow relaxes at 2*rho per step. Fixed point of
+        # the kernel recursion (tick -> chase -> leak) under pure drift mu:
+        #     E[d_fs] = mu*L                    (unchanged)
+        #     d' = (1 - 2*rho)*(d + mu)  ->  E[d_sv] = mu*(1 - 2*rho)/(2*rho)
+        #     C* = L*2*rho / (1 - 2*rho)        (~2x the legacy value)
+        # With the legacy C* the drift prediction reads ~half the true lag
+        # and pure-drift coherence saturates near 0.5 (0.3 with the ratio
+        # floors annealed) instead of ~1 -- the gate ran half-blind to
+        # genuine signal. CPU fixed-point + simulation validation:
+        # experiments/cpu_dynamics/EXPERIMENTS.md (drift coh 0.55 -> 0.98,
+        # pure-noise control unchanged). The non-mass-preserve branch keeps
+        # the legacy formula.
+        rho2 = 2.0 * rho
+        return L * rho2 / (1.0 - rho2)
     return L * rho / (1.0 - L * alpha_v_fast)
 
 
@@ -525,6 +543,25 @@ def _ensure_eps_tensor(eps, device):
     return buf
 
 
+_NAMED_SCALAR_CACHE = {}
+
+
+def _ensure_named_scalar(name, v, device):
+    """_ensure_lr_tensor generalized for the other pointer-read kernel scalars
+    (beta1 / gf_consol): tensors pass through unchanged; floats fill a
+    per-(name, device) scratch. Layers pass their OWN per-layer buffers so a
+    probe-then-commit (the dissipation autotuner) survives CUDA-graph replay."""
+    if isinstance(v, torch.Tensor):
+        return v
+    key = (name, str(device))
+    buf = _NAMED_SCALAR_CACHE.get(key)
+    if buf is None:
+        buf = torch.zeros(1, dtype=torch.float32, device=device)
+        _NAMED_SCALAR_CACHE[key] = buf
+    buf.fill_(float(v))
+    return buf
+
+
 def apply_packed_sgd(packed_w, grad_W, weight_buf, row_exp, col_exp,
                        row_max, col_max,
                        lr, mantissa_bias=15, alpha=0.1, beta1=0.0,
@@ -599,9 +636,10 @@ def _apply_packed_adamw_kernel(
     sum_v_inv_ptr,     # [1] fp32 — 1 / Σ_k v_row_k (precomputed by caller)
     coh_pre_ptr,       # [N,K] fp32 — per-coord established-coherence EMA
     N, K,
-    lr_ptr, mantissa_bias, alpha, beta1,
+    lr_ptr, mantissa_bias, alpha, beta1_ptr,
     weight_decay, eps_ptr, step_cap,
-    v_scale, precond_p, gf_consol, drift_cancel_C, alpha_v_fast,
+    lazy_thresh,          # fp32: τ for the lazy-update gate (a coord stays active iff s_fast_in_w² > τ·v̂)
+    v_scale, precond_p, gf_consol_ptr, drift_cancel_C, alpha_v_fast,
     wd_sv, wd_sf, wd_anchor,
     gf_trust_delta_sq,   # fp32: δ² in step = grad/√(Var + δ²·v̂);
                           # 0 disables (legacy: clamp by step_cap only)
@@ -630,6 +668,7 @@ def _apply_packed_adamw_kernel(
     USE_FIXED_COH: tl.constexpr,  # True → Wiener coh = S/(S+noise²) (units-correct)
     USE_RATIO_COH: tl.constexpr,  # True -> gate chase+leak by live coh, no coh_pre
     USE_GAP_FEEDBACK: tl.constexpr,  # True -> conserved gap-magnitude pass/evap split (strips floor)
+    USE_LAZY_GATE: tl.constexpr,  # True -> freeze gf_consol evap + leak on idle coords (no accumulated signal)
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -640,6 +679,11 @@ def _apply_packed_adamw_kernel(
     # eps likewise read from a device tensor — lets an eps warmup
     # schedule update it between graph replays (e.g. SGD->precond handoff).
     eps = tl.load(eps_ptr).to(tl.float32)
+    # beta1 / gf_consol: device tensors so the dissipation autotuner's
+    # probe-then-commit (and any future schedule) survives CUDA-graph
+    # replay — same pattern as lr/eps/floors. Layers own per-layer bufs.
+    beta1 = tl.load(beta1_ptr).to(tl.float32)
+    gf_consol = tl.load(gf_consol_ptr).to(tl.float32)
     # ratio-coh floors: device tensors too, so the per-step cosine schedule
     # propagates into a captured graph's replays (no recapture).
     chase_floor = tl.load(chase_floor_ptr).to(tl.float32)
@@ -694,7 +738,7 @@ def _apply_packed_adamw_kernel(
     # v̂ (Adafactor rank-1, W² units) feeds both the trust region and the
     # consolidation-coherence gate, so load it if either is active.
     coh = 0.0
-    if (USE_GF_TRUST_REGION or USE_GF_CONSOLIDATION) or (USE_COHPRE or USE_RATIO_COH):
+    if (USE_GF_TRUST_REGION or USE_GF_CONSOLIDATION) or (USE_COHPRE or USE_RATIO_COH) or USE_LAZY_GATE:
         v_row_tile = tl.load(v_row_ptr + offs_n,
                               mask=n_mask, other=0.0).to(tl.float32)
         v_col_tile = tl.load(v_col_ptr + offs_k,
@@ -762,8 +806,16 @@ def _apply_packed_adamw_kernel(
     # the wd contribution to s_fast is -lr·wd·s_fast — a simple
     # exponential decay of s_fast with rate lr·wd per step.
     s_fast_in_w = d_fs * scale_fwd
+    # Lazy-update gate: under grad-accumulation s_fast holds the window's accumulated signal; a
+    # coord with no real signal stays ~0. Freeze dissipation (gf_consol evap + leak) on those, so
+    # a zero gradient is treated as no-information rather than as evidence to decay toward. v_hat =
+    # per-coord typical g² (W² units); the window amplifies real signal far above it, so τ is not
+    # sensitive. g_active = 1.0 everywhere when the flag is off -> bit-exact no-op.
+    g_active = 1.0
+    if USE_LAZY_GATE:
+        g_active = (s_fast_in_w * s_fast_in_w > lazy_thresh * v_hat).to(tl.float32)
     if USE_GAP_FEEDBACK:
-        evap_mantissa = (1.0 - c_pass) * alpha * d_fs   # conserved: non-passed velocity evaporates
+        evap_mantissa = (1.0 - c_pass) * alpha * d_fs * g_active   # conserved: non-passed velocity evaporates
     elif USE_GF_CONSOLIDATION:
         # gf-gated evaporation REPLACES uniform cautious wd: drain only the
         # INCOHERENT part of the velocity. coh→1 (signal) is preserved and
@@ -775,7 +827,7 @@ def _apply_packed_adamw_kernel(
         # position can settle (constant-κ over-skimmed late, when small
         # late-stage signal reads as incoherent). gf_consol is now the rate
         # at unit lr; at peak lr=0.1, gf_consol=0.3 ≈ the old κ=0.03.
-        evap_mantissa = lr * gf_consol * (1.0 - coh) * d_fs
+        evap_mantissa = lr * gf_consol * (1.0 - coh) * d_fs * g_active
     else:
         step_live = step_live + weight_decay * s_fast_in_w
         evap_mantissa = 0.0
@@ -841,7 +893,7 @@ def _apply_packed_adamw_kernel(
         # (s_slow_full), not s_fast (which is now a small velocity).
         s_slow_full_post = s_slow_i8 * 128
         gap_v_full = (s_slow_full_post - v_slow_full).to(tl.float32)
-        delta_v8 = alpha_v_fast * gap_v_full / 128.0 * consf   # gated: no leak mid-cycle
+        delta_v8 = alpha_v_fast * gap_v_full / 128.0 * consf * g_active   # gated: no leak mid-cycle / idle coord
         if USE_RATIO_COH:
             delta_v8 = delta_v8 * (leak_floor + (1.0 - leak_floor) * coh)   # slow->v_slow, floored
         r3 = _hash_uniform(s_fast, pos_hash, step_salt ^ 0x33335555)
@@ -1140,6 +1192,24 @@ def set_ratio_coh(enabled):
     _RATIO_COH = bool(enabled)
 
 
+# Lazy-update gate (sparse/lazy-Adam style): freeze the dissipation (gf_consol evap + v_slow leak)
+# on coordinates with no accumulated gradient signal this window, so a zero gradient is treated as
+# no-information rather than evidence to decay toward. Off by default -> bit-exact no-op. The
+# threshold is relative to the per-coord typical g² (v̂), so it's scale-free across layers.
+_LAZY_GATE = False
+_LAZY_THRESH = 1e-4   # conservative: no-op on active signal to within 1 int8 LSB (smoke-tested); raise for accum
+
+
+def set_lazy_gate(enabled):
+    global _LAZY_GATE
+    _LAZY_GATE = bool(enabled)
+
+
+def set_lazy_thresh(thresh):
+    global _LAZY_THRESH
+    _LAZY_THRESH = float(thresh)
+
+
 def set_ratio_coh_floors(chase, leak):
     """Per-step setter for the two bootstrap floors. Schedule: cosine from 0.9
     (fast->slow) / 0.999 (slow->v_slow) to 0 over ~one epoch. Updates both the python
@@ -1216,7 +1286,8 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
                          mass_preserve=False, apply_chase=True,
                          track_rebalance=True,
                          v_row=None, v_col=None, sum_v_inv=None,
-                         gf_trust_delta_sq=0.0, coh_pre=None):
+                         gf_trust_delta_sq=0.0, coh_pre=None,
+                         gf_consol_buf=None, beta1_buf=None):
     """Wrapper for the AdamW three-accumulator packed apply kernel.
     weight_buf is updated with the new live weight (materialize-merge),
     so the next forward can read directly without a separate materialize
@@ -1232,14 +1303,18 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
     same asymptotic max step as the legacy hard clamp, smoothly.
     """
     if drift_cancel_C is None:
-        drift_cancel_C = compute_drift_cancel_C(alpha, alpha_v_fast)
+        drift_cancel_C = compute_drift_cancel_C(alpha, alpha_v_fast,
+                                                mass_preserve=mass_preserve)
     N, K = packed_w.shape
     assert packed_w.dtype == torch.int32
     assert grad_W.dtype == torch.bfloat16
     assert weight_buf.dtype == torch.bfloat16
     assert weight_buf.shape == packed_w.shape
     use_gf_trust = (gf_trust_delta_sq > 0)
-    use_gf_consol = (gf_consol > 0)
+    # A layer-owned gf_consol buffer means the value can CHANGE between graph
+    # replays (autotuner probe-then-commit) -> bake the consolidation branch in;
+    # a committed kappa of 0 is then an exact arithmetic no-op, not a dead branch.
+    use_gf_consol = (gf_consol_buf is not None) or (gf_consol > 0)
     use_cohpre = (coh_pre is not None)
     coh_pre_arg = coh_pre if coh_pre is not None else packed_w  # stub if off
     if use_gf_trust or use_gf_consol or use_cohpre:
@@ -1262,6 +1337,10 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
                           float(step_cap), int(mantissa_bias))
     lr_ptr = _ensure_lr_tensor(lr, packed_w.device)
     eps_ptr = _ensure_eps_tensor(eps, packed_w.device)
+    gf_consol_ptr = gf_consol_buf if gf_consol_buf is not None \
+        else _ensure_named_scalar("gf_consol", gf_consol, packed_w.device)
+    beta1_ptr = beta1_buf if beta1_buf is not None \
+        else _ensure_named_scalar("beta1", beta1, packed_w.device)
     _ratio_chase_floor_ptr, _ratio_leak_floor_ptr = _ensure_floor_tensors(packed_w.device)
     bc_buf = _v_bc_buf(packed_w.device)                   # (1) v_hat bias-correction buffer
     gap_inv = (1.0 / _GAP_SCALE) if (_GAP_FEEDBACK and _GAP_SCALE > 0) else 0.0
@@ -1273,9 +1352,10 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         v_row, v_col, sum_v_inv,
         coh_pre_arg,
         N, K,
-        lr_ptr, int(mantissa_bias), float(alpha), float(beta1),
+        lr_ptr, int(mantissa_bias), float(alpha), beta1_ptr,
         float(weight_decay), eps_ptr, float(step_cap),
-        float(v_scale), float(precond_p), float(gf_consol),
+        float(_LAZY_THRESH),
+        float(v_scale), float(precond_p), gf_consol_ptr,
         float(drift_cancel_C),
         float(alpha_v_fast),
         float(wd_sv), float(wd_sf), float(wd_anchor),
@@ -1300,6 +1380,7 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         USE_FIXED_COH=bool(_USE_FIXED_COH),
         USE_RATIO_COH=bool(_RATIO_COH),
         USE_GAP_FEEDBACK=bool(_GAP_FEEDBACK),
+        USE_LAZY_GATE=bool(_LAZY_GATE),
     )
 
 
@@ -1560,7 +1641,8 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
                 weight_buf, row_max_buf, col_max_buf,
                 v_row, v_col, sum_v_inv,
                 adafactor_beta2, track_adafactor_v,
-                gf_trust_delta_sq, coh_pre):
+                gf_trust_delta_sq, coh_pre,
+                gf_consol_buf, beta1_buf):
         # weight_buf is kept fresh by the *previous* step's apply kernel
         # (materialize-merge). On the very first forward, the layer's
         # _ensure_buffers materializes it once. So we read it directly
@@ -1591,6 +1673,8 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
         ctx.v_scale = v_scale
         ctx.precond_p = precond_p
         ctx.gf_consol = gf_consol
+        ctx.gf_consol_buf = gf_consol_buf
+        ctx.beta1_buf = beta1_buf
         ctx.drift_cancel_C = drift_cancel_C
         ctx.alpha_v_fast = alpha_v_fast
         ctx.wd_sv = wd_sv
@@ -1665,7 +1749,16 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
                 # sigma is the device tensor (graph-stable); clamp the norm (no python branch).
                 sig_t = _get_sigmag_sigma(gwf.device)
                 nrm = noise.norm().clamp_min(1e-12)
-                grad_W = gwf + noise * (sig_t * gwf.norm() / nrm)
+                scaled = noise * (sig_t * gwf.norm() / nrm)
+                if _LAZY_GATE:
+                    # Lazy noise: only perturb coords that received a real gradient THIS micro-step,
+                    # so idle coords stay truly idle -- no injected noise accumulates in s_fast, and
+                    # the kernel lazy gate reads them as idle instead of being fooled "active" by the
+                    # noise. Mask on per-coord gradient power vs the tensor mean (same _LAZY_THRESH).
+                    # all-tensor (no python branch on tensor values) -> CUDA-graph-capture-safe.
+                    gp = gwf * gwf
+                    scaled = scaled * (gp > _LAZY_THRESH * gp.mean()).to(gwf.dtype)
+                grad_W = gwf + scaled
         if grad_W.dtype != torch.bfloat16:
             grad_W = grad_W.to(torch.bfloat16)
         if not grad_W.is_contiguous():
@@ -1709,6 +1802,7 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
                 step_cap=ctx.step_cap,
                 v_scale=ctx.v_scale, precond_p=ctx.precond_p,
                 gf_consol=ctx.gf_consol,
+                gf_consol_buf=ctx.gf_consol_buf, beta1_buf=ctx.beta1_buf,
                 drift_cancel_C=ctx.drift_cancel_C,
                 alpha_v_fast=ctx.alpha_v_fast,
                 wd_sv=ctx.wd_sv, wd_sf=ctx.wd_sf, wd_anchor=ctx.wd_anchor,
@@ -1745,7 +1839,8 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
                 None, None, None,
                 None, None, None,
                 None, None, None,
-                None, None, None, None)
+                None, None, None, None,
+                None, None)
 
 
 class ConcordLinearPackedB(nn.Module):
@@ -1776,6 +1871,13 @@ class ConcordLinearPackedB(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.alpha = alpha
+        # beta1 / gf_consol: like lr, stored as scalar mirror + 1-elem device
+        # tensor. The kernel reads the TENSORS, so a probe-then-commit (the
+        # dissipation autotuner sets m.gf_consol / m.beta1 mid-run) propagates
+        # into CUDA-graph replays without recapture. Bufs MUST exist before the
+        # property-routed assignments below.
+        self._beta1_buf = torch.zeros(1, dtype=torch.float32, device=device)
+        self._gf_consol_buf = torch.zeros(1, dtype=torch.float32, device=device)
         self.beta1 = beta1
         # lr is stored as both a scalar (self._lr_value) and a 1-elem
         # device tensor (self._lr_buf). The kernel reads the tensor so we
@@ -1806,7 +1908,8 @@ class ConcordLinearPackedB(nn.Module):
         # If callers change alpha or alpha_v_fast (or add periodic leak),
         # they should recompute via compute_drift_cancel_C.
         self.drift_cancel_C = compute_drift_cancel_C(
-            alpha, self.alpha_v_fast)
+            alpha, self.alpha_v_fast,
+            mass_preserve=True)   # matches mass_preserve_v default below
         # Adafactor row/col second-moment EMAs in g² units. Used for
         # the per-weight v̂_ij = v_row_i·v_col_j / Σ_k v_row_k denominator
         # of the garbage fraction Var(ḡ_ij) / E[ḡ_ij²] ∈ [0,1]. β2=0.999
@@ -1903,6 +2006,26 @@ class ConcordLinearPackedB(nn.Module):
         apply kernel). Read-only — assigning to it has no effect on the
         packed state."""
         return getattr(self, '_bf16_weight_buf', None)
+
+    @property
+    def beta1(self):
+        return self._beta1_value
+
+    @beta1.setter
+    def beta1(self, value):
+        # scalar mirror for host reads + device tensor for the kernel pointer
+        # (changes survive CUDA-graph replay — autotuner probe-then-commit).
+        self._beta1_value = float(value)
+        self._beta1_buf.fill_(self._beta1_value)
+
+    @property
+    def gf_consol(self):
+        return self._gf_consol_value
+
+    @gf_consol.setter
+    def gf_consol(self, value):
+        self._gf_consol_value = float(value)
+        self._gf_consol_buf.fill_(self._gf_consol_value)
 
     @property
     def lr(self):
@@ -2221,7 +2344,8 @@ class ConcordLinearPackedB(nn.Module):
             self.v_row, self.v_col, self._sum_v_inv,
             float(self.adafactor_beta2),
             bool(self.track_adafactor_v),
-            float(self.gf_trust_delta_sq), self._coh_pre)
+            float(self.gf_trust_delta_sq), self._coh_pre,
+            self._gf_consol_buf, self._beta1_buf)
         return y.to(in_dtype)
 
     @torch.no_grad()
@@ -2266,6 +2390,7 @@ class ConcordLinearPackedB(nn.Module):
                 step_cap=self.step_cap,
                 v_scale=self.v_scale, precond_p=self.precond_p,
                 gf_consol=self.gf_consol,
+                gf_consol_buf=self._gf_consol_buf, beta1_buf=self._beta1_buf,
                 drift_cancel_C=self.drift_cancel_C,
                 alpha_v_fast=self.alpha_v_fast,
                 wd_sv=self.wd_sv, wd_sf=self.wd_sf, wd_anchor=self.wd_anchor,
@@ -2376,7 +2501,8 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
                 weight_buf, row_max_buf, col_max_buf,
                 v_row, v_col, sum_v_inv,
                 adafactor_beta2, track_adafactor_v,
-                gf_trust_delta_sq, coh_pre):
+                gf_trust_delta_sq, coh_pre,
+                gf_consol_buf, beta1_buf):
         # weight_buf kept fresh by previous apply (materialize-merge).
         # Initial population happens once in _ensure_buffers.
         weight_4d = weight_buf.view(out_channels, in_channels, kh, kw)
@@ -2414,6 +2540,8 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
         ctx.v_scale = v_scale
         ctx.precond_p = precond_p
         ctx.gf_consol = gf_consol
+        ctx.gf_consol_buf = gf_consol_buf
+        ctx.beta1_buf = beta1_buf
         ctx.drift_cancel_C = drift_cancel_C
         ctx.alpha_v_fast = alpha_v_fast
         ctx.wd_sv = wd_sv
@@ -2495,6 +2623,7 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
                 step_cap=ctx.step_cap,
                 v_scale=ctx.v_scale, precond_p=ctx.precond_p,
                 gf_consol=ctx.gf_consol,
+                gf_consol_buf=ctx.gf_consol_buf, beta1_buf=ctx.beta1_buf,
                 drift_cancel_C=ctx.drift_cancel_C,
                 alpha_v_fast=ctx.alpha_v_fast,
                 wd_sv=ctx.wd_sv, wd_sf=ctx.wd_sf, wd_anchor=ctx.wd_anchor,
@@ -2533,7 +2662,8 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
                 None, None, None,
                 None, None, None,
                 None, None, None,
-                None, None, None, None)
+                None, None, None, None,
+                None, None)
 
 
 class ConcordConv2dPackedB(ConcordLinearPackedB):
@@ -2576,8 +2706,156 @@ class ConcordConv2dPackedB(ConcordLinearPackedB):
             self.v_row, self.v_col, self._sum_v_inv,
             float(self.adafactor_beta2),
             bool(self.track_adafactor_v),
-            float(self.gf_trust_delta_sq), self._coh_pre)
+            float(self.gf_trust_delta_sq), self._coh_pre,
+            self._gf_consol_buf, self._beta1_buf)
         return y.to(in_dtype)
+
+
+# ============================================================
+# Dissipation autotuning: the gate's own coherence as a noise meter
+# ============================================================
+# Rolled in with the C* rescale (mass_preserve correction above): with the
+# recalibrated drift-cancel coefficient, the gate's Wiener gain is an honest
+# per-weight SNR meter, and its mid-training layer mean discriminates
+# gradient-noise levels cleanly (CPU validation:
+# experiments/cpu_dynamics/EXPERIMENTS.md exp 6 — monotone in label-noise
+# fraction with seed spread 10-50x below the separation, and a
+# probe-then-commit controller recovers the oracle kappa*(noise) of exp 5
+# almost exactly: committed 2/103/205/381/400 vs oracle 0/100/200/400/400).
+
+
+def gate_coherence_from_fields(s_fast, s_slow_i8, v_slow_i8, drift_cancel_C):
+    """The kernel's USE_FIXED_COH Wiener gain, computed host-side from the
+    unpacked integer fields (float tensors). Scale-invariant: signal and
+    noise share 2^(row_exp+col_exp), so the exponents cancel in the ratio
+    and are not needed. Returns the per-element coh in [0, 1]."""
+    d_fs = s_fast
+    d_sv = (s_slow_i8 - v_slow_i8) * 128.0
+    sig = drift_cancel_C * d_sv
+    noise = d_fs - sig
+    sig2 = sig * sig
+    return sig2 / (sig2 + noise * noise + 1e-30)
+
+
+@torch.no_grad()
+def measure_coherence(layer):
+    """Mean gate coherence of one Concord layer, read from the packed state
+    (no kernel changes, no per-step cost — call it occasionally during a
+    probe window). Matches the statistic the exp-6 calibration uses: the
+    plain element mean of the kernel's coh."""
+    p = layer.packed_w
+    s_fast = (p >> 16).float()
+    s_slow = ((p << 16) >> 24).float()
+    v_slow = ((p << 24) >> 24).float()
+    coh = gate_coherence_from_fields(s_fast, s_slow, v_slow,
+                                     float(layer.drift_cancel_C))
+    return float(coh.mean())
+
+
+class DissipationAutoTuner:
+    """Probe-then-commit autotuning of the dissipation kappa (gf_consol).
+
+    Train at a default kappa through a probe window, read the mean gate
+    coherence over the window, then commit kappa once from a calibrated
+    piecewise-linear (coh -> kappa) table and leave it for the rest of the
+    run. Lower probe coherence = noisier gradient stream = more friction.
+
+    Usage (eager training loop):
+        tuner = DissipationAutoTuner(layers, probe_start, probe_end, table)
+        ...
+        for t in range(total_steps):
+            tuner.step(t)        # before the forward/backward of step t
+            train_step()
+
+    `table`: [(coh, kappa), ...] with coh strictly descending — e.g. the
+    MNIST-calibrated [(0.387, 0), (0.314, 100), (0.288, 200), (0.274, 400),
+    (0.256, 400)]. The table is TASK-CALIBRATED: measure it once per domain
+    by sweeping kappa at a few known noise levels (exp 5/6 scripts) — the
+    transferable object is the procedure, not these numbers.
+
+    Probe placement matters (exp 6): the window must sit after the warmup /
+    init-consolidation transient (the telescope is empty before ~2 epochs,
+    coherence reads low regardless of noise) and the same window must be
+    used for calibration and probing. Under heavy noise the probe length is
+    the cost — memorization during the probe is not undone by the commit —
+    so keep the window as early as the transient allows.
+
+    CUDA-graph caveat: gf_consol enters the kernel as a launch-time scalar,
+    so eager backward picks the commit up on the next step, but a CAPTURED
+    graph bakes the value at capture time. With the Stage-3 graph, capture
+    after the commit (probe eagerly, then capture), or port kappa to a
+    device tensor like lr/sigma/the floors.
+    """
+
+    def __init__(self, layers, probe_start, probe_end, table,
+                 probe_kappa=50.0, measure_every=10, verbose=True,
+                 beta1_on=0.1, beta1_coh_threshold=0.35):
+        assert probe_end > probe_start >= 0
+        assert all(c1 > c2 for (c1, _), (c2, _) in zip(table, table[1:])), \
+            "table coh values must be strictly descending"
+        self.layers = list(layers)
+        self.probe_start, self.probe_end = int(probe_start), int(probe_end)
+        self.table = [(float(c), float(k)) for c, k in table]
+        self.probe_kappa = float(probe_kappa)
+        self.measure_every = max(1, int(measure_every))
+        self.verbose = verbose
+        # Coherence-gated momentum, probe-selected (exp 7): beta1_on is
+        # committed iff the probe coherence clears the threshold — momentum
+        # only on streams the gate reads as clean. beta1 = 0.1 sits at the
+        # critical-damping boundary (1+b1)(1-alpha) ~ 1; any beta1 > 0 LOSES
+        # under label noise (it amplifies coherent memorization drift), which
+        # is exactly what the threshold prevents. Like the kappa table, the
+        # threshold is calibrated in probe-window coherence units. Set
+        # beta1_on=0 to disable. One-task validation so far (MNIST grid) —
+        # gate adoption on the nanoGPT A/B like the rest.
+        self.beta1_on = float(beta1_on)
+        self.beta1_coh_threshold = float(beta1_coh_threshold)
+        self._samples = []
+        self.committed = None
+        self.committed_beta1 = None
+        for m in self.layers:
+            m.gf_consol = self.probe_kappa
+            m.beta1 = 0.0          # probe at the safe default
+
+    def kappa_from_coh(self, c):
+        t = self.table
+        if c >= t[0][0]:
+            return t[0][1]
+        if c <= t[-1][0]:
+            return t[-1][1]
+        for (c1, k1), (c2, k2) in zip(t, t[1:]):
+            if c2 <= c <= c1:
+                return k1 + (c1 - c) / (c1 - c2) * (k2 - k1)
+        return t[-1][1]
+
+    def step(self, t):
+        """Call once per optimizer step, before the backward of step t.
+        Returns the committed kappa once, at t == probe_end; else None."""
+        if self.committed is not None:
+            return None
+        if self.probe_start <= t < self.probe_end \
+                and (t - self.probe_start) % self.measure_every == 0:
+            vals = [measure_coherence(m) for m in self.layers]
+            if vals:
+                self._samples.append(sum(vals) / len(vals))
+        if t >= self.probe_end:
+            coh = (sum(self._samples) / len(self._samples)) \
+                if self._samples else self.table[0][0]
+            self.committed = self.kappa_from_coh(coh)
+            self.committed_beta1 = self.beta1_on \
+                if (self.beta1_on > 0 and coh >= self.beta1_coh_threshold) \
+                else 0.0
+            for m in self.layers:
+                m.gf_consol = self.committed
+                m.beta1 = self.committed_beta1
+            if self.verbose:
+                print(f"[concord] dissipation autotune: probe coh={coh:.4f} "
+                      f"-> kappa={self.committed:.0f}, "
+                      f"beta1={self.committed_beta1:g} "
+                      f"({len(self._samples)} samples, "
+                      f"steps {self.probe_start}-{self.probe_end})")
+            return self.committed
+        return None
 
 
 # ============================================================
