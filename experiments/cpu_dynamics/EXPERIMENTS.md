@@ -178,3 +178,39 @@ small, single-seed, and possibly BatchNorm-mediated on CIFAR (this MLP has no BN
    +0.9% over AdamW, with 43% → 24% noise memorization).
 4. **Deploy ≥ live** in every regime tested, with the margin appearing exactly when
    gradients are noisy — consistent with the "ship the posterior mean" story.
+
+## Exp 5 — the dissipation curve: κ\*(noise) (`exp5_kappa_noise_curve.py`)
+
+Full grid: label-noise fraction ρ ∈ {0, 10, 20, 30, 45%} × κ ∈ {0…800}, overfitting
+regime (4k × 25 epochs), fixed-C\* gate, fluctuation off (σ = 0) so the curve isolates
+the dissipation. Deploy clean-test accuracy, 3 seeds (`exp5_results.json` has every cell;
+figure `exp5_kappa_noise_curve.png`).
+
+| label noise ρ | κ\* | acc at κ\* | acc at κ=0 | Δ |
+|---|---|---|---|---|
+| 0% | **0** | 93.66 | 93.66 | — |
+| 10% | **100** | 92.72 | 92.42 | +0.30 |
+| 20% | **200** | 91.72 | 90.53 | +1.19 |
+| 30% | **400** | 90.77 | 88.27 | +2.50 |
+| 45% | **400** | 89.53 | 83.01 | +6.52 |
+
+Findings:
+
+1. **κ\* rises roughly linearly with noise, then saturates**: κ\* ≈ 1000·ρ up to
+   ρ ≈ 30%, flat at ≈ 400 beyond. An odds-law extrapolation (κ\* ∝ ρ/(1−ρ), predicting
+   ~740 at 45%) was tested and falsified: κ = 600 and 800 at 45% both score below
+   κ = 400. There is a maximum useful friction — past it, draining signal costs more
+   than the marginal noise protection buys, even with nearly half the labels wrong.
+   The plateau sits well inside the stability ceiling (lr·κ < 2 → κ < 2000 at this lr):
+   the optimum is loss-driven, not stability-driven.
+2. **At fixed κ, memorization is nearly noise-level-independent** (κ = 100 → ~19–23%
+   of wrong labels memorized at every ρ; κ = 400 → ~12%): the dissipation sets a
+   *memorization-rate budget* — how fast slow coherent drift may consolidate — rather
+   than responding to how much noise there is.
+3. **The risk is asymmetric.** Over-damping on clean data is cheap (κ = 400 costs
+   −1.5%); under-damping on noisy data is expensive (κ = 0 at 45% costs −6.5%). With
+   unknown noise levels, err high.
+4. **κ\* = 0 exactly at zero noise** — every κ > 0 monotonically hurts a clean task in
+   this regime. The dissipation is pure insurance; its premium is only worth paying
+   when there is noise to reject. (The winner's κ = 50 reads as a mild-noise prior —
+   sensible for the heavy-tailed LM/diffusion streams it was tuned on.)
