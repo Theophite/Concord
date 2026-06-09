@@ -27,9 +27,12 @@ import math
 import torch
 
 
-def compute_drift_cancel_C(alpha=0.1, alpha_v=0.001):
+def compute_drift_cancel_C(alpha=0.1, alpha_v=0.001, mass_preserve=True):
     L = (1.0 - alpha) / alpha
-    return L * alpha_v / (1.0 - L * alpha_v)
+    if mass_preserve:
+        # telescope relaxes at 2*alpha_v under the mass-preserving leak
+        return L * 2 * alpha_v / (1.0 - 2 * alpha_v)
+    return L * alpha_v / (1.0 - L * alpha_v)   # legacy (shipped) value
 
 
 def _cos_floor(start, end, it, horizon):

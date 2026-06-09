@@ -71,6 +71,10 @@ def run(arm, seed, data):
     elif arm == "winner_c2":
         opt = ConcordRef(net, gate=True, kappa=50.0, noise=True, **kw)
         opt.Cstar = 2.0 * compute_drift_cancel_C()
+    if arm.endswith("_legacy"):
+        base = arm[:-7]
+        opt = (ConcordRef(net, gate=True, kappa=50.0, noise=(base == "winner"), **kw))
+        opt.Cstar = compute_drift_cancel_C(mass_preserve=False)
     gen = torch.Generator().manual_seed(seed)
     t = 0
     for _ in range(EPOCHS):
@@ -95,7 +99,7 @@ def run(arm, seed, data):
 if __name__ == "__main__":
     data = load_mnist()
     print(f"steps/run = {EPOCHS * (len(data[0]) // BATCH)}")
-    for arm in ("adamw", "bare", "dissip", "winner", "winner_c2"):
+    for arm in ("adamw", "bare", "dissip_legacy", "dissip", "winner_legacy", "winner"):
         lives, deps = [], []
         t0 = time.time()
         for seed in SEEDS:

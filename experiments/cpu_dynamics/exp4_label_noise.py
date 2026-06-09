@@ -46,6 +46,10 @@ def run(arm, seed, data):
     elif arm == "winner_c2":
         opt = ConcordRef(net, gate=True, kappa=50.0, noise=True, **kw)
         opt.Cstar = 2.0 * compute_drift_cancel_C()
+    if arm.endswith("_legacy"):
+        base = arm[:-7]
+        opt = (ConcordRef(net, gate=True, kappa=50.0, noise=(base == "winner"), **kw))
+        opt.Cstar = compute_drift_cancel_C(mass_preserve=False)
     t = 0
     for _ in range(EPOCHS):
         perm = torch.randperm(len(x), generator=gen)
@@ -71,7 +75,7 @@ if __name__ == "__main__":
     data = load_mnist()
     print(f"train={SUBSET} noise={NOISE_FRAC:.0%} steps/run="
           f"{EPOCHS * (SUBSET // BATCH)}  (clean-test accuracy)")
-    for arm in ("adamw", "bare", "dissip", "winner", "winner_c2"):
+    for arm in ("adamw", "bare", "dissip_legacy", "dissip", "winner_legacy", "winner"):
         lives, deps, fits = [], [], []
         t0 = time.time()
         for seed in SEEDS:

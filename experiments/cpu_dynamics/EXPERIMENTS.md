@@ -66,13 +66,65 @@ lags). Steady-state analysis of the recursion predicts coh ≈ 0.42 at open gate
 measured 0.55 (v̂ rank-1 inexactness accounts for the gap).
 
 Empirical check (pure drift, full winner config): shipped C\* → coh 0.29; **2×C\* →
-coh 0.96**, while the pure-noise control stays at 0.12. The candidate one-line refit is
-ρ = 2·α_v (under `MASS_PRESERVE=True`) in `compute_drift_cancel_C` — same shape as the
-fix already recorded in that docstring's history (the previous constant was 11× off in
-the other direction). End-to-end it is *not* automatically a win (exp 3/4: helps the
-clean task, neutral-to-slightly-negative under label noise, where a more skeptical gate
-is mildly protective) — it sharpens the *meter*, and the consumers were tuned around
-the dull one.
+coh 0.96**, while the pure-noise control stays at 0.12. The exact fixed-point value is
+`C* = L·2α_v/(1 − 2α_v) ≈ 0.018036`.
+
+**The fix is applied on this branch**: `compute_drift_cancel_C` in `concord/packed_b.py`,
+`dist/concord_winner/concord/packed_b.py`, and `src/prototype_packed_b.py` now takes
+`mass_preserve=True` (matching the layer default `mass_preserve_v=True`) and returns the
+corrected value; the legacy formula is preserved under `mass_preserve=False`, and the
+wrapper call sites pass their own `mass_preserve` flag through. (The older
+`src/concord_triton_fused.py` lineage is untouched — different codepath, leak semantics
+not re-verified.) Same shape of fix as the one already recorded in that docstring's
+history (the previous constant was 11× off in the other direction). Porting to
+`concord-integration` is the same edit in
+`modules/util/optimizer/concord/prototype_packed_b.py`.
+
+## After the fix: re-run results
+
+Exp 2 rerun with the honest gate (figure regenerated): pure-drift coherence 0.84 in the
+full winner config, and the gate's character changes — **drift tracking is now faster
+than AdamW** (157 vs 122 displacement; friction shuts off on coherent motion) at the
+cost of slightly more noise walk (2.69 vs 2.41). Displacement selectivity (drift/noise
+ratio): AdamW 43, shipped gate 45, fixed gate **58**.
+
+MNIST, matched κ = 50, deploy accuracy (3 seeds):
+
+| regime | legacy C\* | fixed C\* |
+|---|---|---|
+| clean (exp 3) — dissip | 95.84 ± 0.08 | **96.02 ± 0.10** |
+| clean (exp 3) — winner | 95.79 ± 0.12 | **95.99 ± 0.12** |
+| label noise, no-overfit budget (exp 4) — dissip | 93.20 ± 0.36 | **93.34 ± 0.42** |
+| label noise, overfitting regime — dissip | **90.06 ± 0.33** (24.6% mem.) | 89.66 ± 0.39 (27.8% mem.) |
+| label noise, overfitting regime — winner | **90.00 ± 0.27** (24.2% mem.) | 89.74 ± 0.43 (26.5% mem.) |
+
+And the κ frontier in the two regimes (dissip arm, deploy):
+
+| κ | clean, legacy | clean, fixed | noisy-overfit, legacy | noisy-overfit, fixed |
+|---|---|---|---|---|
+| 50 | 95.84 | **96.02** | 90.06 (24.6%) | 89.66 (27.8%) |
+| 150 | 94.71 | 95.11 | **90.81 (—)** | 90.53 (17.5%) |
+
+The pattern is consistent and instructive:
+
+1. **At matched κ, the honest gate wins wherever coherent = generalizing** (clean task,
+   short-budget noisy task) and **loses where coherent = memorizing** (the overfitting
+   regime): memorization gradients are per-weight coherent over many epochs, so a
+   sharper drift detector waves them through. The miscalibrated gate's half-blindness
+   was acting as accidental extra skepticism — the κ = 50 anti-memorization result of
+   exp 4 was partly *tuned around the bug*.
+2. **κ re-tuning moves both gates up in the noisy regime** (κ = 150: legacy 90.81,
+   fixed 90.53 — both beating every κ = 50 cell) and costs the clean task. The
+   dissipation strength, not the gate calibration, is the regime knob; the gate
+   calibration decides how cleanly friction exempts whatever the gate calls signal.
+3. Practical conclusion for the repo: the fix makes the gate measure what its derivation
+   says it measures (and what the variance-map diagnostic assumes). Whether it improves
+   the *validated* tasks is a different question — nanoGPT/SDXL sit in a different
+   regime (real Bayes error, heavy tails, no label-noise memorization pressure), the
+   winner's κ/floors were tuned against the dull meter, and adopting the fix should be
+   gated on the same-seed nanoGPT A/B in the real harness (GPU), ideally with a small κ
+   sweep. The CPU evidence says: expect the meter to read correctly, expect the tuning
+   optimum to shift.
 
 ## Exp 3 — clean MNIST ablation (784–256–10 MLP, 2 epochs, lr 1e-3, 3 seeds)
 
