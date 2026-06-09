@@ -2142,7 +2142,8 @@ class DissipationAutoTuner:
     """
 
     def __init__(self, layers, probe_start, probe_end, table,
-                 probe_kappa=50.0, measure_every=10, verbose=True):
+                 probe_kappa=50.0, measure_every=10, verbose=True,
+                 beta1_on=0.1, beta1_coh_threshold=0.35):
         assert probe_end > probe_start >= 0
         assert all(c1 > c2 for (c1, _), (c2, _) in zip(table, table[1:])), \
             "table coh values must be strictly descending"
@@ -2152,10 +2153,23 @@ class DissipationAutoTuner:
         self.probe_kappa = float(probe_kappa)
         self.measure_every = max(1, int(measure_every))
         self.verbose = verbose
+        # Coherence-gated momentum, probe-selected (exp 7): beta1_on is
+        # committed iff the probe coherence clears the threshold — momentum
+        # only on streams the gate reads as clean. beta1 = 0.1 sits at the
+        # critical-damping boundary (1+b1)(1-alpha) ~ 1; any beta1 > 0 LOSES
+        # under label noise (it amplifies coherent memorization drift), which
+        # is exactly what the threshold prevents. Like the kappa table, the
+        # threshold is calibrated in probe-window coherence units. Set
+        # beta1_on=0 to disable. One-task validation so far (MNIST grid) —
+        # gate adoption on the nanoGPT A/B like the rest.
+        self.beta1_on = float(beta1_on)
+        self.beta1_coh_threshold = float(beta1_coh_threshold)
         self._samples = []
         self.committed = None
+        self.committed_beta1 = None
         for m in self.layers:
             m.gf_consol = self.probe_kappa
+            m.beta1 = 0.0          # probe at the safe default
 
     def kappa_from_coh(self, c):
         t = self.table
@@ -2182,11 +2196,16 @@ class DissipationAutoTuner:
             coh = (sum(self._samples) / len(self._samples)) \
                 if self._samples else self.table[0][0]
             self.committed = self.kappa_from_coh(coh)
+            self.committed_beta1 = self.beta1_on \
+                if (self.beta1_on > 0 and coh >= self.beta1_coh_threshold) \
+                else 0.0
             for m in self.layers:
                 m.gf_consol = self.committed
+                m.beta1 = self.committed_beta1
             if self.verbose:
                 print(f"[concord] dissipation autotune: probe coh={coh:.4f} "
-                      f"-> kappa={self.committed:.0f} "
+                      f"-> kappa={self.committed:.0f}, "
+                      f"beta1={self.committed_beta1:g} "
                       f"({len(self._samples)} samples, "
                       f"steps {self.probe_start}-{self.probe_end})")
             return self.committed

@@ -81,6 +81,21 @@ assert committed is not None and committed[0] == 50, "commit step wrong"
 assert all(m.gf_consol == committed[1] for m in layers), "kappa not applied"
 expect = tuner.kappa_from_coh(float(coh_pkg.mean()))
 assert abs(committed[1] - expect) < 1e-9
+# beta1 commit: probe runs at 0; threshold decides the committed value
+probe_coh = float(coh_pkg.mean())
+assert tuner.committed_beta1 == (0.1 if probe_coh >= 0.35 else 0.0)
+assert all(m.beta1 == tuner.committed_beta1 for m in layers)
+lo = DissipationAutoTuner([FakeLayer()], 0, 5, TABLE, verbose=False,
+                          beta1_coh_threshold=0.0)     # always clears
+assert all(m.beta1 == 0.0 for m in lo.layers), "probe must run at beta1=0"
+for t in range(6):
+    lo.step(t)
+assert lo.committed_beta1 == 0.1 and lo.layers[0].beta1 == 0.1
+off = DissipationAutoTuner([FakeLayer()], 0, 5, TABLE, verbose=False,
+                           beta1_on=0.0)               # disabled
+for t in range(6):
+    off.step(t)
+assert off.committed_beta1 == 0.0
 # interpolation endpoints + midpoints
 assert tuner.kappa_from_coh(0.50) == 0.0
 assert tuner.kappa_from_coh(0.20) == 400.0
