@@ -214,3 +214,54 @@ Findings:
    this regime. The dissipation is pure insurance; its premium is only worth paying
    when there is noise to reject. (The winner's κ = 50 reads as a mild-noise prior —
    sensible for the heavy-tailed LM/diffusion streams it was tuned on.)
+
+## Exp 6 — autotuning the dissipation from an estimated noise level (`exp6_autotune.py`)
+
+Closing the loop on exp 5: κ\* indexed by a *measurable* statistic instead of
+ground-truth ρ. Three iterations, each informative (`exp6_results.json`,
+`exp6_ramp_results.json`, `exp6_v2_results.json`, figure `exp6_autotune.png`):
+
+1. **v1 — continuous control from raw-gradient coherence: the meter fails, the loop
+   "works" anyway.** A per-layer EMA-gradient coherence statistic saturates at
+   η ≈ 0.995–0.999 for every ρ (at batch 128 the raw gradient stream is almost entirely
+   minibatch noise), yet closed-loop accuracy matched or beat the oracle for ρ ≤ 30%.
+   The mechanism was not noise tracking but the emergent *time profile*: κ low early,
+   high late.
+2. **The schedule alone is not enough.** Meter-free linear κ ramps (0 → K over
+   training) reproduce the low-noise wins but lose badly at high noise (45%: best ramp
+   87.55 vs oracle 89.53) — memorization starts early, so friction must arrive early,
+   which requires sensing. And the late-κ observation stands on its own: κ = 400
+   applied after epoch 3 costs only −0.2 on a clean task vs −1.5 applied from step 0 —
+   most of the dissipation's clean-task tax is paid early in training.
+3. **v2 — the right meter is the gate itself.** Mid-training *gate coherence*
+   (`mean coh`, velocity-side — after the telescope has integrated out minibatch noise)
+   discriminates label-noise levels cleanly and monotonically: coh(epochs 3–8, κ=50) =
+   0.387 / 0.314 / 0.288 / 0.274 / 0.256 for ρ = 0/10/20/30/45%, spreads ~10–50×
+   smaller than the separations. **Probe-then-commit**: train at the default κ = 50 for
+   epochs 0–8, read coh over epochs 3–8, commit κ from the piecewise-linear
+   (coh → κ\*) table for the rest:
+
+| ρ | committed κ (oracle κ\*) | autotuned deploy acc | oracle fixed | κ=0 |
+|---|---|---|---|---|
+| 0% | 2 (0) | 93.52 ± 0.05 | 93.66 | 93.66 |
+| 10% | 103 (100) | 92.71 ± 0.19 | 92.72 | 92.42 |
+| 15% (held out) | 151 (—) | 92.11 ± 0.10 | — | — |
+| 20% | 205 (200) | 91.64 ± 0.45 | 91.72 | 90.53 |
+| 30% | 381 (400) | 90.54 ± 0.24 | 90.77 | 88.27 |
+| 38% (held out) | 400 (—) | 89.59 ± 0.51 | — | — |
+| 45% | 400 (400) | 87.99 ± 0.68 | 89.53 | 83.01 |
+
+The meter recovers oracle κ\* almost exactly (2/103/205/381/400 vs 0/100/200/400/400)
+and interpolates sensibly at held-out noise levels, with no knowledge of ρ. Accuracy is
+within ~0.2% of the oracle through ρ = 30% while paying only −0.14 on the clean task.
+The remaining gap at extreme noise (−1.5 at 45%) is the probe's price: eight epochs at
+κ = 50 lock in early memorization that the late commit can't undo — the same
+"friction must arrive early under heavy noise" constraint the ramp test exposed. A
+shorter probe, a higher default-κ probe, or a continuous controller on the gate-coh
+meter (with its κ-feedback compensated) are the obvious next iterations.
+
+Caveats: the (coh → κ\*) table is calibrated on this task/architecture/schedule — the
+transferable object is the *procedure* (the gate's own mid-training coherence is a
+reliable, nearly-free noise meter; map it through a κ\* curve measured once per domain).
+In the real optimizer, mean gate coherence is available per layer at zero extra cost —
+the kernel already computes coh per weight; aggregating it is one reduction.
