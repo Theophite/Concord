@@ -44,6 +44,45 @@ Three mechanisms make this an optimizer rather than just a quantization format:
    matmul, so no persistent bf16 weight copy exists (~5 GB saved on SDXL: ~15 GB footprint
    fused vs ~20 GB cached).
 
+## In familiar terms: EMA Lookahead AdaFactor behind a Kalman gain, in register
+
+Each ingredient of the recipe is a known optimizer idea; Concord's contribution is fusing
+them into one packed word and one kernel. Line refs are `concord/packed_b.py` (the same
+kernel ships in the fork as `modules/util/optimizer/concord/prototype_packed_b.py`).
+
+- **EMA cascade.** The three fields are exponential moving averages of each other at three
+  timescales: `s_slow` tracks the live weight at α = 0.1, `v_slow` tracks `s_slow` at
+  α_v = 0.001, and the factored second moment is a β₂ = 0.999 EMA of g².
+- **Lookahead, continuous and nested.** The "chase" (L604–611) is exactly Lookahead's
+  slow-weight update `slow ← slow + α·(fast − slow)`, run every step instead of every k:
+  the slow position absorbs α of the fast displacement and the fast field keeps the rest,
+  with the live weight invariant across the transfer (it redistributes mass, it doesn't
+  step). The leak (L616–629) is a second Lookahead level at α_v. Deploying from
+  `consolidated_weight()` — drop `s_fast` — is Lookahead's "evaluate at the slow weights."
+- **AdaFactor preconditioner.** The second moment is rank-1 factored exactly as in
+  AdaFactor: row/col marginals of g² kept as EMAs (L1269–1284), reconstructed in-kernel as
+  `v̂ = v_row ⊗ v_col / Σv_row` (L498–503), and the step is `g / (v̂ + ε)^0.5` (L539–541;
+  at winner settings v_scale = 0, δ² = 1, so v̂ *is* the denominator). The only optimizer
+  state outside the packed word is these two O(N+K) fp32 vectors per layer — and the
+  storage format's shared row/col exponents echo the same factorization.
+- **Kalman-style gating.** The coherence gate (L512–524, the kernel calls it a
+  "Wiener/Kalman SNR gate") decomposes the fast field into signal + noise using the two
+  time-lagged slow states: signal = C\*·(s_slow − v_slow) — the steady drift, with C\*
+  derived analytically so E[noise] = 0 under pure drift (L52–84) — and noise = the
+  residual. The gain `coh = S²/(S² + N²)` is the Wiener / steady-state Kalman gain, and
+  each consolidation stage accepts its innovation in proportion to estimated SNR: the
+  chase and leak gates (L596–597, L619–620) blend toward the floor schedule, and the
+  `gf_consol` evaporation (L568) drains the `(1 − coh)` fraction out of the velocity
+  before it can consolidate. This is the "measurement update" view: slow state = estimate,
+  fast state = observation, per-weight gain set by measured SNR.
+- **Everything in register.** All of the above is one Triton kernel launch per layer per
+  step (`_apply_packed_adamw_kernel`, L404–685): load the int32 word and the gradient,
+  unpack, gate, precondition, stochastically-round all three fields, repack, store — and
+  emit the next forward's bf16 weight (L663–671) plus the rebalance watermarks via
+  `atomic_max` (L675–685) on the way out. The optimizer state never exists unpacked in
+  global memory; momentum, lookahead state, anchor, and the gate's inputs live only in
+  registers between load and store.
+
 ## The winning configuration
 
 Validated on `main` by same-seed A/B (nanoGPT-char; metric is deployed-sv, lower is
