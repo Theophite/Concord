@@ -4,9 +4,10 @@ version that reuses packed_b's real cascade instead of re-implementing it.
 Storage/optimizer = a ConcordLinearPackedB(in=dim, out=K): packed_w is [K, dim]
 (one int32 per element: s_fast int16 + s_slow int8 + v_slow int8), and row_exp is
 PER-TOKEN (out-row). The forward is a gather; the backward scatters the per-row
-grad and drives packed_b's own fused cascade by feeding grad_W = grad_y^T @ I
-through core's autograd Function (an identity matmul -- cheap for the few new
-tokens of textual inversion). Then norm preservation pins each touched token's
+grad into grad_W [K, dim] and drives packed_b's own fused cascade by handing it
+straight to core.apply_grad_step(grad_W) -- a direct kernel launch, NOT a nested
+torch.autograd.backward() (the latter is illegal inside a CUDA-graph capture).
+Then norm preservation pins each touched token's
 DEPLOY norm to the target (vocab median): power-of-2 via row_exp + a mantissa
 residual (col_exp=0, so this is exact per token).
 """
@@ -36,11 +37,13 @@ class _PackedEmbStep(torch.autograd.Function):
         # scatter per-position grad into a per-token grad_W [K, dim].
         G = torch.zeros(mod.K, mod.dim, device=grad_emb.device)
         G.index_add_(0, ids.reshape(-1), grad_emb.reshape(-1, mod.dim).float())
-        # drive packed_b's fused cascade: y = I @ W^T -> grad_W = grad_y^T @ I = G.
-        with torch.enable_grad():
-            x = mod._I.requires_grad_(True)
-            y = core(x)
-            y.backward(G.t().to(y.dtype))
+        # Drive packed_b's fused cascade DIRECTLY with grad_W = G -- one kernel launch, no
+        # re-entrant autograd. The old trick (core(x); y.backward(G.t())) ran a nested
+        # torch.autograd.backward(), which is ILLEGAL inside a CUDA-graph capture: it touches
+        # the legacy stream and aborts the capture (cudaErrorStreamCaptureImplicit) -- crashing
+        # specifically on the post-backup graph RE-capture. apply_grad_step is the identical
+        # apply path with no autograd engine, so capture (and re-capture) is safe.
+        core.apply_grad_step(G)
         core._resync_weight_buf()
         # Pin ALL K rows (static shape -> CUDA-graph capturable). torch.unique would be
         # dynamic-shaped AND sync. K is tiny and untouched rows are already at target,
@@ -159,38 +162,3 @@ def insert_new_tokens(te, tokenizer, names, init_specs=None, lr=5e-3, device="cu
     nm.init_tokens(init=init)
     te.text_model.embeddings.token_embedding = HybridCLIPEmbedding(base, nm, vocab)
     return nm
-
-
-if __name__ == "__main__":
-    import torch.nn.functional as F
-    dev = "cuda"
-    torch.manual_seed(0)
-    D, K = 64, 4
-    base = torch.randn(4000, D, device=dev)
-    base[:1200] *= 0.15
-    med = ConcordPackedEmbedding.vocab_median_norm(base)
-
-    tgt = torch.randn(K, D, device=dev)
-    tgt = tgt / tgt.norm(dim=1, keepdim=True) * 30.0
-    ids = torch.arange(K, device=dev)
-
-    emb = ConcordPackedEmbedding(K, D, device=dev, lr=5e-2, target_norm=med)
-    emb.init_tokens()
-    p0 = emb.core.packed_w.clone()
-    print(f"[init] deploy norm {emb.deploy_weight().norm(dim=1).mean():.2f} "
-          f"(median target {med:.2f}) | storage int32 packed_w {tuple(emb.core.packed_w.shape)} "
-          f"= {emb.core.packed_w.numel()*4} bytes ({emb.core.packed_w.numel()*32//emb.core.packed_w.numel()} b/param)")
-    l0 = None
-    for it in range(300):
-        loss = F.mse_loss(emb(ids).float(), tgt)
-        loss.backward()
-        if l0 is None:
-            l0 = loss.item()
-    dep = emb.deploy_weight()
-    cos = F.cosine_similarity(dep.float(), tgt, dim=1).mean().item()
-    changed = (emb.core.packed_w != p0).float().mean().item()
-    print(f"[trained] loss {l0:.3f}->{loss.item():.3f} | deploy norm "
-          f"{dep.norm(dim=1).mean():.2f} (pinned {med:.2f}) | cos {cos:.3f} | "
-          f"packed_w words changed {changed:.0%} (cascade ran)")
-    print("-> packed (32 b/param) reuse of packed_b's real cascade; deploy norm "
-          "pinned to the vocab median; learns the concept direction.")

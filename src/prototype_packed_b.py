@@ -152,6 +152,159 @@ def materialize_packed_bf16(packed_w, row_exp, col_exp, out,
     )
 
 
+# ============================================================================
+# Fused dequant-matmul (CONCORD_FUSED_MATMUL): compute y = x @ dequant(packed_w)^T
+# and grad_x = grad_y @ dequant(packed_w) WITHOUT materializing the full bf16
+# weight. Drops the ~2 B/param persistent _bf16_weight_buf cache (~5 GB across the
+# UNet's Linear layers). Validated to match cuBLAS to bf16 precision. Linear-only
+# (conv keeps the cache -- a fused dequant-conv is a separate kernel). In cached mode the
+# bf16 cache doubles as the gradient-accumulation freeze buffer; fused reads packed_w
+# directly, so s_fast ticks through the accumulation cycle rather than being frozen.
+# ============================================================================
+import os as _os
+_FUSED_MATMUL = bool(_os.environ.get("CONCORD_FUSED_MATMUL"))
+
+# One shared bf16 scratch (grown to the largest layer's N*K). The apply kernel
+# still writes the materialized weight as a side effect; in fused mode we hand it
+# this throwaway view instead of a per-layer buffer, so nothing 5 GB persists.
+_FUSED_SCRATCH = None
+
+
+def _get_fused_scratch(N, K, device):
+    global _FUSED_SCRATCH
+    need = N * K
+    if (_FUSED_SCRATCH is None or _FUSED_SCRATCH.numel() < need
+            or _FUSED_SCRATCH.device != device):
+        _FUSED_SCRATCH = torch.empty(need, dtype=torch.bfloat16, device=device)
+    return _FUSED_SCRATCH[:need].view(N, K)
+
+
+# Block-size autotune configs (key on M,N,K -> settles per layer shape during the graph
+# warmup, then a cached lookup during capture). Common winner on SDXL shapes: 128x64x32.
+_FUSED_AUTOTUNE_CONFIGS = [
+    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=4),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 32}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64}, num_warps=8, num_stages=3),
+]
+
+
+@triton.autotune(configs=_FUSED_AUTOTUNE_CONFIGS, key=['M', 'N', 'K'])
+@triton.jit
+def _fused_packed_linear_kernel(
+    x_ptr, packed_ptr, row_exp_ptr, col_exp_ptr, bias_ptr, y_ptr,
+    M, N, K, mantissa_bias,
+    stride_xm, stride_xk, stride_pn, stride_pk, stride_ym, stride_yn,
+    HAS_BIAS: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    row_e = tl.load(row_exp_ptr + offs_n, mask=offs_n < N, other=0).to(tl.int32)
+    # 2^(row_e[n]+col_e[k]-bias) is a SEPARABLE power of two -> factor it out of the dot:
+    # 2^col_e folds into x (per-K), the dot runs on the raw int mantissa, 2^(row_e-bias)
+    # scales the output (per-N). Collapses N*K exp2 calls to N+K. Bit-identical (exact).
+    row_scale = tl.exp2((row_e - mantissa_bias).to(tl.float32))   # per-N, once
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < K
+        col_e = tl.load(col_exp_ptr + offs_k, mask=k_mask, other=0).to(tl.int32)
+        col_scale = tl.exp2(col_e.to(tl.float32))                 # per-K, once per K-tile
+        x = tl.load(x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
+                    mask=(offs_m[:, None] < M) & (k_mask[None, :]), other=0.0).to(tl.float32)
+        x = (x * col_scale[None, :]).to(tl.bfloat16)              # fold 2^col_e into x (exact)
+        packed = tl.load(packed_ptr + offs_k[:, None] * stride_pk + offs_n[None, :] * stride_pn,
+                         mask=(k_mask[:, None]) & (offs_n[None, :] < N), other=0).to(tl.int32)
+        s_fast = packed >> 16
+        s_slow = (packed << 16) >> 24
+        v_slow = (packed << 24) >> 24
+        m_eff = (s_slow * 128 + s_fast + v_slow * 128).to(tl.bfloat16)   # raw mantissa, no exp2 in the dot
+        acc += tl.dot(x, m_eff)
+    acc = acc * row_scale[None, :]                               # fold 2^(row_e-bias) into the output
+    if HAS_BIAS:
+        acc += tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)[None, :]
+    tl.store(y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
+             acc.to(tl.bfloat16), mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+@triton.autotune(configs=_FUSED_AUTOTUNE_CONFIGS, key=['M', 'N', 'K'])
+@triton.jit
+def _fused_packed_gradx_kernel(
+    gy_ptr, packed_ptr, row_exp_ptr, col_exp_ptr, gx_ptr,
+    M, N, K, mantissa_bias,
+    stride_gym, stride_gyn, stride_pn, stride_pk, stride_gxm, stride_gxk,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    col_e = tl.load(col_exp_ptr + offs_k, mask=offs_k < K, other=0).to(tl.int32)
+    # Symmetric factoring: 2^row_e folds into grad_y (per-N), the dot runs on the raw
+    # mantissa, 2^(col_e-bias) scales the output (per-K). Bit-identical.
+    col_scale = tl.exp2((col_e - mantissa_bias).to(tl.float32))   # per-K, once -- output scale
+    acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+    for n0 in range(0, N, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        n_mask = offs_n < N
+        row_e = tl.load(row_exp_ptr + offs_n, mask=n_mask, other=0).to(tl.int32)
+        row_scale = tl.exp2(row_e.to(tl.float32))                 # per-N, once per N-tile
+        gy = tl.load(gy_ptr + offs_m[:, None] * stride_gym + offs_n[None, :] * stride_gyn,
+                     mask=(offs_m[:, None] < M) & (n_mask[None, :]), other=0.0).to(tl.float32)
+        gy = (gy * row_scale[None, :]).to(tl.bfloat16)            # fold 2^row_e into grad_y
+        packed = tl.load(packed_ptr + offs_n[:, None] * stride_pn + offs_k[None, :] * stride_pk,
+                         mask=(n_mask[:, None]) & (offs_k[None, :] < K), other=0).to(tl.int32)
+        s_fast = packed >> 16
+        s_slow = (packed << 16) >> 24
+        v_slow = (packed << 24) >> 24
+        m_eff = (s_slow * 128 + s_fast + v_slow * 128).to(tl.bfloat16)
+        acc += tl.dot(gy, m_eff)
+    acc = acc * col_scale[None, :]                               # fold 2^(col_e-bias) into the output
+    tl.store(gx_ptr + offs_m[:, None] * stride_gxm + offs_k[None, :] * stride_gxk,
+             acc.to(tl.bfloat16), mask=(offs_m[:, None] < M) & (offs_k[None, :] < K))
+
+
+def fused_packed_linear(x, packed_w, row_exp, col_exp, bias=None, mantissa_bias=15):
+    """y = x @ dequant(packed_w)^T (+bias). x is [..., K]; returns [..., N]."""
+    *lead, K = x.shape
+    N = packed_w.shape[0]
+    x2d = x.reshape(-1, K).contiguous() if not x.is_contiguous() else x.reshape(-1, K)
+    M = x2d.shape[0]
+    y = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
+    _fused_packed_linear_kernel[grid](
+        x2d, packed_w, row_exp, col_exp, bias if bias is not None else x2d, y,
+        M, N, K, int(mantissa_bias),
+        x2d.stride(0), x2d.stride(1), packed_w.stride(0), packed_w.stride(1),
+        y.stride(0), y.stride(1),
+        HAS_BIAS=bias is not None,
+    )
+    return y.reshape(*lead, N)
+
+
+def fused_packed_gradx(grad_y, packed_w, row_exp, col_exp, mantissa_bias=15):
+    """grad_x = grad_y @ dequant(packed_w). grad_y is [..., N]; returns [..., K]."""
+    *lead, N = grad_y.shape
+    K = packed_w.shape[1]
+    gy2d = grad_y.reshape(-1, N).contiguous() if not grad_y.is_contiguous() else grad_y.reshape(-1, N)
+    M = gy2d.shape[0]
+    gx = torch.empty((M, K), dtype=torch.bfloat16, device=grad_y.device)
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(K, META['BLOCK_K']))
+    _fused_packed_gradx_kernel[grid](
+        gy2d, packed_w, row_exp, col_exp, gx,
+        M, N, K, int(mantissa_bias),
+        gy2d.stride(0), gy2d.stride(1), packed_w.stride(0), packed_w.stride(1),
+        gx.stride(0), gx.stride(1),
+    )
+    return gx.reshape(*lead, K)
+
+
 @triton.jit
 def _apply_packed_sgd_kernel(
     packed_ptr,        # [N, K] int32, mutated in place
@@ -448,8 +601,9 @@ def _apply_packed_adamw_kernel(
     N, K,
     lr_ptr, mantissa_bias, alpha, beta1,
     weight_decay, eps_ptr, step_cap,
+    lazy_thresh,          # fp32: τ for the lazy-update gate (a coord stays active iff s_fast_in_w² > τ·v̂)
     v_scale, precond_p, gf_consol, drift_cancel_C, alpha_v_fast,
-    wd_sv, wd_sf,
+    wd_sv, wd_sf, wd_anchor,
     gf_trust_delta_sq,   # fp32: δ² in step = grad/√(Var + δ²·v̂);
                           # 0 disables (legacy: clamp by step_cap only)
     gate_gain,           # fp32: scalar cosine schedule on the commitment gate
@@ -477,6 +631,7 @@ def _apply_packed_adamw_kernel(
     USE_FIXED_COH: tl.constexpr,  # True → Wiener coh = S/(S+noise²) (units-correct)
     USE_RATIO_COH: tl.constexpr,  # True -> gate chase+leak by live coh, no coh_pre
     USE_GAP_FEEDBACK: tl.constexpr,  # True -> conserved gap-magnitude pass/evap split (strips floor)
+    USE_LAZY_GATE: tl.constexpr,  # True -> freeze gf_consol evap + leak on idle coords (no accumulated signal)
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -541,7 +696,7 @@ def _apply_packed_adamw_kernel(
     # v̂ (Adafactor rank-1, W² units) feeds both the trust region and the
     # consolidation-coherence gate, so load it if either is active.
     coh = 0.0
-    if (USE_GF_TRUST_REGION or USE_GF_CONSOLIDATION) or (USE_COHPRE or USE_RATIO_COH):
+    if ((USE_GF_TRUST_REGION or USE_GF_CONSOLIDATION) or (USE_COHPRE or USE_RATIO_COH)) or USE_LAZY_GATE:
         v_row_tile = tl.load(v_row_ptr + offs_n,
                               mask=n_mask, other=0.0).to(tl.float32)
         v_col_tile = tl.load(v_col_ptr + offs_k,
@@ -609,8 +764,16 @@ def _apply_packed_adamw_kernel(
     # the wd contribution to s_fast is -lr·wd·s_fast — a simple
     # exponential decay of s_fast with rate lr·wd per step.
     s_fast_in_w = d_fs * scale_fwd
+    # Lazy-update gate: under grad-accumulation s_fast holds the window's accumulated signal; a
+    # coord with no real signal stays ~0. Freeze dissipation (gf_consol evap + leak) on those, so
+    # a zero gradient is treated as no-information rather than as evidence to decay toward. v_hat =
+    # per-coord typical g² (W² units); the window amplifies real signal far above it, so τ is not
+    # sensitive. g_active = 1.0 everywhere when the flag is off -> bit-exact no-op.
+    g_active = 1.0
+    if USE_LAZY_GATE:
+        g_active = (s_fast_in_w * s_fast_in_w > lazy_thresh * v_hat).to(tl.float32)
     if USE_GAP_FEEDBACK:
-        evap_mantissa = (1.0 - c_pass) * alpha * d_fs   # conserved: non-passed velocity evaporates
+        evap_mantissa = (1.0 - c_pass) * alpha * d_fs * g_active   # conserved: non-passed velocity evaporates
     elif USE_GF_CONSOLIDATION:
         # gf-gated evaporation REPLACES uniform cautious wd: drain only the
         # INCOHERENT part of the velocity. coh→1 (signal) is preserved and
@@ -622,7 +785,7 @@ def _apply_packed_adamw_kernel(
         # position can settle (constant-κ over-skimmed late, when small
         # late-stage signal reads as incoherent). gf_consol is now the rate
         # at unit lr; at peak lr=0.1, gf_consol=0.3 ≈ the old κ=0.03.
-        evap_mantissa = lr * gf_consol * (1.0 - coh) * d_fs
+        evap_mantissa = lr * gf_consol * (1.0 - coh) * d_fs * g_active
     else:
         step_live = step_live + weight_decay * s_fast_in_w
         evap_mantissa = 0.0
@@ -688,7 +851,7 @@ def _apply_packed_adamw_kernel(
         # (s_slow_full), not s_fast (which is now a small velocity).
         s_slow_full_post = s_slow_i8 * 128
         gap_v_full = (s_slow_full_post - v_slow_full).to(tl.float32)
-        delta_v8 = alpha_v_fast * gap_v_full / 128.0 * consf   # gated: no leak mid-cycle
+        delta_v8 = alpha_v_fast * gap_v_full / 128.0 * consf * g_active   # gated: no leak mid-cycle / idle coord
         if USE_RATIO_COH:
             delta_v8 = delta_v8 * (leak_floor + (1.0 - leak_floor) * coh)   # slow->v_slow, floored
         r3 = _hash_uniform(s_fast, pos_hash, step_salt ^ 0x33335555)
@@ -722,6 +885,25 @@ def _apply_packed_adamw_kernel(
         frac_wd_sf = wd_sf_delta - floor_wd_sf
         tick_wd_sf = (floor_wd_sf + (r5 < frac_wd_sf).to(tl.float32)).to(tl.int32)
         s_fast = s_fast - tick_wd_sf
+
+        # ── anchor decay (wd_anchor): L2 on the trainable DELTA toward 0 ──
+        # Decay s_slow AND s_fast toward zero so the live weight relaxes toward the
+        # v_slow anchor (v_slow*128). This is the elastic pull-to-pretrained for
+        # FROZEN-v_slow mode. NOTE it is NOT wd_sv/wd_sf: those pull s_slow TOWARD
+        # v_slow, which — once v_slow is a pinned anchor instead of the usual EMA
+        # half of a mass-preserved (s_slow+v_slow) position — drags the weight to
+        # ~2*anchor. wd_anchor shrinks only the delta. consf-gated; wd_anchor=0
+        # (default) floors both ticks to 0 -> bit-exact no-op for every existing run.
+        anc_s8 = lr * wd_anchor * s_slow_i8.to(tl.float32) * consf
+        r6 = _hash_uniform(s_fast, pos_hash, step_salt ^ 0x13571357)
+        floor_a8 = tl.floor(anc_s8)
+        tick_a8 = (floor_a8 + (r6 < (anc_s8 - floor_a8)).to(tl.float32)).to(tl.int32)
+        s_slow_i8 = s_slow_i8 - tick_a8
+        anc_sf = lr * wd_anchor * s_fast.to(tl.float32) * consf
+        r7 = _hash_uniform(s_fast, pos_hash, step_salt ^ 0x2468ACE1)
+        floor_af = tl.floor(anc_sf)
+        tick_af = (floor_af + (r7 < (anc_sf - floor_af)).to(tl.float32)).to(tl.int32)
+        s_fast = s_fast - tick_af
 
     # ── clamp and repack ──────────────────────────────────────
     s_fast_c = tl.minimum(tl.maximum(s_fast, -32768), 32767)
@@ -968,6 +1150,24 @@ def set_ratio_coh(enabled):
     _RATIO_COH = bool(enabled)
 
 
+# Lazy-update gate (sparse/lazy-Adam style): freeze the dissipation (gf_consol evap + v_slow leak)
+# on coordinates with no accumulated gradient signal this window, so a zero gradient is treated as
+# no-information rather than evidence to decay toward. Off by default -> bit-exact no-op. The
+# threshold is relative to the per-coord typical g² (v̂), so it's scale-free across layers.
+_LAZY_GATE = False
+_LAZY_THRESH = 1e-4   # conservative: no-op on active signal to within 1 int8 LSB (smoke-tested); raise for accum
+
+
+def set_lazy_gate(enabled):
+    global _LAZY_GATE
+    _LAZY_GATE = bool(enabled)
+
+
+def set_lazy_thresh(thresh):
+    global _LAZY_THRESH
+    _LAZY_THRESH = float(thresh)
+
+
 def set_ratio_coh_floors(chase, leak):
     """Per-step setter for the two bootstrap floors. Schedule: cosine from 0.9
     (fast->slow) / 0.999 (slow->v_slow) to 0 over ~one epoch. Updates both the python
@@ -1040,7 +1240,7 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
                          v_scale=1.0, precond_p=0.5, gf_consol=0.0,
                          drift_cancel_C=None,
                          alpha_v_fast=0.001,
-                         wd_sv=0.0, wd_sf=0.0,
+                         wd_sv=0.0, wd_sf=0.0, wd_anchor=0.0,
                          mass_preserve=False, apply_chase=True,
                          track_rebalance=True,
                          v_row=None, v_col=None, sum_v_inv=None,
@@ -1103,10 +1303,11 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         N, K,
         lr_ptr, int(mantissa_bias), float(alpha), float(beta1),
         float(weight_decay), eps_ptr, float(step_cap),
+        float(_LAZY_THRESH),
         float(v_scale), float(precond_p), float(gf_consol),
         float(drift_cancel_C),
         float(alpha_v_fast),
-        float(wd_sv), float(wd_sf),
+        float(wd_sv), float(wd_sf), float(wd_anchor),
         float(gf_trust_delta_sq),
         float(_GATE_GAIN),
         _ratio_chase_floor_ptr,
@@ -1128,6 +1329,7 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         USE_FIXED_COH=bool(_USE_FIXED_COH),
         USE_RATIO_COH=bool(_RATIO_COH),
         USE_GAP_FEEDBACK=bool(_GAP_FEEDBACK),
+        USE_LAZY_GATE=bool(_LAZY_GATE),
     )
 
 
@@ -1383,7 +1585,7 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
                 optimizer_kind,
                 weight_decay, eps, step_cap,
                 v_scale, precond_p, gf_consol, drift_cancel_C, alpha_v_fast,
-                wd_sv, wd_sf,
+                wd_sv, wd_sf, wd_anchor,
                 mass_preserve, apply_chase, track_rebalance,
                 weight_buf, row_max_buf, col_max_buf,
                 v_row, v_col, sum_v_inv,
@@ -1396,8 +1598,15 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
         bias_bf16 = (bias.to(torch.bfloat16)
                      if bias is not None and bias.dtype != torch.bfloat16
                      else bias)
-        y = F.linear(x, weight_buf, bias_bf16)
-        ctx.save_for_backward(x, weight_buf)
+        ctx.fused = _FUSED_MATMUL
+        if _FUSED_MATMUL:
+            # Dequant inside the matmul; never touch weight_buf for the forward (it's a
+            # shared throwaway scratch in this mode, only the apply kernel writes it).
+            y = fused_packed_linear(x, packed_w, row_exp, col_exp, bias_bf16, mantissa_bias)
+            ctx.save_for_backward(x)
+        else:
+            y = F.linear(x, weight_buf, bias_bf16)
+            ctx.save_for_backward(x, weight_buf)
         ctx.packed_w = packed_w
         ctx.row_exp = row_exp
         ctx.col_exp = col_exp
@@ -1416,6 +1625,7 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
         ctx.alpha_v_fast = alpha_v_fast
         ctx.wd_sv = wd_sv
         ctx.wd_sf = wd_sf
+        ctx.wd_anchor = wd_anchor
         ctx.mass_preserve = mass_preserve
         ctx.apply_chase = apply_chase
         ctx.track_rebalance = track_rebalance
@@ -1434,20 +1644,26 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_y):
-        x, weight = ctx.saved_tensors
+        if ctx.fused:
+            (x,) = ctx.saved_tensors
+        else:
+            x, weight = ctx.saved_tensors
         if grad_y.dtype != torch.bfloat16:
             grad_y = grad_y.to(torch.bfloat16)
         if not grad_y.is_contiguous():
             grad_y = grad_y.contiguous()
         # grad_x: broadcasts batch dims naturally over weight [N,K].
-        grad_x = grad_y @ weight
+        if ctx.fused:
+            grad_x = fused_packed_gradx(grad_y, ctx.packed_w, ctx.row_exp,
+                                        ctx.col_exp, ctx.mantissa_bias)
+        else:
+            grad_x = grad_y @ weight
         # grad_W: flatten leading batch dims so grad_y_flat is [B*..., N]
         # and x_flat is [B*..., K]. grad_y_flat.T @ x_flat = [N, K].
         # The unflattened form `grad_y.transpose(-1,-2) @ x` only works
         # for 2D inputs — for 3D (e.g., transformer (B, L, K)) it gives
         # a per-batch slice, not the reduced [N, K] we need.
-        in_features = weight.shape[1]
-        out_features = weight.shape[0]
+        out_features, in_features = ctx.packed_w.shape   # [N, K]; works whether or not weight was saved
         x_flat = x.reshape(-1, in_features)
         grad_y_flat = grad_y.reshape(-1, out_features)
         grad_W = grad_y_flat.transpose(0, 1) @ x_flat
@@ -1479,7 +1695,16 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
                 # sigma is the device tensor (graph-stable); clamp the norm (no python branch).
                 sig_t = _get_sigmag_sigma(gwf.device)
                 nrm = noise.norm().clamp_min(1e-12)
-                grad_W = gwf + noise * (sig_t * gwf.norm() / nrm)
+                scaled = noise * (sig_t * gwf.norm() / nrm)
+                if _LAZY_GATE:
+                    # Lazy noise: only perturb coords that received a real gradient THIS micro-step,
+                    # so idle coords stay truly idle -- no injected noise accumulates in s_fast, and
+                    # the kernel lazy gate reads them as idle instead of being fooled "active" by the
+                    # noise. Mask on per-coord gradient power vs the tensor mean (same _LAZY_THRESH).
+                    # all-tensor (no python branch on tensor values) -> CUDA-graph-capture-safe.
+                    gp = gwf * gwf
+                    scaled = scaled * (gp > _LAZY_THRESH * gp.mean()).to(gwf.dtype)
+                grad_W = gwf + scaled
         if grad_W.dtype != torch.bfloat16:
             grad_W = grad_W.to(torch.bfloat16)
         if not grad_W.is_contiguous():
@@ -1525,7 +1750,7 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
                 gf_consol=ctx.gf_consol,
                 drift_cancel_C=ctx.drift_cancel_C,
                 alpha_v_fast=ctx.alpha_v_fast,
-                wd_sv=ctx.wd_sv, wd_sf=ctx.wd_sf,
+                wd_sv=ctx.wd_sv, wd_sf=ctx.wd_sf, wd_anchor=ctx.wd_anchor,
                 mass_preserve=ctx.mass_preserve,
                 apply_chase=ctx.apply_chase,
                 track_rebalance=ctx.track_rebalance,
@@ -1555,7 +1780,7 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
                 None,
                 None, None, None,
                 None, None, None, None, None,
-                None, None,
+                None, None, None,
                 None, None, None,
                 None, None, None,
                 None, None, None,
@@ -1643,6 +1868,10 @@ class ConcordLinearPackedB(nn.Module):
         self.allow_tickdown = False
         self.wd_sv = 0.0
         self.wd_sf = 0.0
+        # L2 decay of the trainable DELTA (s_slow, s_fast) toward 0 -> the live
+        # weight relaxes toward the v_slow anchor (v_slow*128). The elastic
+        # pull-to-pretrained for frozen-v_slow TE mode. 0 = off (no-op kernel tick).
+        self.wd_anchor = 0.0
         self.mass_preserve_v = True   # default to mass-preserving v_slow leak
         self.apply_chase = True
         # Default True for backward-compat. Set False in the cifar driver
@@ -1811,6 +2040,27 @@ class ConcordLinearPackedB(nn.Module):
         self._resync_weight_buf()
 
     @torch.no_grad()
+    def load_weights_anchor(self, W):
+        """Frozen-v_slow anchor init: pack W with its COARSE part in v_slow (the frozen
+        anchor, x128) and the FINE residual in s_fast, s_slow=0. get_weight() reproduces W
+        to ~16-bit; with alpha_v_fast=0 (v_slow pinned) + wd_anchor>0 the trainable delta
+        (s_slow+s_fast) relaxes toward this anchor. DEPLOY via get_weight (keeps s_fast),
+        NOT consolidated_weight (which drops s_fast -> only the coarse 8-bit anchor)."""
+        W = W.to(device=self.packed_w.device, dtype=torch.float32)
+        max_abs = W.abs().amax(dim=1).clamp(min=1e-30)
+        self.row_exp.copy_(torch.ceil(torch.log2(max_abs) + 1.0)
+                           .clamp(self.EXP_MIN, self.EXP_MAX).to(self.row_exp.dtype))
+        self.col_exp.zero_()
+        exp = (self.row_exp[:, None].float() + self.col_exp[None, :].float() - self.MANTISSA_BIAS)
+        scale = torch.pow(2.0, exp)
+        m_total = (W / scale).round().to(torch.int32)
+        v_slow = (m_total.float() / 128.0).round().clamp(INT8_MIN, INT8_MAX).to(torch.int32)
+        s_fast = (m_total - v_slow * 128).clamp(INT16_MIN, INT16_MAX).to(torch.int32)
+        s_slow = torch.zeros_like(s_fast)
+        self.packed_w.copy_(((s_fast & 0xFFFF) << 16) | ((s_slow & 0xFF) << 8) | (v_slow & 0xFF))
+        self._resync_weight_buf()
+
+    @torch.no_grad()
     def _resync_weight_buf(self):
         """Re-materialize the bf16 weight buffer from the current packed_w
         state. Call after any external mutation of packed_w (e.g.,
@@ -1939,17 +2189,33 @@ class ConcordLinearPackedB(nn.Module):
 
     def _ensure_buffers(self):
         N, K = self.packed_w.shape
-        wbuf = getattr(self, '_bf16_weight_buf', None)
-        if wbuf is None or wbuf.shape != self.packed_w.shape:
-            wbuf = torch.empty(self.packed_w.shape, dtype=torch.bfloat16,
-                                device=self.packed_w.device)
-            self._bf16_weight_buf = wbuf
-            # One-shot materialize: from now on, the apply kernel keeps
-            # wbuf in sync with packed_w (materialize-merge), so the
-            # forward path doesn't need a separate materialize launch.
-            materialize_packed_bf16(self.packed_w, self.row_exp,
-                                      self.col_exp, out=wbuf,
-                                      mantissa_bias=self.MANTISSA_BIAS)
+        if _FUSED_MATMUL and not hasattr(self, 'kh'):
+            # Fused dequant-matmul (Linear): no per-layer bf16 cache -- the forward/backward
+            # dequant inside the matmul. The apply kernel still writes the materialized weight
+            # as a side effect, so hand it ONE shared throwaway scratch. (In cached mode the
+            # per-layer cache doubles as the accumulation-freeze buffer; fused has no such buffer,
+            # so s_fast ticks through an accumulation cycle rather than being frozen mid-cycle.)
+            wbuf = _get_fused_scratch(N, K, self.packed_w.device)
+        elif _FUSED_MATMUL:
+            # Fused conv (has 'kh'): cuDNN can't dequant inside, so materialize this conv's
+            # weight into the SHARED scratch each forward (reused, not a per-layer cache); the
+            # conv backward re-materializes. One ~tens-of-MB buffer replaces the per-layer conv
+            # caches (~0.9 GB across the UNet).
+            wbuf = _get_fused_scratch(N, K, self.packed_w.device)
+            materialize_packed_bf16(self.packed_w, self.row_exp, self.col_exp,
+                                    out=wbuf, mantissa_bias=self.MANTISSA_BIAS)
+        else:
+            wbuf = getattr(self, '_bf16_weight_buf', None)
+            if wbuf is None or wbuf.shape != self.packed_w.shape:
+                wbuf = torch.empty(self.packed_w.shape, dtype=torch.bfloat16,
+                                    device=self.packed_w.device)
+                self._bf16_weight_buf = wbuf
+                # One-shot materialize: from now on, the apply kernel keeps
+                # wbuf in sync with packed_w (materialize-merge), so the
+                # forward path doesn't need a separate materialize launch.
+                materialize_packed_bf16(self.packed_w, self.row_exp,
+                                          self.col_exp, out=wbuf,
+                                          mantissa_bias=self.MANTISSA_BIAS)
         rmbuf = getattr(self, '_row_max_buf', None)
         if rmbuf is None or rmbuf.shape[0] != N:
             rmbuf = torch.zeros(N, dtype=torch.int32,
@@ -1988,7 +2254,7 @@ class ConcordLinearPackedB(nn.Module):
             self.optimizer_kind,
             self.weight_decay, self._eps_buf, self.step_cap,
             self.v_scale, self.precond_p, self.gf_consol, self.drift_cancel_C, self.alpha_v_fast,
-            self.wd_sv, self.wd_sf,
+            self.wd_sv, self.wd_sf, self.wd_anchor,
             self.mass_preserve_v, self.apply_chase, self.track_rebalance,
             wbuf, rmbuf, cmbuf,
             self.v_row, self.v_col, self._sum_v_inv,
@@ -1996,6 +2262,70 @@ class ConcordLinearPackedB(nn.Module):
             bool(self.track_adafactor_v),
             float(self.gf_trust_delta_sq), self._coh_pre)
         return y.to(in_dtype)
+
+    @torch.no_grad()
+    def apply_grad_step(self, grad_W):
+        """Apply ONE fused self-step for an EXTERNALLY-supplied weight gradient
+        grad_W [out_features, in_features], WITHOUT autograd -- a direct kernel launch.
+
+        Mirrors the apply path of FusedConcordLinearPackedB.backward (the optional
+        adafactor v_row/v_col EMA + the apply_packed_* kernel that mutates packed_w and
+        refreshes weight_buf). This exists so a caller (the packed embedding's self-step)
+        can drive the cascade INSIDE a CUDA-graph capture: a re-entrant
+        torch.autograd.backward() there touches the legacy stream and aborts the capture
+        with cudaErrorStreamCaptureImplicit. The experimental Sigma_g gradient noise is NOT
+        applied here -- it is keyed to the forward's grad_y/x decomposition, which a directly
+        supplied grad_W does not have (noise is default-off and irrelevant for the few
+        textual-inversion rows)."""
+        wbuf, rmbuf, cmbuf = self._ensure_buffers()
+        if grad_W.dtype != torch.bfloat16:
+            grad_W = grad_W.to(torch.bfloat16)
+        if not grad_W.is_contiguous():
+            grad_W = grad_W.contiguous()
+        if self.track_rebalance:
+            rmbuf.zero_()
+            cmbuf.zero_()
+        if self.track_adafactor_v and self.v_row is not None:
+            g2 = grad_W.float() ** 2
+            if _COH_WEIGHTED_V and self._coh_pre is not None:
+                w = self._coh_pre / self._coh_pre.mean().clamp(min=1e-12)
+                g2 = g2 * w
+            b2 = self.adafactor_beta2
+            self.v_row.mul_(b2).add_(g2.sum(dim=1), alpha=1.0 - b2)
+            self.v_col.mul_(b2).add_(g2.sum(dim=0), alpha=1.0 - b2)
+            self._sum_v_inv.fill_(0).add_(1.0 / self.v_row.sum().clamp(min=1e-30))
+        if self.optimizer_kind == 'adamw':
+            apply_packed_adamw(
+                self.packed_w, grad_W, wbuf,
+                self.row_exp, self.col_exp,
+                rmbuf, cmbuf,
+                lr=self._lr_buf, mantissa_bias=self.MANTISSA_BIAS,
+                alpha=self.alpha, beta1=self.beta1,
+                weight_decay=self.weight_decay, eps=self._eps_buf,
+                step_cap=self.step_cap,
+                v_scale=self.v_scale, precond_p=self.precond_p,
+                gf_consol=self.gf_consol,
+                drift_cancel_C=self.drift_cancel_C,
+                alpha_v_fast=self.alpha_v_fast,
+                wd_sv=self.wd_sv, wd_sf=self.wd_sf, wd_anchor=self.wd_anchor,
+                mass_preserve=self.mass_preserve_v,
+                apply_chase=self.apply_chase,
+                track_rebalance=self.track_rebalance,
+                v_row=self.v_row, v_col=self.v_col,
+                sum_v_inv=self._sum_v_inv,
+                gf_trust_delta_sq=self.gf_trust_delta_sq,
+                coh_pre=self._coh_pre,
+            )
+        else:
+            apply_packed_sgd(
+                self.packed_w, grad_W, wbuf,
+                self.row_exp, self.col_exp,
+                rmbuf, cmbuf,
+                lr=self._lr_buf, mantissa_bias=self.MANTISSA_BIAS,
+                alpha=self.alpha, beta1=self.beta1,
+                alpha_v_fast=self.alpha_v_fast,
+                mass_preserve=self.mass_preserve_v,
+                track_rebalance=self.track_rebalance)
 
     @torch.no_grad()
     def rebalance(self):
@@ -2080,7 +2410,7 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
                 optimizer_kind,
                 weight_decay, eps, step_cap,
                 v_scale, precond_p, gf_consol, drift_cancel_C, alpha_v_fast,
-                wd_sv, wd_sf,
+                wd_sv, wd_sf, wd_anchor,
                 mass_preserve, apply_chase, track_rebalance,
                 weight_buf, row_max_buf, col_max_buf,
                 v_row, v_col, sum_v_inv,
@@ -2097,7 +2427,13 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
                      else bias)
         y = torch.nn.functional.conv2d(x_bf16, weight_4d, bias=bias_bf16,
                                          stride=stride, padding=padding)
-        ctx.save_for_backward(x_bf16, weight_4d)
+        ctx.fused = _FUSED_MATMUL
+        if _FUSED_MATMUL:
+            # weight_4d is the shared scratch (overwritten by later layers) -> don't save it;
+            # the backward re-materializes from packed_w.
+            ctx.save_for_backward(x_bf16)
+        else:
+            ctx.save_for_backward(x_bf16, weight_4d)
         ctx.packed_w = packed_w
         ctx.row_exp = row_exp
         ctx.col_exp = col_exp
@@ -2121,6 +2457,7 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
         ctx.alpha_v_fast = alpha_v_fast
         ctx.wd_sv = wd_sv
         ctx.wd_sf = wd_sf
+        ctx.wd_anchor = wd_anchor
         ctx.mass_preserve = mass_preserve
         ctx.apply_chase = apply_chase
         ctx.track_rebalance = track_rebalance
@@ -2139,7 +2476,16 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_y):
-        x_bf16, weight_4d = ctx.saved_tensors
+        if ctx.fused:
+            (x_bf16,) = ctx.saved_tensors
+            # Re-materialize this conv's weight into the shared scratch (ctx.weight_buf is a
+            # still-valid view kept alive by ctx). grad_x reads it before the apply kernel
+            # overwrites it below.
+            materialize_packed_bf16(ctx.packed_w, ctx.row_exp, ctx.col_exp,
+                                    out=ctx.weight_buf, mantissa_bias=ctx.mantissa_bias)
+            weight_4d = ctx.weight_buf.view(ctx.out_channels, ctx.in_channels, ctx.kh, ctx.kw)
+        else:
+            x_bf16, weight_4d = ctx.saved_tensors
         if grad_y.dtype != torch.bfloat16:
             grad_y = grad_y.to(torch.bfloat16)
         if not grad_y.is_contiguous():
@@ -2190,7 +2536,7 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
                 gf_consol=ctx.gf_consol,
                 drift_cancel_C=ctx.drift_cancel_C,
                 alpha_v_fast=ctx.alpha_v_fast,
-                wd_sv=ctx.wd_sv, wd_sf=ctx.wd_sf,
+                wd_sv=ctx.wd_sv, wd_sf=ctx.wd_sf, wd_anchor=ctx.wd_anchor,
                 mass_preserve=ctx.mass_preserve,
                 apply_chase=ctx.apply_chase,
                 track_rebalance=ctx.track_rebalance,
@@ -2222,7 +2568,7 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
                 None,
                 None, None, None,
                 None, None, None, None, None,
-                None, None,
+                None, None, None,
                 None, None, None,
                 None, None, None,
                 None, None, None,
@@ -2263,7 +2609,7 @@ class ConcordConv2dPackedB(ConcordLinearPackedB):
             self.optimizer_kind,
             self.weight_decay, self._eps_buf, self.step_cap,
             self.v_scale, self.precond_p, self.gf_consol, self.drift_cancel_C, self.alpha_v_fast,
-            self.wd_sv, self.wd_sf,
+            self.wd_sv, self.wd_sf, self.wd_anchor,
             self.mass_preserve_v, self.apply_chase, self.track_rebalance,
             wbuf, rmbuf, cmbuf,
             self.v_row, self.v_col, self._sum_v_inv,
@@ -2476,7 +2822,3 @@ def main():
     else:
         print("=== PROTOTYPE B FAILED ===")
         sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
