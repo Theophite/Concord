@@ -29,3 +29,24 @@ compare_out/
 dist/*
 !dist/concord_winner/
 OneTrainer/
+
+# Native build outputs (cutlass experiments — regenerable)
+*.dll
+*.exp
+*.lib
+*.obj
+
+# Git history bundles & archives (large, regenerable)
+*.bundle
+*.zip
+
+# OneTrainer run workspaces (model backups + configs; large, regenerable)
+ot_noop_ws/
+ot_val/
+
+# Private token vocabulary — NEVER commit (public repo)
+token_list.local.txt
+*.local.txt
+
+# Local agent / editor state
+.claude/

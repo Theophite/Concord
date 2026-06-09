@@ -1,100 +1,105 @@
-# Concord × OneTrainer: SDXL full-UNet finetune in 24 GB
+# Concord × OneTrainer: SDXL full-UNet finetune in 24 GB — **AS-BUILT**
 
-Design spec. Goal: full SDXL UNet finetune on a 24 GB card, using Concord's packed-int
-optimizer (32 b/param weight-as-storage) wired into OneTrainer with **minimal monkeypatching**,
-including the fused Triton kernels and CUDA-graph capture.
+**Status: BUILT and in production.** This documents the integration as it actually exists and
+trains SDXL today — it is not a plan. (Earlier revisions of this file framed it as future work
+for a "next bot"; that premise was wrong and has been corrected.)
 
-## Why this fits 24 GB (the thesis)
+## Where it lives (two trees, one remote)
 
-Standard AdamW finetune holds, per UNet weight: fp32 master (32) + bf16 working (16) + m (32)
-+ v (32) ≈ **112 bits/param**. SDXL UNet ≈ 2.6 B params → the optimizer state alone is the
-VRAM wall. Concord holds the **entire** state (weight + both momenta + variance) in **one int32
-= 32 b/param**, the weight *is* the storage (no fp32 master). That's the 3.5× state reduction
-that turns "doesn't fit" into "fits".
+- **Optimizer library** (the kernel + modules): developed in **this repo** (`C:\concord`, `src/`),
+  mirrored 1:1 into the OneTrainer fork's `modules/util/optimizer/concord/`.
+- **OneTrainer-side integration** (the glue: controller, graph, saver/setup hooks): a **OneTrainer
+  fork** at `C:\fisher\OneTrainer-clean` — branch **`concord-integration`** on the same remote
+  (`Theophite/Concord.git`; unrelated history to this repo's `main`). Concord is a first-class
+  registered optimizer there: `Optimizer.CONCORD` (`modules/util/enum/Optimizer.py:83`).
+- The `C:\concord\OneTrainer/` clone in this repo was only ever **recon scratch** — it has **no**
+  integration code (gitignored). Ignore it; the real integration is the fork above.
 
-## The seam (verified in OneTrainer 2026-06 HEAD)
+## Why it fits 24 GB (the thesis — validated in practice)
 
-OneTrainer ALREADY swaps UNet modules in-place: `quantization_util.__replace_linear_layers`
-walks `named_modules()` and does `setattr(parent, attr, replacement)` to swap nn.Linear/Conv2d
-for quantized variants (called from `BaseStableDiffusionXLSetup` ~L85 `quantize_layers`). We
-mirror this idiom -> **low monkeypatch, OneTrainer's own pattern**.
+Standard AdamW holds, per UNet weight: fp32 master (32) + bf16 working (16) + m (32) + v (32) ≈
+**112 b/param**. Concord holds the entire state (weight + both momenta + variance) in **one int32 =
+32 b/param**; the weight *is* the storage (no fp32 master). That 3.5× state reduction turns
+"doesn't fit" into "fits." **Validated:** a full SDXL UNet finetune runs end-to-end — 794
+nn.Linear/nn.Conv2d swapped to packed layers — and saves a standard sharded UNet (see §4).
 
-Key facts established by recon:
-- `create_optimizer` (modules/util/create.py:124) returns a `torch.optim.Optimizer`; it has a
-  `supports_fused_back_pass()` path (Optimizer.py:101) + `step_parameter(tensor, group, i)` via
-  `register_post_accumulate_grad_hook` (GenericTrainer.__apply_fused_back_pass L556).
-- **Concord modules have NO nn.Parameter weights** (weight = packed_w buffer; step fused in the
-  module's autograd Function.backward). So Concord layers BYPASS OneTrainer's optimizer for the
-  swapped weights -- they self-update. OneTrainer's optimizer only handles the NON-swapped
-  trainable params (norms/embeddings/bias) = the "aux AdamW" split, exactly like nanoGPT.
-- **bf16 finetune uses NO grad scaler** (dtype_util.enable_grad_scaling: scaler only for FLOAT_16
-  + fp32 params). So no double-scaling conflict with Concord's in-backward step. bf16 is the
-  target (SDXL trains bf16; Concord internals are bf16).
-- Concord already has the pieces: `ConcordConv2dPackedB` (SDXL UNet is conv-heavy), a bf16
-  `.weight` property shim (packed_b.py:1481) so the module looks normal to sampling/EMA/saving,
-  `load_weights()` to ingest a pretrained weight into packed_w, `consolidated_weight()` to
-  materialize bf16 for checkpoint export, `rebalance()` per step, and `--cuda_graph`-style
-  capture (device-tensor scalars).
+## As-built architecture (file:line into `C:\fisher\OneTrainer-clean`)
 
-## The 3 integration points
+### 1. Optimizer slot — Concord layers self-step; OneTrainer's optimizer is just the aux
+`create_optimizer` (`modules/util/create.py:164`) for `Optimizer.CONCORD` returns a plain
+`torch.optim.SGD` over the **non-swapped** params (norms/biases/embeddings). The swapped UNet
+layers have **no nn.Parameter weight** — they self-update inside their autograd `Function.backward`,
+bypassing `optimizer.step()`. So "the Concord optimizer" is really: self-stepping packed layers +
+an aux SGD. (SGD not AdamW for the aux on purpose — AdamW normalizes every step and collapses group
+norms; rationale at `concord/concord_winner.py:333`.) `supports_fused_back_pass()` does **not**
+special-case CONCORD — it's orthogonal.
 
-### 1. Module swap (the VRAM win)
-`concord_onetrainer/inject.py : replace_unet_with_concord(unet, config)`
-- Mirror `__replace_linear_layers`: recurse, swap nn.Linear -> ConcordLinearPackedB and
-  nn.Conv2d -> ConcordConv2dPackedB via setattr, load the pretrained weight into packed_w
-  (`load_weights`), drop the original fp32/bf16 weight (the win).
-- Filter: only the big UNet hidden weights (skip tiny norm/bias; those go to aux AdamW). Use
-  OneTrainer's ModuleFilter pattern (same as Muon's hidden-layer filter).
-- Conv2d: pass stride/padding/dilation/groups (ConcordConv2dPackedB already takes them).
-- Frozen-base correctness: load_weights at swap time = bit-identical forward at step 0
-  (Concord's live weight == init until the first backward).
+### 2. The swap (the VRAM win)
+`StableDiffusionXLFineTuneSetup.setup_model()`
+(`modules/modelSetup/StableDiffusionXLFineTuneSetup.py:150-174`) builds a **`ConcordController`**
+(`modules/util/optimizer/concord_ot.py`). The controller calls `swap_unet_to_winner()`
+(`concord/concord_winner.py:114`): every `nn.Linear`/`nn.Conv2d` →
+`ConcordLinearPackedB`/`ConcordConv2dPackedB`, subject to OneTrainer's **Layer Filter** preset
+(`concord_winner.py:135`); the original fp32/bf16 weight is dropped. `before_step`/`after_step`
+hooks (`setup:375/395`) drive the per-step schedule (lr warmup-cosine, rising-late noise σ, ratio
+floors via `winner_step`) and `GatedRebalance` (fires only on real mantissa overflow). The
+`concord_fused_matmul` flag is set **before** the swap (layers read it at `__init__`).
 
-### 2. Optimizer slot (marker + aux + rebalance driver)
-- Add `Optimizer.CONCORD` to the enum; in `create_optimizer`, return a thin wrapper:
-  - the swapped Concord modules self-step in backward (no optimizer involvement);
-  - a real AdamW (or Concord-via-nanoGPT-aux) over the NON-swapped params;
-  - `.step()` ALSO drives `rebalance()` on every Concord module + advances lr/sigma device
-    tensors (the per-step schedule).
-- `supports_fused_back_pass()` -> the Concord layers are already fused; the wrapper reports
-  compatibility so OneTrainer's loop doesn't fight it.
-- lr: Concord reads `_lr_buf` (device tensor); the wrapper's lr schedule .fill_()s it.
+### 3. Text encoder + new-token embeddings
+- **TE anchor** (`swap_text_encoder_to_anchor`, `concord_winner.py:185`): CLIP-L Linears → packed
+  layers in **frozen-v_slow anchor mode** (`alpha_v_fast=0` pins the pretrained anchor; `wd_anchor`
+  elastic-pulls the trainable delta back). Default on when TE training is enabled (`concord_te_anchor`).
+- **Control plane** (`control_plane.py : ControlPlaneEmbedding`): replaces the TE `token_embedding`
+  and routes trainable new tokens to a `ConcordPackedEmbedding` (packed, self-stepping,
+  norm-preserving). `forward` is branch-free (`torch.where`) → CUDA-graph-safe. Installed via
+  `setup_packed_embeddings` (`concord_ot.py`), conditional on `concord_packed_embeddings`.
 
-### 3. CUDA graph
-- OneTrainer's train step (GenericTrainer) host side -> capture the UNet fwd+loss+bwd into one
-  graph (our proven recipe: capture iter0, side-stream warmup, no eager pre-roll, device-tensor
-  scalars). The aux AdamW step + rebalance stay eager after replay.
-- This is the trickiest piece (OneTrainer's loop has grad accum, EMA, sampling interleaved) ->
-  build LAST behind a flag, fall back to eager if capture fails. Correctness-gate vs eager
-  (within SR-noise floor, the nanoGPT method).
+### 4. Save / deploy — consolidate back to standard layers
+`StableDiffusionXLModelSaver.save`
+(`modules/modelSaver/stableDiffusionXL/StableDiffusionXLModelSaver.py:88-90`) →
+`ConcordController.consolidate_into_unet` (`concord_ot.py:144-173`): each packed layer →
+`consolidated_weight()` (drops s_fast — the deploy-slow weight) → a standard `nn.Linear`/`nn.Conv2d`,
+yielding a normal SDXL `.safetensors`. Prints `[concord] consolidated <n> layers -> standard
+nn.Linear/nn.Conv2d for deploy` (`concord_ot.py:172`). **Final-save only / destructive**; internal
+**backups keep packed state** for resume. TE Linears + trained new-token vectors are reversibly
+materialized to standard tensors for the save and restored afterward so training continues.
 
-## Build order: all three, code-first (no SDXL download needed to write/import-check)
-inject.py (swap) -> optimizer wrapper + enum/create.py hooks -> graph wrapper. Validate each
-imports against OneTrainer's modules; then download SDXL + bf16 finetune run once GPU is free.
+### 5. CUDA graph (opt-in, experimental)
+`modules/util/optimizer/concord_graph.py`. The validated path is **`ManualUNetGraph`** (captures
+fwd+loss+bwd with a real `loss.backward()` inside the graph). Gated by `should_graph(config)`:
+`concord_cuda_graph` flag **AND** CONCORD **AND** bf16 **AND** latent caching **AND** gradient
+checkpointing **AND** single-GPU. **Default OFF; eager is the default path.** The older
+`make_graphed_callables` v1 is left in but **NaNs on the first step** (static-buffer backward ×
+self-stepping × checkpointing) — explicitly marked experimental.
 
-## Open risks to verify during build
-- EMA over param-less modules (OneTrainer EMA likely iterates parameters() -> Concord modules
-  contribute none; the bf16 .weight shim is read-only -> EMA of the deployed weight may need a
-  hook, or disable EMA for Concord layers).
-- Checkpoint save: SDXL .safetensors expects bf16 weight tensors -> materialize via
-  consolidated_weight() at save time (a save hook).
-- Sampling mid-train reads .weight (the bf16 shim) -> should just work (shim is the live weight).
-- Gradient checkpointing interaction with the fused-in-backward step (recompute -> the Function
-  backward runs on recompute; need the step to fire once, not per-recompute).
-  **RESOLVED (probe, 2026-06-02):** under `use_reentrant=False` (OneTrainer's DEFAULT,
-  checkpointing_util.py:97), the recomputed FORWARD fires 2x but the custom Function.backward
-  (= Concord's fused step) fires exactly **1x** -> SAFE. Probe: forward=2 backward=1.
-  **CAVEAT:** OneTrainer ALSO has a `use_reentrant=True` path (L140), used ONLY with LAYER
-  OFFLOADING (LayerOffloadConductor). Reentrant checkpointing has different nested-autograd
-  semantics -> NOT verified safe for the fused step. MITIGATION: target non-reentrant
-  checkpointing + NO layer-offload. The whole thesis is that Concord's 32-b state makes SDXL
-  fit in 24 GB WITHOUT offloading, so this should be moot. If offloading is ever needed,
-  re-test the reentrant path before enabling.
+### 6. Gradient accumulation (~0 extra memory)
+`set_consolidate(device, is_update_step)` (`modules/trainer/GenericTrainer.py:826`): only the
+cycle's **last** micro-step consolidates (full apply); earlier micro-steps tick the gradient into
+s_fast with the live weight frozen. No separate grad-accumulation buffer.
 
-## De-risk status (before writing integration code)
-- [x] Module-swap seam exists (OneTrainer's own __replace_linear_layers idiom).
-- [x] Concord has Conv2d + bf16 .weight shim + load_weights + consolidated_weight + rebalance.
-- [x] bf16 finetune uses NO grad scaler -> no double-scale conflict with the in-backward step.
-- [x] Gradient checkpointing (non-reentrant) fires the fused step ONCE -> safe under the
-      checkpointing 24GB-SDXL requires.
-- [ ] EMA / checkpoint-save / sampling over param-less modules (build-time verify).
-- [ ] CUDA-graph capture over OneTrainer's loop (build LAST, behind flag, eager fallback).
+### 7. Config knobs → kernel (`make_concord_config`, `concord_ot.py:66`)
+Optimizer panel: `gf_consol`, `noise`, `sigmag_peak`, `ratio_coh`, `lazy_gate`, `lazy_active_thresh`.
+General: `concord_cuda_graph` (off), `concord_fused_matmul` (on), `concord_packed_embeddings` (on),
+`concord_bucket_contiguous` (on), `concord_te_anchor` (on), `concord_te_wd_anchor` (0.5),
+`concord_sanitize_tokens`. These flow into the `ConcordConfig` → `swap_unet_to_winner` / `winner_step`
+and the kernel `set_*` setters.
+
+## The recipe (the validated winner)
+Baked in `concord/concord_winner.py : WINNER` / `ConcordConfig`; full spec + numbers in
+[`WINNING_CONFIG.md`](../WINNING_CONFIG.md). In short: rank-1 v̂ AdamW (32 b/param) + **dissipation**
+(`ratio_coh` + chase/leak floors + `gf_consol`) + **fluctuation** (isotropic noise), deploy off
+`consolidated_weight()`.
+
+## De-risk status
+- [x] Module-swap (794 layers), self-stepping in backward, aux SGD — works.
+- [x] bf16 finetune, **no** grad scaler — no double-scale conflict.
+- [x] Non-reentrant gradient checkpointing fires the fused step **once** (forward 2× / backward 1×).
+      CAVEAT: the `use_reentrant=True` path (layer-offload only) is **not** verified for the fused
+      step — target non-reentrant + no offload (the 32-b state is what makes offload unnecessary).
+- [x] Save → consolidate to standard SDXL safetensors — works.
+- [x] Lazy-update gate no-op-safe on dense (ot_noop A/B, OFF==ON at τ=1e-4, 2026-06-09).
+- [x] Fused packed matmul kernels match cuBLAS (fwd exact, bwd within bf16).
+- [ ] CUDA-graph **v1** NaNs first step — use `ManualUNetGraph` (v2) / eager. (open)
+- [ ] Noise σ magnitude is single-seed (nanoGPT); multi-seed on SDXL before trusting it. (open)
+- [ ] EMA over param-less swapped layers — confirm OneTrainer EMA (if enabled) reads the deploy
+      weight or is disabled for swapped layers. (verify if EMA is turned on)
