@@ -981,6 +981,7 @@ class GenericTrainer(BaseTrainer):
                             # friction / gamma-SNR regimes; the live loss alone is deflated
                             # by the batch-fitted transient riding in s_fast.
                             _ctrl = getattr(self.model, "concord_controller", None)
+                            _gap = None
                             if _ctrl is not None:
                                 _gap = _ctrl.read_memorization_gap()
                                 self.tensorboard.add_scalar(
@@ -988,6 +989,17 @@ class GenericTrainer(BaseTrainer):
                                 self.tensorboard.add_scalar(
                                     "loss/deploy_est", accumulated_loss_cpu + _gap,
                                     train_progress.global_step)
+                            # Plain stdout loss line: the tqdm postfix is transient
+                            # (overwritten in place, lost on redirect); this survives in
+                            # console scrollback and piped logs. tqdm.write keeps the
+                            # progress bars intact.
+                            _msg = (f"[loss] step {train_progress.global_step}"
+                                    f"  loss={accumulated_loss_cpu:.5f}"
+                                    f"  smooth={ema_loss:.5f}")
+                            if _gap is not None:
+                                _msg += (f"  gap={_gap:+.5f}"
+                                         f"  deploy_est={accumulated_loss_cpu + _gap:.5f}")
+                            step_tqdm.write(_msg)
 
                         accumulated_loss = 0.0
                         self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
