@@ -889,6 +889,15 @@ class GenericTrainer(BaseTrainer):
                         else:
                             model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
 
+                        # gamma-SNR dissipation modulation (eager path; the graph path has
+                        # its own hook): timesteps are sampled by predict() above, the fused
+                        # backward below reads the kappa buffers.
+                        _ctrl = getattr(self.model, "concord_controller", None)
+                        if _ctrl is not None and "timestep" in model_output_data:
+                            _ac = getattr(self.model.noise_scheduler, "alphas_cumprod", None)
+                            if _ac is not None:
+                                _ctrl.on_timesteps(model_output_data["timestep"], _ac)
+
                         loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
 
                         loss = loss / self.config.gradient_accumulation_steps

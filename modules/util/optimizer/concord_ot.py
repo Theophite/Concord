@@ -90,6 +90,7 @@ def make_concord_config(learning_rate: float, optimizer_config=None):
         autotune_beta1_on=float(pick("autotune_beta1_on", d.autotune_beta1_on)),
         autotune_beta1_coh=float(pick("autotune_beta1_coh", d.autotune_beta1_coh)),
         autotune_reprobe_band=pick("autotune_reprobe_band", d.autotune_reprobe_band),
+        autotune_gamma_snr=pick("autotune_gamma_snr", d.autotune_gamma_snr),
         dissipation=pick("dissipation", d.dissipation),
     )
 
@@ -140,6 +141,7 @@ class ConcordController:
         # the trainer finalizes the horizon at train start.
         self.autotuner = None
         self._autotune_pending = bool(getattr(self.config, "autotune_table", None))
+        self._snr_mod_announced = False
         self.step_idx = 0
         print(f"[concord] swapped {len(self.layers)} UNet layers | lr={self.config.lr} "
               f"gf_consol={self.config.gf_consol} noise={self.config.noise} "
@@ -199,6 +201,64 @@ class ConcordController:
             beta1_on=self.config.autotune_beta1_on,
             beta1_coh_threshold=self.config.autotune_beta1_coh,
             reprobe_band=self.config.autotune_reprobe_band)
+
+    # gamma-SNR modulation cap: lam_t = lr*kappa_t never exceeds this (half the
+    # lam < 2 linear-stability ceiling), whatever the batch's SNR draw.
+    _LAM_MOD_CAP = 1.0
+
+    @torch.no_grad()
+    def on_timesteps(self, timesteps, alphas_cumprod):
+        """gamma-SNR dissipation modulation (opt-in via optimizer.autotune_gamma_snr).
+
+        min-SNR-gamma's loss weight w(t) = min(snr, gamma)/snr is a hand-designed
+        PRIOR for "limit the influence of the conflicting high-SNR gradient
+        stream". The gate's coherence meter measures that conflict directly and
+        the autotuner turns it into a base friction; this hook adds the
+        timestep-resolved shape on top:
+
+            m       = mean_batch( max(1, snr_i / knee) )   (inverse of w, knee at gamma)
+            kappa_t = min(kappa_base * m, _LAM_MOD_CAP / lr)
+
+        Batches at timesteps min-SNR would down-weight get proportionally MORE
+        dissipation instead -- the loss stays unweighted, the regularizer absorbs
+        the role, and the overall strength is the autotuned base rather than a
+        hand-tuned gamma.
+
+        Exogenous by construction: the modulation input is the sampler's timestep
+        draw, not the meter, so this does NOT reintroduce the exp-11 closed loop.
+        While the tuner is probing (committed is None) the hook is silent and the
+        probe runs at the clean constant probe kappa -- calibration conditions
+        match the table.
+
+        Graph-native: writes each UNet layer's gf_consol device buffer directly
+        (device-to-device 0-dim copy, no host sync); the captured backward reads
+        the buffers at replay. The host mirror (_gf_consol_value) keeps the
+        UNMODULATED base. Call after the batch's timesteps are sampled and before
+        the backward / graph replay. TE layers are never modulated.
+        """
+        knee = self.config.autotune_gamma_snr
+        if knee is None:
+            return
+        if self.autotuner is not None:
+            base = self.autotuner.committed
+            if base is None:
+                return                      # probe / re-probe window: stay clean
+        else:
+            base = self.config.gf_consol    # fixed-friction run: modulate the config base
+        if base is None or float(base) <= 0:
+            return
+        ac = alphas_cumprod.to(timesteps.device)[timesteps.long()].float()
+        snr = ac / (1.0 - ac).clamp_min(1e-8)
+        mod = (snr / float(knee)).clamp_min(1.0).mean()
+        cap = self._LAM_MOD_CAP / max(self.config.lr, 1e-12)
+        kappa_t = (mod * float(base)).clamp_max(cap)
+        if not self._snr_mod_announced:
+            self._snr_mod_announced = True
+            print(f"[concord] gamma-SNR dissipation modulation ON: knee={float(knee):g}, "
+                  f"base kappa={float(base):.0f}, cap lam={self._LAM_MOD_CAP:g} "
+                  f"(kappa <= {cap:.0f} @ lr={self.config.lr:g})")
+        for layer in self.layers:
+            layer._gf_consol_buf.copy_(kappa_t)
 
     @torch.no_grad()
     def before_step(self):

@@ -329,6 +329,12 @@ class ManualUNetGraph:
             self._shape_key = shape_key
             self._ensure_vhat(model).switch_to(shape_key)   # save outgoing, restore incoming v_hat
         self._copy_in(prep)
+        # gamma-SNR dissipation modulation: the batch's timesteps are known here
+        # (eager prep) and the kappa device buffers are read inside the replay --
+        # write them now (no-op unless optimizer.autotune_gamma_snr is set).
+        _ctrl = getattr(model, "concord_controller", None)
+        if _ctrl is not None and self._alphas_cumprod is not None:
+            _ctrl.on_timesteps(prep["timestep"], self._alphas_cumprod)
         if self.graph is None:
             if os.environ.get("CONCORD_RESAWARE_DEBUG") and self._min_snr:
                 self._log_resaware()

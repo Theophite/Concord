@@ -89,6 +89,7 @@ class TrainOptimizerConfig(BaseConfig):
     lazy_active_thresh: float
     autotune_table: str
     autotune_reprobe_band: float
+    autotune_gamma_snr: float
     dissipation: float
     autotune_beta1_on: float
     autotune_beta1_coh: float
@@ -219,6 +220,7 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("lazy_active_thresh", None, float, True))
         data.append(("autotune_table", None, str, True))
         data.append(("autotune_reprobe_band", None, float, True))
+        data.append(("autotune_gamma_snr", None, float, True))
         data.append(("dissipation", None, float, True))
         data.append(("autotune_beta1_on", None, float, True))
         data.append(("autotune_beta1_coh", None, float, True))

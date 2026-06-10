@@ -103,6 +103,11 @@ class ConcordConfig:
     # across domains. beta1_on=0.0 keeps probe-selected momentum OFF (conservative
     # default; the beta1 evidence is one task deep).
     autotune_table: str = None
+    autotune_gamma_snr: float = None  # gamma-SNR dissipation modulation knee: per step,
+                                      # kappa_t = min(base * mean(max(1, snr/knee)), 1.0/lr).
+                                      # Plays min-SNR-gamma's role on the DISSIPATION side
+                                      # (run the loss unweighted); base = the autotune commit,
+                                      # or gf_consol when autotune is off. None = off.
     autotune_reprobe_band: float = None  # exp-11d live mode: one-sided coherence-drop
                                           # band that triggers a re-probe; None = one-commit
     autotune_beta1_on: float = 0.0

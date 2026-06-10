@@ -175,6 +175,64 @@ check("7f subsumed knobs pruned from the panel (config-file only)",
 check("7g step cap / trust region exposed at winner values",
       gd["step_cap"] == 10.0 and gd["gf_trust_delta_sq"] == 1.0)
 
+# ---- 8. gamma-SNR dissipation modulation (controller hook, CPU tensors) -----
+import torch
+from concord_ot import ConcordController
+
+def snr_hook_rig(knee, base_committed, lr=7.5e-5, tuner=True, gf_consol=333.0):
+    rig = SimpleNamespace(
+        config=SimpleNamespace(autotune_gamma_snr=knee, gf_consol=gf_consol, lr=lr),
+        autotuner=SimpleNamespace(committed=base_committed) if tuner else None,
+        layers=[SimpleNamespace(_gf_consol_buf=torch.full((1,), -1.0)) for _ in range(3)],
+        _snr_mod_announced=True, _LAM_MOD_CAP=ConcordController._LAM_MOD_CAP)
+    return rig
+
+def snr_to_alphas(snrs):
+    """alphas_cumprod table such that index i has exactly snr[i] = ac/(1-ac)."""
+    return torch.tensor([s / (1.0 + s) for s in snrs], dtype=torch.float64)
+
+def run_hook(rig, snrs):
+    ac = snr_to_alphas(snrs)
+    ts = torch.arange(len(snrs))
+    ConcordController.on_timesteps(rig, ts, ac)
+    return [float(m._gf_consol_buf[0]) for m in rig.layers]
+
+# 8a below the knee (snr <= knee) -> m = 1 -> buffers = committed base
+rig = snr_hook_rig(5.0, base_committed=200.0)
+bufs = run_hook(rig, [1.0, 3.0, 5.0])
+check("8a below-knee batch leaves kappa at base",
+      all(abs(b - 200.0) < 1e-3 for b in bufs), f"bufs={bufs}")
+
+# 8b above the knee -> m = mean(max(1, snr/knee)); snr {5,10,15} -> (1+2+3)/3 = 2
+rig = snr_hook_rig(5.0, base_committed=200.0)
+bufs = run_hook(rig, [5.0, 10.0, 15.0])
+check("8b above-knee batch scales kappa by mean(max(1, snr/knee))",
+      all(abs(b - 400.0) < 1e-2 for b in bufs), f"bufs={bufs}")
+
+# 8c cap: huge snr -> kappa_t clamps at LAM_MOD_CAP/lr (lam_t = 1)
+rig = snr_hook_rig(5.0, base_committed=5000.0)
+bufs = run_hook(rig, [500.0])
+cap = 1.0 / 7.5e-5
+check("8c modulated kappa caps at lam=1 (kappa = 1/lr)",
+      all(abs(b - cap) < 1.0 for b in bufs), f"bufs={bufs} cap={cap:.0f}")
+
+# 8d probe gating: tuner present but not committed -> hook is silent
+rig = snr_hook_rig(5.0, base_committed=None)
+bufs = run_hook(rig, [50.0])
+check("8d probe window unmodulated (buffers untouched)",
+      all(b == -1.0 for b in bufs))
+
+# 8e knee None -> off entirely
+rig = snr_hook_rig(None, base_committed=200.0)
+bufs = run_hook(rig, [50.0])
+check("8e knee=None disables the hook", all(b == -1.0 for b in bufs))
+
+# 8f no tuner -> modulates the config base (fixed-friction run)
+rig = snr_hook_rig(5.0, base_committed=None, tuner=False, gf_consol=300.0)
+bufs = run_hook(rig, [10.0])      # m = 2
+check("8f fixed-friction run modulates gf_consol base",
+      all(abs(b - 600.0) < 1e-2 for b in bufs), f"bufs={bufs}")
+
 print()
 ok = all(results)
 print(f"{'ALL PASS' if ok else 'FAILURES'} ({sum(results)}/{len(results)})")

@@ -449,6 +449,7 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
         "dissipation": 0.025,
         "autotune_table": "[[0.387,0],[0.314,0.1],[0.288,0.2],[0.274,0.4],[0.256,0.4]]",
         "autotune_reprobe_band": 0.02,
+        "autotune_gamma_snr": None,
     },
     Optimizer.LION: {
         "beta1": 0.9,
