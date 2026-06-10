@@ -145,3 +145,55 @@ kernel `USE_MUON` path; (4) per-drive autotune calibration (the coh→κ table a
 lr\* shift together). Native Muon's clean-protocol showing (95.40, lr unswept) marks
 the remaining headroom a pre-NS gradient EMA might buy — the one piece of state this
 design refuses to purchase.
+
+## 9. Gate 1 verdict: the nanoGPT A/B (2026-06-09) — not passed
+
+The drive is implemented (package + notebook bench; `ns5` bit-exact vs the exp-9
+reference, CUDA smoke + determinism green on triton 3.1/3.5) and the same-seed
+char-nanoGPT A/B ran at the contemporaneous code state (fixed mass-preserve C\*,
+which moves the v̂ control from the historical 1.4967 to **1.5157** — the
+operating-point shift `compute_drift_cancel_C`'s fix predicted). Deployed-sv,
+seed 0, 3000 iters, each arm's own knobs:
+
+| arm | deployed-sv | final live val |
+|---|---|---|
+| v̂ winner (κ=50, σ=0.6) | **1.5157** | 1.537 (stable) |
+| NS κ=25 | 1.5387 | 2.58 |
+| NS κ=50 | 1.5385 | 2.02 |
+| NS κ=100 | 1.5376 | 1.76 |
+| NS κ=50, lr 1.5e-3 | 1.5669 | 1.87 |
+| NS κ=50 + post-NS σ=0.6 | 1.5373 | 2.02 |
+
+Findings, in order of interest:
+
+1. **The NS plateau is κ-flat**: best-checkpoint quality is identical across a
+   4× friction range (1.5387/1.5385/1.5376); κ controls only the *post-peak
+   heating rate* (final live val 2.58 → 1.76). Dissipation is not the binding
+   constraint — the drive reaches its ceiling mid-schedule and then degrades.
+2. **The late-heating mechanism**: NS5 is scale-free, so once late-training
+   gradients go noise-dominated, orthogonalization re-amplifies them to unit
+   spectral weight — the train loss plunges (0.42/0.69/0.91 across κ; the v̂
+   control sits at 1.20) while val climbs. Memorization-by-whitening: native
+   Muon's §4 failure mode, damped by the cascade but not eliminated, on the
+   bench regime where it matters.
+3. **Post-NS σ is neutral on the bench too** (−0.001), extending exp 9b's
+   MNIST result. σ does not return in this arm.
+4. **Higher lr hurts** (1.5669 at 3×): the MNIST capless-lr robustness does
+   not transfer to this regime.
+5. **vs native Muon: decisively better** (1.538 vs 1.578 historical) — the
+   gate/friction/deploy cascade converts Muon's failure into a usable arm, at
+   32 b/param. The MNIST election (96.07, protocol best) did not transfer to
+   char-LM overfit — consistent with the earlier probe-campaign finding that
+   spectral whitening's rank-democratic prior is wrong for this low-rank task,
+   and exactly what this gate exists to catch.
+
+Caveat for any rematch: both arms ran at the OLD κ\*=50 — the honest-gate v̂
+κ\* is itself unswept since the C\* fix (1.5157 may not be the v̂ optimum).
+But the NS plateau's κ-flatness means no plausible NS κ\* closes the 0.022.
+
+**Status:** the drive stays in (opt-in `drive="muon"`, default `"vhat"`),
+gates 2–4 (multi-seed MNIST grid, Conv2d/kernel path beyond smoke, per-drive
+autotune calibration) and the fork port do NOT proceed for adoption. The
+remaining headroom marked in §8 — a pre-NS gradient EMA, the one state this
+design refused to buy — is now the obvious next experiment, since the failure
+is late-phase noise in the NS *input*, precisely what an input EMA filters.
