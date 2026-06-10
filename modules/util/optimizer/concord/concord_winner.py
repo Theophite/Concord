@@ -36,7 +36,7 @@ import prototype_packed_b as ppb
 from prototype_packed_b import (
     ConcordLinearPackedB, ConcordConv2dPackedB,
     set_ratio_coh, set_ratio_coh_floors, set_fixed_coh,
-    set_lazy_gate, set_lazy_thresh,
+    set_lazy_gate, set_lazy_thresh, set_min_leak,
     set_sigmag_noise, set_sigmag_sigma,
 )
 
@@ -76,6 +76,9 @@ class ConcordConfig:
     v_scale: float = 0.0
     precond_p: float = 0.5
     gf_trust_delta_sq: float = 1.0
+    min_leak: float = 0.1     # servo floor: min per-step survival fraction of accumulated
+                              # s_fast under the gf evaporation -- the valve never fully
+                              # shuts (slam-shut guard for lam -> 1; no-op at lam <= 0.9)
     # dissipation (the "split")
     gf_consol: float = 50.0
     # DIMENSIONLESS dissipation: the per-step friction fraction lam = lr*kappa
@@ -406,6 +409,7 @@ def configure_optimizer(unet, device, config):
     ppb.set_sigmag_noise(config.noise, isotropic=config.sigmag_iso)
     ppb.set_lazy_gate(config.lazy_gate)
     ppb.set_lazy_thresh(config.lazy_active_thresh)
+    ppb.set_min_leak(config.min_leak)
     aux = [p for p in unet.parameters() if p.requires_grad]
     print(f"[picker] concord: {len(layers)} layers, lr={config.lr}, gf_consol="
           f"{config.gf_consol}, ratio_coh={config.ratio_coh}, noise={config.noise}, "

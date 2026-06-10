@@ -233,6 +233,26 @@ bufs = run_hook(rig, [10.0])      # m = 2
 check("8f fixed-friction run modulates gf_consol base",
       all(abs(b - 600.0) < 1e-2 for b in bufs), f"bufs={bufs}")
 
+# ---- 9. min-leak servo floor ------------------------------------------------
+def evap_frac(lam, coh, min_leak):
+    """Mirror of the kernel clamp: min(lam*(1-coh), 1 - min_leak)."""
+    return min(lam * (1.0 - coh), 1.0 - min_leak)
+
+check("9a winner regimes unaffected (clamp never binds at lam<=0.9)",
+      evap_frac(0.4, 0.0, 0.1) == 0.4 and evap_frac(0.025, 0.0, 0.1) == 0.025)
+check("9b lam=1 at coh=0: survival floored at min_leak",
+      abs((1.0 - evap_frac(1.0, 0.0, 0.1)) - 0.1) < 1e-12)
+check("9c lam=1.5 at coh=0: no negative factor (ringing removed)",
+      abs((1.0 - evap_frac(1.5, 0.0, 0.1)) - 0.1) < 1e-12)
+check("9d Wiener filtering intact where coh speaks (clamp inactive)",
+      evap_frac(1.0, 0.5, 0.1) == 0.5)
+check("9e module default and setter",
+      hasattr(ppb, "set_min_leak") and ppb._MIN_LEAK == 0.1)
+cfg9 = make_concord_config(7.5e-5, SimpleNamespace(min_leak=0.25))
+check("9f pick-through", cfg9.min_leak == 0.25
+      and make_concord_config(7.5e-5, SimpleNamespace()).min_leak == 0.1)
+check("9g GUI default exposed", gui_concord_defaults()["min_leak"] == 0.1)
+
 print()
 ok = all(results)
 print(f"{'ALL PASS' if ok else 'FAILURES'} ({sum(results)}/{len(results)})")
