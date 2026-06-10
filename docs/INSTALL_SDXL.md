@@ -13,6 +13,14 @@ Reference implementations all live on this branch in `concord/packed_b.py`
 (search markers given below); the evidence is in [`RESULTS.md`](RESULTS.md) and
 [`experiments/cpu_dynamics/EXPERIMENTS.md`](../experiments/cpu_dynamics/EXPERIMENTS.md).
 
+**Ready-made patch**: [`patches/0001-concord-integration-cstar-tuner-guard.patch`](../patches/0001-concord-integration-cstar-tuner-guard.patch)
+applies all of §1–§3 onto `concord-integration` at `d62931b` (`git apply` from the fork
+root; verified to apply cleanly and all touched files compile). It includes the
+F-units autotuner (`autotune_table_in_F=True`: the table is dimensionless F = lr·κ,
+`probe` converts the configured `gf_consol` via F = κ·lr so default behavior is
+unchanged until a table is passed). The manual steps below remain the reference for
+review or for applying onto a moved branch tip.
+
 ---
 
 ## 1. The C\* fix (the bug)
