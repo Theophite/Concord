@@ -148,6 +148,20 @@ The table maps *probe-window coherence* → κ for **your** task/architecture/sc
 3. Table = [(coh_i, κ\*_i)] sorted by descending coherence. Expect the same *shape* as
    the CPU result (κ\* rising with incoherence, then plateauing), not the same numbers.
 
+**Calibrate in F = lr·κ, not κ.** κ is defined per unit lr, so the dimensionless
+friction F = lr·κ is the real knob: F·(1−coh) is the per-step velocity decay (and, via
+the κ-identity in `MIXUP.md` §6, the per-step self-distillation weight toward the EMA
+teacher), F(1−coh)/(α·gc) the deleted-vs-consolidated split, F < 2 the stability
+ceiling. Reference points from the campaign: MNIST heavy-memorization optimum
+F ≈ 1.0–1.5; nanoGPT validated winner F = 0.025; **the current SDXL preset runs
+F = 0.00375 — near-frictionless in these units**, while diffusion fine-tuning (noisy
+ε/t-sampled gradients, small datasets, many steps) is plausibly the heaviest-
+memorization regime Concord faces, and the field's reliance on aggressive weight-EMA is
+independent evidence it wants a strong pull toward the average. Sweep
+F ∈ {0.004, 0.025, 0.1, 0.5, 1.0}. Committing F (not κ) also keeps the friction sweep
+orthogonal to any upward lr sweep. (The C\* calibration survives high F: at the
+pure-drift fixed point coh → 1 and the friction term self-vanishes.)
+
 β1 selection (`beta1_on=0.1, beta1_coh_threshold=...`) rides the same probe; set the
 threshold between your cleanest and next quality level's probe coherence, or pass
 `beta1_on=0` to leave momentum off (the conservative default — the β1 evidence is one
