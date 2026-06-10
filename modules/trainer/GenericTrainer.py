@@ -719,14 +719,15 @@ class GenericTrainer(BaseTrainer):
                 return
             self.callbacks.on_update_status("Starting epoch/caching")
 
-            # Multistage-caching headroom (opt-in via concord_epoch_cache_release):
+            # Multistage-caching headroom (concord_epoch_cache_release, default ON):
             # per-epoch cache stages run TE/VAE work while the captured Concord
             # graph still holds its multi-GB private pool — the cache stage then
             # pegs VRAM and thrashes. Mirror the sampling path: release the graph
             # (it recaptures transparently on the next training step) + gc before
-            # start_next_epoch. Off by default: single-stage runs whose epoch
-            # boundary is a cheap shuffle would pay a pointless recapture/epoch.
-            if getattr(self.config, "concord_epoch_cache_release", False):
+            # start_next_epoch. Costs one recapture per epoch on graph runs;
+            # set false to skip it on single-stage datasets where the epoch
+            # boundary is a cheap shuffle and the headroom is not needed.
+            if getattr(self.config, "concord_epoch_cache_release", True):
                 _v2e = getattr(self.model, "concord_graph_v2", None)
                 if _v2e is not None:
                     _v2e.release()

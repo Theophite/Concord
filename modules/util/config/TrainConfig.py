@@ -1077,7 +1077,7 @@ class TrainConfig(BaseConfig):
         data.append(("timestep_shift", 1.0, float, False))
         data.append(("dynamic_timestep_shifting", False, bool, False))
         data.append(("resolution_aware_loss_weight", False, bool, False))
-        data.append(("concord_epoch_cache_release", False, bool, False))
+        data.append(("concord_epoch_cache_release", True, bool, False))
         data.append(("concord_sample_deploy", True, bool, False))
         data.append(("concord_antithetic_timesteps", False, bool, False))
         data.append(("concord_antithetic_noise", False, bool, False))
