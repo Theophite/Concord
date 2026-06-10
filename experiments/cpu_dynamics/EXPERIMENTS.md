@@ -464,3 +464,40 @@ NS.**
    (at lr = 0.1 it caps κ at 20 — high-lr + heavy-noise needs that arithmetic done).
 4. Caveats: sweep is κ = 0 / clean only, 3 seeds, this protocol; the noisy-regime lr
    envelope (where κ > 0 re-enters) is unswept.
+
+## Exp 11 — computing the dissipation curve LIVE (`exp11_live_kappa.py`, `exp11d_reprobe.py`)
+
+Can κ be controlled live, instead of (or beyond) probe-then-commit? Four
+iterations, each informative (`exp11{,b,c,d}_results.json`):
+
+1. **Naive continuous laws fail on meter conditioning.** Table-interp,
+   self-referenced integral servo, and trend laws — engaged from κ=0 in an
+   early window — all read coherence ABOVE the table's whole range and sat at
+   κ≈0 across every static noise level. The table's (coh → κ) range is
+   conditioned on the κ=50 probe over epochs 3–8; a meter read under other
+   (κ, phase) conditions is on a different scale. Corollary: a self-referenced
+   servo can detect *change* but not *level* — under static noise the run's
+   own reference IS the noisy stream. Calibration-free level inference needs
+   an absolute anchor; that is what the table is.
+2. **Continuous tracking through the calibrated table is self-defeating for
+   level** (11b). Probe-conditioned one-commit lands near-oracle (κ_post
+   89/291 vs κ\* 100/400). Re-evaluating the same table every epoch UNDOES
+   it: friction drains the incoherent velocity, the velocity-side meter reads
+   clean, the tracker relaxes (κ 89→7, 291→26; deploy −0.2/−0.8; memorized
+   +7/+10). The exp-6 v1 "controller chases its own tail" warning, measured
+   on the v2 meter.
+3. **Two-sided change detection fires on the benign side** (11c). Post-commit
+   coherence RISES as friction works; a ±band watchdog re-probes on that rise
+   and recommits low (κ 287→5).
+4. **The validated live law: commit + ONE-SIDED event-driven re-probe**
+   (11d). Hold the committed κ; windowed meter vs a slow-EMA baseline;
+   re-probe only on a DROP (m < base − 0.08); rises update the baseline.
+   Static ρ ∈ {0, 10%, 30%}: zero events, numerically identical to the
+   shipped tuner. Mid-run regime change (clean → 30% label noise at epoch
+   12, where one-commit is wrong by construction): one re-probe, recommit
+   κ≈115 — deploy 92.76 vs 92.43, memorized 12.2% vs 13.4% (2 seeds).
+
+Takeaway: "live" done right is **event-driven re-calibration, not continuous
+feedback** — the meter's absolute level belongs to calibrated probe
+conditions; its deviations belong to the watchdog. The calibration burden
+(the per-domain table) is unchanged.
