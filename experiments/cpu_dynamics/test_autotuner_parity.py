@@ -12,7 +12,7 @@ import re
 
 import torch
 
-SRC = open("../../concord/packed_b.py").read()
+SRC = open("../../concord/packed_b.py", encoding="utf-8").read()
 ns = {"torch": torch}
 for name in ("def gate_coherence_from_fields", "def measure_coherence",
              "class DissipationAutoTuner"):
@@ -104,3 +104,52 @@ assert 100.0 < mid < 200.0, mid
 print(f"3. tuner probe/commit at t=50, kappa={committed[1]:.1f}, "
       f"interp checks: OK")
 print("ALL PARITY TESTS PASSED")
+
+
+# 5. live mode: one-sided re-probe watchdog (exp 11d) ----------------------
+def _packed_with_coh(high, n=64, k=96, seed=0):
+    """Synthetic packed state with high (~1) or low (~0) gate coherence:
+    coherent -> s_fast == round(C*·d_sv·128) (noise ~ 0); incoherent ->
+    s_fast random against a small telescope."""
+    g = torch.Generator().manual_seed(seed)
+    s_slow = torch.randint(20, 120, (n, k), generator=g)
+    v_slow = torch.zeros((n, k), dtype=torch.long)
+    if high:
+        mu = C * (s_slow - v_slow).float() * 128.0
+        s_fast = mu.round().long()
+    else:
+        s_fast = torch.randint(-2000, 2000, (n, k), generator=g)
+    return (((s_fast.int() & 0xFFFF) << 16)
+            | ((s_slow.int() & 0xFF) << 8)
+            | (v_slow.int() & 0xFF))
+
+
+hi, lo_pk = _packed_with_coh(True), _packed_with_coh(False)
+lay = FakeLayer(); lay.packed_w = hi
+tun = DissipationAutoTuner([lay], probe_start=0, probe_end=20, table=TABLE,
+                           probe_kappa=50.0, measure_every=5, verbose=False,
+                           reprobe_band=0.08)
+k_first = None
+for t in range(0, 21):
+    r = tun.step(t)
+    if r is not None:
+        k_first = r
+assert k_first is not None and k_first == TABLE[0][1], "high-coh commit should be kappa=0"
+# stable hold: enough windows to prove no spurious event on a flat stream
+for t in range(21, 121):
+    tun.step(t)
+assert tun.reprobes == 0, "spurious re-probe on a stable stream"
+assert tun.committed == k_first
+# regime change: swap to the low-coherence stream -> drop fires exactly once
+lay.packed_w = lo_pk
+k_second, t_fire = None, None
+for t in range(121, 300):
+    r = tun.step(t)
+    if r is not None:
+        k_second, t_fire = r, t
+assert tun.reprobes == 1, f"expected exactly 1 re-probe, got {tun.reprobes}"
+assert k_second is not None and k_second > k_first, \
+    f"recommit should raise kappa ({k_first} -> {k_second})"
+assert lay.gf_consol == k_second
+print(f"5. live re-probe: stable hold quiet, drop fires once, "
+      f"kappa {k_first:.0f} -> {k_second:.0f} at t={t_fire}: OK")

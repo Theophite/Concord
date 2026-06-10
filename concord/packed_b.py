@@ -2268,7 +2268,8 @@ class DissipationAutoTuner:
 
     def __init__(self, layers, probe_start, probe_end, table,
                  probe_kappa=50.0, measure_every=10, verbose=True,
-                 beta1_on=0.1, beta1_coh_threshold=0.35):
+                 beta1_on=0.1, beta1_coh_threshold=0.35,
+                 reprobe_band=None, reprobe_beta=0.7):
         assert probe_end > probe_start >= 0
         assert all(c1 > c2 for (c1, _), (c2, _) in zip(table, table[1:])), \
             "table coh values must be strictly descending"
@@ -2289,6 +2290,18 @@ class DissipationAutoTuner:
         # gate adoption on the nanoGPT A/B like the rest.
         self.beta1_on = float(beta1_on)
         self.beta1_coh_threshold = float(beta1_coh_threshold)
+        # Live mode (exp 11d): after the commit, watch the meter's windowed
+        # mean against a slow-EMA baseline and RE-PROBE on a one-sided
+        # coherence DROP > reprobe_band. None = the shipped one-commit
+        # behavior. (One-sided is load-bearing: post-commit coherence RISES
+        # as friction works; reacting to that is the self-defeating
+        # continuous-tracking failure, exp 11b/c.)
+        self.reprobe_band = None if reprobe_band is None else float(reprobe_band)
+        self.reprobe_beta = float(reprobe_beta)
+        self._probe_len = self.probe_end - self.probe_start
+        self._baseline = None
+        self._hold = []
+        self.reprobes = 0
         self._samples = []
         self.committed = None
         self.committed_beta1 = None
@@ -2311,6 +2324,35 @@ class DissipationAutoTuner:
         """Call once per optimizer step, before the backward of step t.
         Returns the committed kappa once, at t == probe_end; else None."""
         if self.committed is not None:
+            if self.reprobe_band is None:
+                return None
+            if (t - self.probe_end) % self.measure_every == 0:
+                vals = [measure_coherence(m) for m in self.layers]
+                if vals:
+                    self._hold.append(sum(vals) / len(vals))
+            if len(self._hold) * self.measure_every >= self._probe_len:
+                m_ = sum(self._hold) / len(self._hold)
+                self._hold = []
+                if self._baseline is None:
+                    self._baseline = m_
+                elif m_ < self._baseline - self.reprobe_band:
+                    self.reprobes += 1
+                    if self.verbose:
+                        print(f"[concord] dissipation autotune: coherence drop "
+                              f"{self._baseline:.4f} -> {m_:.4f} "
+                              f"(band {self.reprobe_band}) — re-probing")
+                    self.probe_start = t + 1
+                    self.probe_end = t + 1 + self._probe_len
+                    self.committed = None
+                    self.committed_beta1 = None
+                    self._samples = []
+                    self._baseline = None
+                    for m in self.layers:
+                        m.gf_consol = self.probe_kappa
+                        m.beta1 = 0.0
+                else:
+                    self._baseline = (self.reprobe_beta * self._baseline
+                                      + (1.0 - self.reprobe_beta) * m_)
             return None
         if self.probe_start <= t < self.probe_end \
                 and (t - self.probe_start) % self.measure_every == 0:
