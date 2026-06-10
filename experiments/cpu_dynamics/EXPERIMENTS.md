@@ -501,3 +501,68 @@ Takeaway: "live" done right is **event-driven re-calibration, not continuous
 feedback** — the meter's absolute level belongs to calibrated probe
 conditions; its deviations belong to the watchdog. The calibration burden
 (the per-domain table) is unchanged.
+
+
+## Exp 12 — the muon dissipation curve: high-λ gates, prediction refuted (`exp12_muon_lambda.py`)
+
+Tests MUON_DRIVE.md §11: λ* should scale with the drive's noise-energy
+injection rate, so the NS5 drive (every singular direction written at equal
+magnitude) should want λ 10–100× above the v̂ winner — plausibly near the
+Wiener point λ=1. Exp-5 protocol exactly (4k×25ep, σ=0, fixed C*, seeds
+0/1/2), extended along λ with the min-leak servo floor in `concord_ref`
+(`evap_term`, min_leak=0.1 — kernel parity; bit-compatible no-op on the old
+grid, verified against `exp5_results.json`). λ quoted at peak lr (κ·1e-3).
+
+**Result: refuted — λ*(muon) ≈ 0 at every noise level.** Deploy accuracy is
+monotone-DECREASING in λ for the muon drive everywhere (clean 94.86 → 86.10
+over λ 0 → 1.5; ρ45% 90.64 → 83.95, with a within-spread +0.07 blip at
+λ=0.1). The servo never slammed shut (final coh 0.42–0.56 across the grid —
+the floor works); the decline is signal loss, not gate death.
+
+The two columns that localize the mechanism:
+
+- **The clean column is the smoking gun.** At ρ=0 there is no label noise to
+  scrub, yet λ=1.5 costs muon −8.8% (v̂: only −3.5%). For the muon drive the
+  evaporation is a near-uniform SIGNAL tax, λ-proportional.
+- **The memorization column shows the scrub itself works**: ρ30% wrong-label
+  fit falls 14.8% → 10.2% (≈chance) by λ=1 — but deploy falls faster than the
+  scrub pays. The friction drains muon's signal and noise at nearly the same
+  rate.
+
+Mechanism (replaces §11's injection-balance story): **whitening destroys the
+per-element SNR contrast the gate keys on.** The Wiener meter
+coh = μ²/(μ²+ν²) is per-ELEMENT; the v̂ drive writes signal coordinates
+harder than noise coordinates, so coh separates them and the evaporation is
+selective. NS5 writes everything at the same magnitude — signal and noise
+arrive element-wise indistinguishable, coh carries no contrast, and
+λ(1−coh)·u taxes both equally. "Indiscriminate about the directions it
+writes to" was the right premise with the inverted consequence: an
+indiscriminate drive makes the dissipation indiscriminate too.
+
+And the reason muon doesn't NEED the friction: **whitening is itself the
+noise control.** At λ=0 the muon drive beats the v̂ drive at its per-regime
+oracle κ at EVERY noise level — clean 94.86 vs 93.66, ρ10% 94.61 vs 92.72,
+ρ30% 92.85 vs 90.77, ρ45% 90.64 vs 89.53 — and the gap is largest exactly
+where v̂ needs κ most (v̂ at λ=0, ρ45%: 83.01; muon: 90.64). Equal-magnitude
+writes cap any one sample's influence (sign-SGD-style robustness), so the
+defense the dissipation provides is already built into the drive.
+(Supersedes exp 9's stored muon rows, which were the c=3 blend arm; the c=0
+λ=0 numbers here match the exp-9 c-sweep notes, 94.88/92.0x.)
+
+v̂ high-λ extension (κ ∈ {500, 1000, 1500}): the exp-5 grid edge was at the
+peak after all, not below it — λ*(v̂) ≈ 0.4–0.5 at ρ≥30% (κ500 ties κ400
+within spread: 90.63 vs 90.77 at ρ30%) and everything declines by λ=1. On
+THIS task the curve does not continue to the Wiener point; the SDXL
+quality-monotone-in-λ observation is a domain property (diffusion gradient
+noise, deploy-sample metric), not a universal law of the update rule.
+
+Gate-1 re-read: the nanoGPT κ-flat plateau was not "under-damped
+everywhere" — there is no high-λ regime where muon improves. Flatness is
+what a near-uniform λ-proportional tax looks like at small tested λ (the
+MNIST slope ≈ −5.8%/unit-λ predicts ≪0.01 loss across gate-1's swept range).
+
+What survives for the muon line: a SPECTRAL gate. The per-element meter is
+the wrong basis for a whitened drive; coherence measured in the singular
+basis (the `wiener` rank mode — implemented, unrun) would restore the
+contrast the evaporation needs, and is now the single reopen point that
+addresses both this result and the emergent-rank starvation of exp 10/§10.

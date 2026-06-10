@@ -266,3 +266,20 @@ disappears as λ approaches the injection-balanced value; if muon + matched λ
 beats v̂ + 0.025, gate 1 reopens. SDXL-side, the same logic says any
 muon-drive port must scale `dissipation` up by the injection ratio, not
 inherit the v̂ default.
+
+**Verdict (same day, exp 12 — CPU MNIST oracle, λ grid to 1.5 with the
+min-leak floor): REFUTED.** λ*(muon) ≈ 0 at every label-noise level; deploy
+accuracy is monotone-decreasing in λ (clean −8.8% by λ=1.5 — a pure signal
+tax, there is nothing to scrub at ρ=0). The injection-balance story missed
+that the meter is per-ELEMENT: whitening destroys the element-wise SNR
+contrast coh keys on, so the evaporation drains muon's signal and noise at
+the same rate — an indiscriminate drive makes the dissipation indiscriminate
+too. And muon doesn't need the friction: equal-magnitude writes already cap
+per-sample influence, and at λ=0 the muon drive beats the v̂ drive at its
+oracle κ at every noise level (largest where v̂ needs κ most: ρ45% 90.64 vs
+83.01 unaided / 89.53 at κ*). The gate-1 κ-flat plateau re-reads as the
+small-λ end of a near-uniform tax, not under-damping. The GPU bench above is
+NOT worth running as specced. The surviving reopen point is a SPECTRAL gate
+— coherence in the singular basis (`wiener` rank mode, implemented, unrun) —
+which addresses both this meter-blindness and §10's emergent-rank
+starvation. Full table: experiments/cpu_dynamics/EXPERIMENTS.md exp 12.

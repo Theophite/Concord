@@ -35,6 +35,19 @@ def compute_drift_cancel_C(alpha=0.1, alpha_v=0.001, mass_preserve=True):
     return L * alpha_v / (1.0 - L * alpha_v)   # legacy (shipped) value
 
 
+def evap_term(lr, kappa, coh, u, min_leak=0.1):
+    """Dissipation with the min-leak servo floor (kernel parity: fork 4c786433,
+    canonical 4eaa704). The per-step evaporated fraction is capped at
+    1 - min_leak so the valve never fully shuts: at lam = lr*kappa -> 1 with
+    coh ~ 0 the unclamped term wipes u's history each step -- nothing
+    accumulates, the drift freezes, coh pins at 0 and the gate self-seals.
+    No-op while lam*(1-coh) <= 1 - min_leak (the whole exp-5 grid)."""
+    if kappa <= 0:
+        return 0.0
+    frac = (lr * kappa * (1.0 - coh)).clamp_(max=1.0 - min_leak)
+    return frac * u
+
+
 def _cos_floor(start, end, it, horizon):
     if it >= horizon:
         return end
@@ -52,7 +65,7 @@ class ConcordRef:
                  eps=1e-10, step_cap=10.0, kappa=50.0,
                  sigma_peak=0.6, lr_min_frac=0.2,
                  chase_floor=(0.9, 0.1), leak_floor=(0.999, 0.1),
-                 gate=True, noise=True, generator=None):
+                 gate=True, noise=True, generator=None, min_leak=0.1):
         self.peak_lr = lr
         self.T = total_steps
         self.warmup = warmup
@@ -62,6 +75,7 @@ class ConcordRef:
         self.sigma_peak, self.lr_min_frac = sigma_peak, lr_min_frac
         self.chase_floor, self.leak_floor = chase_floor, leak_floor
         self.gate, self.noise = gate, noise
+        self.min_leak = float(min_leak)
         self.Cstar = compute_drift_cancel_C(alpha, alpha_v)
         self.gen = generator
         self.t = 0
@@ -126,7 +140,7 @@ class ConcordRef:
                 coh = torch.zeros_like(u)   # bare: no gate consumers below
             # drive + dissipation (+ optional coherence-gated momentum)
             step_ = (g / (vhat + self.eps).sqrt()).clamp_(-self.cap, self.cap)
-            evap = lr * self.kappa * (1.0 - coh) * u if self.kappa > 0 else 0.0
+            evap = evap_term(lr, self.kappa, coh, u, self.min_leak)
             u += self.beta1 * coh * u - lr * step_ - evap
             # chase (continuous Lookahead; W-invariant)
             gc = self.phic + (1 - self.phic) * coh if self.gate else 1.0
