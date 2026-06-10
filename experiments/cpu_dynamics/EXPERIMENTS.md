@@ -577,3 +577,50 @@ Native Muon has the NS normalization and none of the cascade, so its fine-grid l
 4. Product implication: the lr-insensitivity does **not** transfer to bare NS
    optimizers — it is a Concord-cascade property, i.e., a real differentiator rather
    than inherited Muon credit.
+
+## Exp 12 — noise with the character of augmentation: the hierarchy test (`exp12_noise_character.py`)
+
+Arena: the exp-10 corner where augmentation mattered most (4k, 30% label noise, 80ep,
+NS drive, κ=150 @ lr 1e-2 — stale-high κ biases *against* the diversity arms, so the
+ordering is conservative). References on the books: none = 86.28 (47.8% mem),
+crop-aug = 96.31 (10.6% mem).
+
+| arm | level | deploy acc | memorized |
+|---|---|---|---|
+| none (ref) | — | 86.28 ± 0.77 | 47.8% |
+| iso, post-NS σ=0.6 | L0 | 86.79 ± 0.69 | 46.2% |
+| Σ_g-shaped, pre-NS | L1 | 87.20 ± 0.85 | 46.1% |
+| vicinal (chord jitter, labels fixed) | L2a | 89.14 ± 0.62 | 38.6% |
+| **mixup (chords + label interp.)** | L2b | **92.52 ± 0.35** | 25.8% |
+| small-batch (32) control | temp. | 89.56 ± 0.27 | **22.6%** |
+| crop-aug (ref) | L3 | **96.31 ± 0.22** | 10.6% |
+
+The ladder is monotone in the hierarchy (L0 ≈ none < L1 < L2a < L2b < L3), with four
+refinements to the model:
+
+1. **Σ_g is nearly inert (+0.9), and the reason refines the theory**: its covariance is
+   right but its *support is static* — it re-injects directions already present in the
+   same 4k gradients every epoch (including the wrong-label directions themselves!),
+   so it adds no per-visit decorrelation beyond what SGD already provides. The
+   operative augmentation property is not the covariance; it is **fresh support beyond
+   the empirical points, resampled per visit**. (This also retro-explains the original
+   nanoGPT ablation's isotropic ≥ Σ_g verdict more deeply than "BN-mediated.")
+2. **Label interpolation is load-bearing at Level 2**: chord geometry alone (vicinal)
+   buys +2.9; adding target mixing (mixup) buys +6.2 — under label noise, mixing
+   dilutes every wrong label so the model is never trained on a pure corrupted target.
+   Level 2 splits into L2a (vicinity) and L2b (vicinity + target dilution), and most
+   of the practical power is in the dilution.
+3. **The remaining gap to crop (+3.8 over mixup) is the on-manifold premium**: chords
+   between digits are off-manifold blends; shifts are on-manifold orbits. Domain
+   knowledge buys exactly that.
+4. **Small batch is a different axis, not a rung**: temperature, not information. It
+   suppresses memorization hardest of all injectables (22.6%) but converts little of
+   it into accuracy (89.56) — more SGD noise blurs signal and noise alike, where
+   diversity arms replace noise-fitting with signal.
+
+Refined principle: *the character of augmentation = per-visit-decorrelated vicinity
+with support beyond the empirical sample, ideally on-manifold, plus target dilution
+where labels can be wrong.* Predicted next rung (untested): k-NN/local-PCA-directed
+jitter — on-manifold chords — should land between mixup and crop without domain
+knowledge. For label-free domains (diffusion), the mixup analogue is target-space
+mixing, not class interpolation.
