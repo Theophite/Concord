@@ -560,7 +560,7 @@ def _apply_packed_adamw_kernel(
         v_hat = v_row_tile[:, None] * v_col_tile[None, :] * sum_v_inv
     if USE_GF_TRUST_REGION:
         v_proxy = v_proxy + gf_trust_delta_sq * v_hat
-    if USE_GF_CONSOLIDATION or USE_COHPRE or USE_RATIO_COH:
+    if USE_GF_CONSOLIDATION or (USE_COHPRE or USE_RATIO_COH):
         # Momentum = displacement between two time-lagged positions: the
         # mean gradient over v_slow's window is α_v·d_sv (mantissa units),
         # → W units via scale_fwd. Coherence = (mean grad)² / E[g²] ∈ [0,1]
