@@ -667,3 +667,38 @@ pre-NS v̂ scaling (orthogonalize the SNR-scaled gradient — NS re-whitens
 magnitudes but the DOMINANT SUBSPACE it preserves shifts toward signal;
 cousin of §8's pre-NS EMA). Until then: muon stays opt-in at λ≈0 for
 clean/high-rank tasks, v̂ + the element gate everywhere else.
+
+
+## Exp 15 — pre-NS v̂ scaling: erased by NS; the line closes (`exp15_prens.py`)
+
+The last candidate from exp 14: orthogonalize the SNR-scaled gradient
+h = g/√(v̂+ε), betting that NS re-whitens magnitudes but preserves the
+dominant subspace of its INPUT. Both predictions fail:
+
+- **Rank-4 synthetic**: prens leak 37.3% / 43.4% (clean/noisy) — identical
+  to plain muon (37.3 / 44.4), nowhere near v̂ (25.8 / 23.6). MSE identical
+  to muon. The written subspace did not move.
+- **MNIST λ-response**: prens λ=0 ≈ ns5 (slightly worse clean: 94.46 vs
+  94.86), and the λ 0→0.1 penalty is IDENTICAL (−1.08 vs −1.06 clean) —
+  the element gate is exactly as blind downstream of prens as of NS5. No
+  legibility was restored.
+
+Why — and this is the arc's deepest finding: **the reference meters are
+axis-aligned; task subspaces are rotated.** The teacher's rank-4 subspace is
+a random rotation, so per-element statistics (the element coh) and rank-1
+factored statistics (v̂ = v_row ⊗ v_col) are blind to it BY CONSTRUCTION —
+there is nothing axis-aligned for the pre-NS weighting to encode, so NS has
+nothing to preserve. Re-read in this light, the v̂ drive's leak advantage
+(23.6 vs 44.4) was never subspace-selectivity: it is MAGNITUDE-selectivity
+(noise writes are small in W units), and magnitude is exactly the channel NS
+erases. All five failures (exp 12-15) are one sentence: every meter in this
+system lives in the element basis, magnitude is the only selectivity it can
+express, and orthogonalization deletes magnitude.
+
+Closure: selectivity-at-the-write for an orthogonalized drive requires
+second-moment statistics in a ROTATED basis — full-matrix / Kronecker
+(Shampoo-family) preconditioning or a maintained spectral sketch. That is a
+research program, not a patch; the muon line CLOSES here. Standing verdict:
+muon opt-in at λ≈0 for clean/high-rank tasks (where it beats v̂ outright —
+exp 12), v̂ + the element gate everywhere else; nothing about the winner
+configuration changes.

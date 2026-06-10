@@ -322,3 +322,19 @@ emergent-rank/long-horizon phenomenon (gate 1), as observed. One candidate
 left standing, unrun: PRE-NS v̂ scaling (orthogonalize the SNR-scaled
 gradient — NS re-whitens magnitudes but its preserved dominant subspace
 shifts toward signal; cousin of the §8 pre-NS EMA).
+
+**Addendum 3 (exp 15, same day): pre-NS v̂ scaling is erased by NS — the
+line closes.** Identical leak to plain muon on the rank-4 synthetic (37/43%
+vs v̂'s 24-26%), identical λ-penalty on MNIST (no element-gate legibility
+restored), slightly worse clean. The arc's root cause, visible only from
+the rank task: the system's meters are AXIS-ALIGNED (element coh; rank-1
+v̂ = v_row ⊗ v_col) while task subspaces are rotated — they are blind to
+rotated low-rank structure by construction, so the only selectivity they
+can express is per-element MAGNITUDE, and magnitude is exactly the channel
+orthogonalization deletes. The v̂ drive's leak advantage was never
+subspace-selectivity; it was magnitude-selectivity. Selectivity-at-the-write
+for an orthogonalized drive therefore requires second-moment statistics in
+a rotated basis (Shampoo-family / spectral sketch) — a research program,
+not a patch. Standing verdict unchanged: muon opt-in at λ≈0 for
+clean/high-rank tasks (where it beats v̂ outright, exp 12); v̂ + the
+element gate everywhere else.
