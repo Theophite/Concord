@@ -87,6 +87,8 @@ def make_concord_config(learning_rate: float, optimizer_config=None):
         autotune_table=pick("autotune_table", d.autotune_table),
         autotune_beta1_on=float(pick("autotune_beta1_on", d.autotune_beta1_on)),
         autotune_beta1_coh=float(pick("autotune_beta1_coh", d.autotune_beta1_coh)),
+        autotune_reprobe_band=pick("autotune_reprobe_band", d.autotune_reprobe_band),
+        dissipation=pick("dissipation", d.dissipation),
     )
 
 
@@ -100,6 +102,17 @@ class ConcordController:
         from concord_winner import swap_unet_to_winner, GatedRebalance, swap_text_encoder_to_anchor, \
             set_lazy_gate, set_lazy_thresh
         self.config = make_concord_config(learning_rate, optimizer_config)
+        # Dimensionless dissipation: the physical friction knob is lam = lr*kappa
+        # (u <- u - lr*kappa*(1-coh)*u). When `dissipation` is set it overrides
+        # gf_consol with lam/lr, so the same lam means the same per-step friction
+        # at ANY learning rate (kappa alone does not transfer: kappa=50 at SDXL
+        # lr 7.5e-5 is lam=0.00375 — ~100x under the CPU noisy-regime optimum).
+        # The lr*kappa < 2 stability guard then reads directly as lam < 2.
+        if self.config.dissipation is not None:
+            lam = float(self.config.dissipation)
+            self.config.gf_consol = lam / max(self.config.lr, 1e-12)
+            print(f"[concord] dimensionless dissipation lam={lam:g} @ lr={self.config.lr:g} "
+                  f"-> gf_consol={self.config.gf_consol:.0f}")
         self.total_steps = max(1, int(total_steps))
         # module_filters: OneTrainer's layer_filter (ModuleFilter list). When set to a non-"full"
         # preset (e.g. attn-mlp -> ["attentions"]) only the selected layers are swapped to
@@ -140,6 +153,13 @@ class ConcordController:
         from prototype_packed_b import DissipationAutoTuner
         self._autotune_pending = False
         table = [(float(c), float(k)) for c, k in json.loads(self.config.autotune_table)]
+        if self.config.dissipation is not None:
+            # dimensionless mode: the table's kappa column is lam = lr*kappa ->
+            # convert to kappa at this run's lr BEFORE the stability guard, so the
+            # guard's lr*kappa reads exactly the table's lam. The coherence column
+            # is untouched — its scale remains domain-calibrated (the exp-11
+            # meter-conditioning rule).
+            table = [(c, k / max(self.config.lr, 1e-12)) for c, k in table]
         max_kappa = max(k for _, k in table)
         if self.config.lr * max_kappa >= 2.0:
             raise ValueError(
@@ -174,7 +194,8 @@ class ConcordController:
             table=table,
             probe_kappa=self.config.gf_consol,
             beta1_on=self.config.autotune_beta1_on,
-            beta1_coh_threshold=self.config.autotune_beta1_coh)
+            beta1_coh_threshold=self.config.autotune_beta1_coh,
+            reprobe_band=self.config.autotune_reprobe_band)
 
     @torch.no_grad()
     def before_step(self):

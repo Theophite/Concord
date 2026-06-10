@@ -78,6 +78,16 @@ class ConcordConfig:
     gf_trust_delta_sq: float = 1.0
     # dissipation (the "split")
     gf_consol: float = 50.0
+    # DIMENSIONLESS dissipation: the per-step friction fraction lam = lr*kappa
+    # (the physical knob — the friction term is u <- u - lr*kappa*(1-coh)*u, and
+    # kappa alone does not transfer across learning rates: the CPU oracle's
+    # kappa* in {0..400} at lr=1e-3 is lam* in {0..0.4}; kappa=50 at SDXL lr
+    # 7.5e-5 is lam=0.00375, ~100x under-damped vs the noisy-regime optimum).
+    # When set, OVERRIDES gf_consol with lam/lr at controller init; the
+    # stability ceiling reads directly as lam < 2. With autotune active, the
+    # table's kappa column is then interpreted as DIMENSIONLESS lam and
+    # converted by 1/lr at build (the coherence column stays domain-calibrated).
+    dissipation: float = None
     ratio_coh: bool = True
     ratio_chase_floor: float = 0.9
     ratio_chase_floor_min: float = 0.1
@@ -93,6 +103,8 @@ class ConcordConfig:
     # across domains. beta1_on=0.0 keeps probe-selected momentum OFF (conservative
     # default; the beta1 evidence is one task deep).
     autotune_table: str = None
+    autotune_reprobe_band: float = None  # exp-11d live mode: one-sided coherence-drop
+                                          # band that triggers a re-probe; None = one-commit
     autotune_beta1_on: float = 0.0
     autotune_beta1_coh: float = 0.35
     # fluctuation (the noise)
