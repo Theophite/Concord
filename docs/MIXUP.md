@@ -103,11 +103,24 @@ Decision rule, by what you have:
 | only vectors, no labels to mix | chord/k-NN jitter (modest) | L2a |
 | nothing (optimizer-only) | σ/Σ_g — measured not worth it | L0/L1 |
 
-- **For the SDXL fork**: diffusion training has no class labels to interpolate, so the
-  L2b analogue is **target-space mixing** (interpolating latents/noise targets) —
-  flagged as a testable idea, not a result. The L3 path (real image augmentation) is
-  already available in OneTrainer and, per this hierarchy, strictly preferable where
-  semantically safe.
+- **For the SDXL fork**: the caption IS the label (corrected from an earlier draft
+  that claimed otherwise). Miscaptioned data is label noise in exactly the exp-12
+  sense, and captions enter as text-encoder embeddings — a continuous space where
+  interpolation is well-defined. Three observations make caption mixup concrete:
+  (a) with shared ε and t, the v-prediction target is affine in z₀, so latent mixup
+  mixes targets **exactly** (`v(λz+(1−λ)z′) = λv+(1−λ)v′`) — an identity where
+  classification's mixed CE is a heuristic; (b) **CFG caption dropout is already the
+  Bernoulli endpoint of caption mixing** (dilution toward the null embedding at
+  λ ∈ {0,1}) — caption mixup is the continuous interior of standard practice;
+  (c) both ingredients are cached in the fork (latents, text embeds), so mixing is
+  two lerps per batch, same-shape within aspect buckets, graph-compatible via the
+  existing inject-per-replay pattern. Two variants to test, conservative first:
+  **caption-side-only dilution** (mix embeddings, keep latent/target pure — pure
+  anti-caption-noise, no off-manifold latents) and **full mixup** (the exact identity
+  above; open distributional question: whether training on chord blends biases
+  generations toward blends — hedge with small-α Beta). Untested in diffusion;
+  flagged as the highest-value transfer experiment from this series. The L3 path
+  (real image augmentation) remains strictly preferable where semantically safe.
 - **Predicted next rung (untested)**: k-NN/local-PCA-directed jitter — *on-manifold*
   chords, still domain-agnostic — should land between mixup and crop. The test is the
   same arena; the prediction is on the books.
