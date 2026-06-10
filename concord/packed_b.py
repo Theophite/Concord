@@ -103,6 +103,37 @@ def compute_drift_cancel_C(alpha, alpha_v_fast,
 
 
 # ============================================================
+# The NS (Muon) drive — docs/MUON_DRIVE.md, docs/MUON_IMPLEMENTATION.md
+# ============================================================
+
+def ns5(G, steps=5, eps=1e-7):
+    """Newton–Schulz quintic orthogonalization (the standard Muon iteration).
+
+    Transient, per-layer, stateless: input is this backward's grad_W (bf16 —
+    the quintic coefficients are tuned to tolerate bf16, per Muon practice);
+    Frobenius normalization makes it scale-free. Returns a semi-orthogonal
+    matrix (singular values ~1): the spectral bound IS the trust region —
+    the NS drive runs with no eps, no step cap, no v-hat (exp 9c: per-element
+    |step| max 6.7 vs the v-hat arm's 323+, cap never binds).
+
+    Reference: experiments/cpu_dynamics/exp9_muon.py::ns5 (CPU-validated,
+    exps 9/9b/9c). The drive consumes plain NS5(g/|g|): blending velocity into
+    the NS input (c>0) is a self-reinforcing direction loop — the chase IS the
+    EMA, retraction belongs on directions only (the c-sweep, MUON_DRIVE.md §2).
+    """
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = G / (G.norm() + eps)
+    transposed = X.shape[0] > X.shape[1]
+    if transposed:
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    return X.T if transposed else X
+
+
+# ============================================================
 # Triton kernels
 # ============================================================
 
@@ -456,6 +487,9 @@ def _apply_packed_adamw_kernel(
     USE_COHPRE: tl.constexpr,  # True → coh_pre-gated acceptance (chase)
     USE_FIXED_COH: tl.constexpr,  # True → Wiener coh = S/(S+noise²) (units-correct)
     USE_RATIO_COH: tl.constexpr,  # True -> gate chase+leak by live coh, no coh_pre
+    USE_MUON: tl.constexpr,  # True -> NS drive: grad_W_ptr carries O = γ·NS5(ĝ); no
+                              # denom, no cap, no v-hat (eps/step_cap/v_scale/
+                              # precond_p/gf_trust_delta_sq are dead args)
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -512,7 +546,12 @@ def _apply_packed_adamw_kernel(
     # v̂ (Adafactor rank-1, W² units) feeds both the trust region and the
     # consolidation-coherence gate, so load it if either is active.
     coh = 0.0
-    if USE_GF_TRUST_REGION or USE_GF_CONSOLIDATION or USE_COHPRE or USE_RATIO_COH:
+    # USE_MUON: v-hat is deleted state — the wrapper stubs v_row/v_col/sum_v_inv
+    # and this path must never touch them. The fixed Wiener gate below reads only
+    # d_fs, d_sv and drift_cancel_C (packed fields); it never needed v-hat.
+    # (Pairwise parens: old Triton rejects 3+-way `or` chains.)
+    if ((USE_GF_TRUST_REGION or USE_GF_CONSOLIDATION)
+            or (USE_COHPRE or USE_RATIO_COH)) and (not USE_MUON):
         v_row_tile = tl.load(v_row_ptr + offs_n,
                               mask=n_mask, other=0.0).to(tl.float32)
         v_col_tile = tl.load(v_col_ptr + offs_k,
@@ -554,9 +593,16 @@ def _apply_packed_adamw_kernel(
     # (pure SGD); p in (0,0.5) interpolates between the linear (SGD) and
     # fully-smoothed (trust-region) regimes. Use exp2/log2 for the pow;
     # v_proxy+eps > 0 always (eps>0) so the log is safe.
-    denom_p = tl.exp2(precond_p * tl.log2(v_proxy + eps))
-    step_live = grad_W / denom_p
-    step_live = tl.minimum(tl.maximum(step_live, -step_cap), step_cap)
+    if USE_MUON:
+        # NS drive (MUON_DRIVE.md §3): grad_W_ptr already carries
+        # O = γ·NS5(ĝ) — per-element RMS ≈ 0.7, spectral norm exactly γ.
+        # The spectral bound IS the trust region: no denominator, no cap
+        # (exp 9c — capless-stable across lr ∈ [1e-3, 1e-1]).
+        step_live = grad_W
+    else:
+        denom_p = tl.exp2(precond_p * tl.log2(v_proxy + eps))
+        step_live = grad_W / denom_p
+        step_live = tl.minimum(tl.maximum(step_live, -step_cap), step_cap)
     # Cautious weight decay: decay s_fast (the velocity) toward 0,
     # equivalently decay the live weight W toward (s_slow + v_slow)·
     # scale_fwd (the persistent "slow position"), NOT toward 0. The
@@ -871,7 +917,8 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
                          mass_preserve=False, apply_chase=True,
                          track_rebalance=True,
                          v_row=None, v_col=None, sum_v_inv=None,
-                         gf_trust_delta_sq=0.0, coh_pre=None):
+                         gf_trust_delta_sq=0.0, coh_pre=None,
+                         use_muon=False):
     """Wrapper for the AdamW three-accumulator packed apply kernel.
     weight_buf is updated with the new live weight (materialize-merge),
     so the next forward can read directly without a separate materialize
@@ -898,7 +945,15 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
     use_gf_consol = (gf_consol > 0)
     use_cohpre = (coh_pre is not None)
     coh_pre_arg = coh_pre if coh_pre is not None else packed_w  # stub if off
-    if use_gf_trust or use_gf_consol or use_cohpre:
+    if use_muon:
+        # NS drive: v-hat is deleted state. The trust region rode on v-hat ->
+        # dead; the coherence gate must be the fixed-Wiener (or ratio) form —
+        # the legacy coh branch reads v-hat (MUON_DRIVE.md §7).
+        assert _USE_FIXED_COH or _RATIO_COH, \
+            "the muon drive requires the fixed/ratio coherence gate " \
+            "(the legacy coh branch reads the deleted v-hat)"
+        use_gf_trust = False
+    if (use_gf_trust or use_gf_consol or use_cohpre) and not use_muon:
         assert v_row is not None and v_col is not None \
             and sum_v_inv is not None, \
             "gf_trust/gf_consol/coh_pre require v_row, v_col, sum_v_inv"
@@ -909,7 +964,7 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         sum_v_inv = sum_v_inv if sum_v_inv is not None else packed_w
     step_counter = _get_step_counter(packed_w.device)
     step_counter.add_(1)
-    if _DENOM_DIAG["enabled"]:
+    if _DENOM_DIAG["enabled"] and not use_muon:
         _denom_diagnostic(packed_w, grad_W, row_exp, col_exp,
                           v_row, v_col, sum_v_inv, use_gf_trust,
                           lr, float(eps), float(v_scale),
@@ -948,6 +1003,7 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         USE_COHPRE=bool(use_cohpre),
         USE_FIXED_COH=bool(_USE_FIXED_COH),
         USE_RATIO_COH=bool(_RATIO_COH),
+        USE_MUON=bool(use_muon),
     )
 
 
@@ -1208,7 +1264,8 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
                 weight_buf, row_max_buf, col_max_buf,
                 v_row, v_col, sum_v_inv,
                 adafactor_beta2, track_adafactor_v,
-                gf_trust_delta_sq, coh_pre):
+                gf_trust_delta_sq, coh_pre,
+                use_muon, muon_gamma):
         # weight_buf is kept fresh by the *previous* step's apply kernel
         # (materialize-merge). On the very first forward, the layer's
         # _ensure_buffers materializes it once. So we read it directly
@@ -1250,6 +1307,8 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
         ctx.track_adafactor_v = track_adafactor_v
         ctx.gf_trust_delta_sq = gf_trust_delta_sq
         ctx.coh_pre = coh_pre
+        ctx.use_muon = use_muon
+        ctx.muon_gamma = muon_gamma
         return y
 
     @staticmethod
@@ -1275,6 +1334,14 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
             grad_W = grad_W.to(torch.bfloat16)
         if not grad_W.is_contiguous():
             grad_W = grad_W.contiguous()
+        if ctx.use_muon:
+            # The NS drive (MUON_DRIVE.md §3): orthogonalize THIS backward's
+            # gradient — transient, per-layer, no state; the self-stepping
+            # contract (grad consumed in the same backward call) is untouched.
+            # γ = √max(N,K) restores per-element RMS ≈ 0.7 (spectral norm γ).
+            # Fluctuation, if it ever returns, goes POST-NS (exp 9b: pre-NS σ
+            # is re-amplified to unit spectral weight); this module ships no σ.
+            grad_W = (ctx.muon_gamma * ns5(grad_W)).contiguous()
         # Only zero the rebalance bookkeeping buffers if we're going to
         # write to them — skipping the zeros saves two more kernel
         # launches per layer per backward.
@@ -1324,6 +1391,7 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
                 sum_v_inv=ctx.sum_v_inv,
                 gf_trust_delta_sq=ctx.gf_trust_delta_sq,
                 coh_pre=ctx.coh_pre,
+                use_muon=ctx.use_muon,
             )
         else:
             apply_packed_sgd(
@@ -1350,7 +1418,8 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
                 None, None, None,
                 None, None, None,
                 None, None, None,
-                None, None, None, None)
+                None, None, None, None,
+                None, None)
 
 
 class ConcordLinearPackedB(nn.Module):
@@ -1376,8 +1445,19 @@ class ConcordLinearPackedB(nn.Module):
     MAX_M = 24000   # rebalance threshold (matches int16 path)
 
     def __init__(self, in_features, out_features, bias=True,
-                 device='cuda', alpha=0.1, beta1=0.0, lr=0.01):
+                 device='cuda', alpha=0.1, beta1=0.0, lr=0.01,
+                 drive="vhat"):
         super().__init__()
+        # Drive selection (docs/MUON_DRIVE.md): "vhat" = the validated rank-1
+        # v-hat AdamW; "muon" = the NS drive — γ·NS5(ĝ) ticks with no v-hat,
+        # no eps, no step cap, no trust region (the int32 word is the entire
+        # optimizer state). Gate/friction/chase/leak/deploy are drive-agnostic.
+        if drive not in ("vhat", "muon"):
+            raise ValueError(f"drive must be 'vhat' or 'muon', got {drive!r}")
+        self.drive = drive
+        # γ = √max(N,K): per-element step RMS ≈ 0.7 (measured), spectral norm
+        # exactly γ. Shape constant — baked at construction.
+        self._muon_gamma = float(max(out_features, in_features)) ** 0.5
         self.in_features = in_features
         self.out_features = out_features
         self.alpha = alpha
@@ -1422,7 +1502,8 @@ class ConcordLinearPackedB(nn.Module):
         # AND the gf-trust-region floor δ²·v̂ when enabled. β2=0.999
         # matches v_slow's EMA rate. Set `track_adafactor_v=False` to
         # skip the EMA if you want neither diagnostic nor trust region.
-        self.track_adafactor_v = True
+        # (The muon drive deletes v-hat entirely — no EMA to track.)
+        self.track_adafactor_v = (self.drive != "muon")
         self.adafactor_beta2 = 0.999
         # Garbage-fraction trust region: when > 0, adds δ²·v̂ to v_proxy
         # so step is implicitly bounded by ~1/δ at gf→0 and → 0 at gf→1
@@ -1453,15 +1534,23 @@ class ConcordLinearPackedB(nn.Module):
         self.register_buffer('col_exp',
             torch.zeros(in_features, dtype=torch.int8, device=device))
         # Adafactor row/col second-moment EMAs in g² units. Σv_row=Σv_col.
-        self.register_buffer('v_row',
-            torch.zeros(out_features, dtype=torch.float32, device=device))
-        self.register_buffer('v_col',
-            torch.zeros(in_features, dtype=torch.float32, device=device))
-        # 1/Σv_row, updated per step; kernel reads it to compute v̂ per
-        # element without a per-launch reduction. Initialized to 1 to
-        # avoid div-by-zero on the first step (when v_row is still 0).
-        self.register_buffer('_sum_v_inv',
-            torch.ones(1, dtype=torch.float32, device=device))
+        # The muon drive deletes this state outright (MUON_DRIVE.md §7): the
+        # buffers register as None so attribute access stays uniform and the
+        # backward/wrapper None-checks skip the EMA + stub the kernel pointers.
+        if self.drive == "muon":
+            self.register_buffer('v_row', None)
+            self.register_buffer('v_col', None)
+            self.register_buffer('_sum_v_inv', None)
+        else:
+            self.register_buffer('v_row',
+                torch.zeros(out_features, dtype=torch.float32, device=device))
+            self.register_buffer('v_col',
+                torch.zeros(in_features, dtype=torch.float32, device=device))
+            # 1/Σv_row, updated per step; kernel reads it to compute v̂ per
+            # element without a per-launch reduction. Initialized to 1 to
+            # avoid div-by-zero on the first step (when v_row is still 0).
+            self.register_buffer('_sum_v_inv',
+                torch.ones(1, dtype=torch.float32, device=device))
         # Coherence gate ON by default (validated recipe): per-coord coh_pre EMA
         # (fp32, init 1.0). Apply kernel gates the chase by coh + coh_pre*(1-coh).
         self._coh_pre = torch.ones_like(self.packed_w, dtype=torch.float32)
@@ -1551,6 +1640,31 @@ class ConcordLinearPackedB(nn.Module):
         """Turn the coherence gate OFF (no-gate ablation): _coh_pre -> None, so
         the apply kernel takes the ungated chase path."""
         self._coh_pre = None
+
+    def set_drive(self, drive):
+        """Switch the step drive: 'vhat' (validated rank-1 v-hat AdamW) or
+        'muon' (the NS drive — docs/MUON_DRIVE.md). Muon deletes the v-hat
+        state; switching back to 'vhat' re-allocates it zeroed, so the EMA
+        re-warms over ~1/(1-β2) steps. κ (gf_consol) is PER-DRIVE — the NS
+        tick is unit-RMS, friction works ~4x harder per unit κ; recalibrate."""
+        if drive not in ("vhat", "muon"):
+            raise ValueError(f"drive must be 'vhat' or 'muon', got {drive!r}")
+        if drive == self.drive:
+            return
+        self.drive = drive
+        if drive == "muon":
+            self.v_row = None
+            self.v_col = None
+            self._sum_v_inv = None
+            self.track_adafactor_v = False
+        else:
+            dev = self.packed_w.device
+            self.v_row = torch.zeros(self.out_features, dtype=torch.float32,
+                                     device=dev)
+            self.v_col = torch.zeros(self.in_features, dtype=torch.float32,
+                                     device=dev)
+            self._sum_v_inv = torch.ones(1, dtype=torch.float32, device=dev)
+            self.track_adafactor_v = True
 
     def set_optimizer_kind(self, kind, weight_decay=0.0, eps=1.0,
                               step_cap=10.0):
@@ -1786,7 +1900,8 @@ class ConcordLinearPackedB(nn.Module):
             self.v_row, self.v_col, self._sum_v_inv,
             float(self.adafactor_beta2),
             bool(self.track_adafactor_v),
-            float(self.gf_trust_delta_sq), self._coh_pre)
+            float(self.gf_trust_delta_sq), self._coh_pre,
+            self.drive == "muon", self._muon_gamma)
         return y.to(in_dtype)
 
     @torch.no_grad()
@@ -1877,7 +1992,8 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
                 weight_buf, row_max_buf, col_max_buf,
                 v_row, v_col, sum_v_inv,
                 adafactor_beta2, track_adafactor_v,
-                gf_trust_delta_sq, coh_pre):
+                gf_trust_delta_sq, coh_pre,
+                use_muon, muon_gamma):
         # weight_buf kept fresh by previous apply (materialize-merge).
         # Initial population happens once in _ensure_buffers.
         weight_4d = weight_buf.view(out_channels, in_channels, kh, kw)
@@ -1927,6 +2043,8 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
         ctx.track_adafactor_v = track_adafactor_v
         ctx.gf_trust_delta_sq = gf_trust_delta_sq
         ctx.coh_pre = coh_pre
+        ctx.use_muon = use_muon
+        ctx.muon_gamma = muon_gamma
         return y
 
     @staticmethod
@@ -1948,6 +2066,10 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
         grad_W_2d = grad_W_4d.reshape(ctx.out_channels, -1).contiguous()
         if grad_W_2d.dtype != torch.bfloat16:
             grad_W_2d = grad_W_2d.to(torch.bfloat16)
+        if ctx.use_muon:
+            # NS on the packed 2-D view [C_out, C_in·kh·kw] — the layout the
+            # packed conv already uses for its exponents (standard Muon practice).
+            grad_W_2d = (ctx.muon_gamma * ns5(grad_W_2d)).contiguous()
         if ctx.track_rebalance:
             ctx.row_max_buf.zero_()
             ctx.col_max_buf.zero_()
@@ -1990,6 +2112,7 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
                 sum_v_inv=ctx.sum_v_inv,
                 gf_trust_delta_sq=ctx.gf_trust_delta_sq,
                 coh_pre=ctx.coh_pre,
+                use_muon=ctx.use_muon,
             )
         else:
             # SGD path doesn't have a variance preconditioner, so the gf
@@ -2018,7 +2141,8 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
                 None, None, None,
                 None, None, None,
                 None, None, None,
-                None, None, None, None)
+                None, None, None, None,
+                None, None)
 
 
 class ConcordConv2dPackedB(ConcordLinearPackedB):
@@ -2027,7 +2151,7 @@ class ConcordConv2dPackedB(ConcordLinearPackedB):
 
     def __init__(self, in_channels, out_channels, kernel_size, stride=1,
                  padding=0, bias=True, device='cuda',
-                 alpha=0.1, beta1=0.0, lr=0.01):
+                 alpha=0.1, beta1=0.0, lr=0.01, drive="vhat"):
         if isinstance(kernel_size, int):
             kh = kw = kernel_size
         else:
@@ -2040,7 +2164,7 @@ class ConcordConv2dPackedB(ConcordLinearPackedB):
         super().__init__(in_features=in_channels * kh * kw,
                          out_features=out_channels,
                          bias=bias, device=device,
-                         alpha=alpha, beta1=beta1, lr=lr)
+                         alpha=alpha, beta1=beta1, lr=lr, drive=drive)
 
     def forward(self, x):
         in_dtype = x.dtype
@@ -2061,7 +2185,8 @@ class ConcordConv2dPackedB(ConcordLinearPackedB):
             self.v_row, self.v_col, self._sum_v_inv,
             float(self.adafactor_beta2),
             bool(self.track_adafactor_v),
-            float(self.gf_trust_delta_sq), self._coh_pre)
+            float(self.gf_trust_delta_sq), self._coh_pre,
+            self.drive == "muon", self._muon_gamma)
         return y.to(in_dtype)
 
 
@@ -2275,6 +2400,18 @@ def _packed_b_mlp_adamw(in_f, hid, out_f, lr, device):
     return m
 
 
+def _packed_b_mlp_muon(in_f, hid, out_f, lr, device):
+    """The NS drive arm (MUON_DRIVE.md): bare adamw-kind layers with
+    drive='muon' — γ·NS5(ĝ) ticks; eps/step_cap/trust-region are dead args."""
+    return nn.Sequential(
+        ConcordLinearPackedB(in_f, hid, device=device, lr=lr, alpha=0.1,
+                             drive="muon"),
+        nn.ReLU(),
+        ConcordLinearPackedB(hid, out_f, device=device, lr=lr, alpha=0.1,
+                             drive="muon"),
+    )
+
+
 def _torch_mlp_adamw(in_f, hid, out_f, lr, device):
     model = nn.Sequential(
         nn.Linear(in_f, hid, device=device),
@@ -2353,6 +2490,8 @@ def smoke_test():
         ('packed-B AdamW lr=0.05',  _packed_b_mlp_adamw, 0.05),
         ('packed-B AdamW lr=0.01',  _packed_b_mlp_adamw, 0.01),
         ('packed-B AdamW lr=0.001', _packed_b_mlp_adamw, 0.001),
+        ('packed-B MUON lr=0.05',   _packed_b_mlp_muon, 0.05),
+        ('packed-B MUON lr=0.01',   _packed_b_mlp_muon, 0.01),
         ('SGD baseline lr=0.05',    _torch_mlp,    0.05),
         ('SGD baseline lr=0.01',    _torch_mlp,    0.01),
         ('AdamW baseline lr=0.01',  _torch_mlp_adamw,  0.01),
@@ -2386,21 +2525,38 @@ def smoke_test():
     base_adam = max((r[1] for k, r in results.items()
                      if k.startswith('AdamW baseline') and r[2] == 0),
                     default=0.0)
+    pkdB_muon = max((r[1] for k, r in results.items()
+                     if k.startswith('packed-B MUON') and r[2] == 0),
+                    default=0.0)
     print(f"[smoke] packed-B SGD best:    {pkdB_sgd:.1f}x   (vs torch.SGD baseline {base_sgd:.1f}x)")
     print(f"[smoke] packed-B AdamW best:  {pkdB_adam:.1f}x   (vs torch.AdamW baseline {base_adam:.1f}x)")
+    print(f"[smoke] packed-B MUON best:   {pkdB_muon:.1f}x")
+    print()
+
+    print("=== MUON drive determinism (same seed, SR counters reset) ===")
+    def _muon_once():
+        _STEP_COUNTERS.clear()          # reset the SR salt so runs are comparable
+        return _run_one(_packed_b_mlp_muon, lr=0.01)
+    muon_det = (_muon_once() == _muon_once())
+    print(f"[smoke] muon same-seed determinism: {'OK' if muon_det else 'FAIL'}")
     print()
 
     sgd_ok = pkdB_sgd >= base_sgd * 0.7
     adam_works = pkdB_adam > 1.5   # at least some convergence (not NaN)
-    if sgd_ok and adam_works:
-        print(f"[PASS] packed-B SGD >= 70% of torch.SGD, AdamW path converges")
+    muon_ok = pkdB_muon > 1.5 and muon_det
+    if sgd_ok and adam_works and muon_ok:
+        print(f"[PASS] packed-B SGD >= 70% of torch.SGD, AdamW path converges, "
+              f"MUON drive converges + deterministic")
         return True
     elif not sgd_ok:
         print(f"[FAIL] packed-B SGD ratio too low ({pkdB_sgd:.1f}x vs "
               f"baseline {base_sgd:.1f}x)")
         return False
-    else:
+    elif not adam_works:
         print(f"[FAIL] packed-B AdamW path failed to converge")
+        return False
+    else:
+        print(f"[FAIL] MUON drive: ratio={pkdB_muon:.1f}x det={muon_det}")
         return False
 
 
