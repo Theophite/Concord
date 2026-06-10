@@ -280,6 +280,21 @@ oracle κ at every noise level (largest where v̂ needs κ most: ρ45% 90.64 vs
 83.01 unaided / 89.53 at κ*). The gate-1 κ-flat plateau re-reads as the
 small-λ end of a near-uniform tax, not under-damping. The GPU bench above is
 NOT worth running as specced. The surviving reopen point is a SPECTRAL gate
-— coherence in the singular basis (`wiener` rank mode, implemented, unrun) —
-which addresses both this meter-blindness and §10's emergent-rank
-starvation. Full table: experiments/cpu_dynamics/EXPERIMENTS.md exp 12.
+— coherence in the singular basis — which addresses both this meter-blindness
+and §10's emergent-rank starvation. Full table:
+experiments/cpu_dynamics/EXPERIMENTS.md exp 12.
+
+**Addendum (exp 13, same day): the zero-cost spectral gate is also refuted.**
+Cube-and-renormalize inside the NS (X@(XᵀX) = U σ³ Vᵀ — a smooth relative
+spectral threshold, 2c matmuls, no SVD) loses at every noise level and both
+sharpnesses, with the clean column again the killer (−2.5 at c=1, −6.6 at
+c=2, ρ=0): the minibatch spectrum is not spike-plus-bulk, so an
+energy-relative threshold is a per-step soft rank cut — §10's starvation in
+smooth clothing. This also weighs against the σ-energy form of the `wiener`
+rank mode. Combined exp 12+13 lesson: suppressors keyed on the gradient's
+OWN statistics (element magnitude, singular energy) lose; the working gates
+key on a SIGNAL REFERENCE (the telescope drift C*(S−A)). The standing reopen
+point is therefore the DRIFT-REFERENCED spectral gate: per-direction
+coherence diag(UᵀDV) against the drift matrix D — the existing Wiener meter
+transported to the singular basis with the same external reference; costs a
+basis (SVD/subspace sketch, ~4× per exp 10).

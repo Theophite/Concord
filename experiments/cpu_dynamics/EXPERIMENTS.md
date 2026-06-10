@@ -566,3 +566,44 @@ the wrong basis for a whitened drive; coherence measured in the singular
 basis (the `wiener` rank mode — implemented, unrun) would restore the
 contrast the evaporation needs, and is now the single reopen point that
 addresses both this result and the emergent-rank starvation of exp 10/§10.
+
+
+## Exp 13 — the spectral gate inside Newton-Schulz: energy is not SNR (`exp13_spectral_gate.py`)
+
+Exp 12's reopen point, implemented the zero-cost way: X@(X^T X) = U diag(σ³) V^T,
+so cube-and-renormalize c times before NS5 is a smooth RELATIVE spectral
+threshold (gap → gap^(3^c)) in 2c matmuls — no SVD, basis-preserving, and
+nominally "emergent-annealed" (a flat spectrum should pass unchanged).
+
+**Negative at both sharpnesses, λ ∈ {0, 0.1}, all noise levels** (NS5
+controls from exp 12, same seeds):
+
+    deploy %, λ=0      clean   ρ10%    ρ30%    ρ45%
+    ns5 (control)      94.86   94.61   92.85   90.64
+    wiener-NS c=1      92.41   92.01   90.55   88.88
+    wiener-NS c=2      88.28   87.47   85.65   84.04
+
+- **The clean column kills it**: −2.45 (c=1) and −6.58 (c=2) with zero label
+  noise. The minibatch gradient spectrum is not spike-plus-bulk — the small-σ
+  directions carry real signal, so a relative-energy threshold is a soft rank
+  cut applied every step: exp 10's starvation in smooth clothing. The
+  "emergent annealing" hope fails because the early spectrum is never flat
+  ENOUGH; cubing always reweights toward the top directions.
+- **The suppression works perfectly and loses anyway**: wns2 holds
+  memorization at chance even at ρ=10% (9.3%) while deploy is the worst in
+  the table — the purest form of the exp-12 lesson.
+- **λ=0.1 still hurts every wns cell**: cleaning the drive's spectrum by
+  energy does not restore the per-element meter's contrast either.
+
+Combined exp 12+13 statement: **every suppressor keyed on the gradient's own
+statistics — per-element friction on a whitened drive, energy-thresholded
+spectral shrinkage — loses to NS5's bare equal-magnitude write.** The
+suppressors that DO work in this codebase (the v̂-drive's gate) key on a
+SIGNAL REFERENCE: the telescope drift C*(S−A). The recorded reopen point is
+therefore the drift-referenced spectral gate — per-direction coherence
+diag(U^T D V) of the step's singular pairs against the drift matrix D, i.e.
+the existing Wiener meter transported to the singular basis with the same
+external reference. That needs the basis (SVD or a subspace sketch, the cost
+exp 10 measured at ~4×); the cube trick was worth one experiment precisely
+because it was free, and what it bought is the clean negative: energy is not
+SNR.
