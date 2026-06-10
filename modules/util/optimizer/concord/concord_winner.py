@@ -131,7 +131,8 @@ def _scalar(v, what):
     return int(v)
 
 
-def swap_unet_to_winner(unet, device, lr, gf_consol=None, verbose=True, module_filters=None):
+def swap_unet_to_winner(unet, device, lr, gf_consol=None, step_cap=None,
+                        gf_trust_delta_sq=None, verbose=True, module_filters=None):
     """Swap every nn.Linear / nn.Conv2d in `unet` (in place) to
     Concord{Linear,Conv2d}PackedB with the validated recipe + dissipation, load
     the pretrained weights, and engage the global winner flags (ratio_coh,
@@ -142,6 +143,10 @@ def swap_unet_to_winner(unet, device, lr, gf_consol=None, verbose=True, module_f
     """
     if gf_consol is None:
         gf_consol = WINNER["gf_consol"]
+    if step_cap is None:
+        step_cap = WINNER["step_cap"]
+    if gf_trust_delta_sq is None:
+        gf_trust_delta_sq = WINNER["gf_trust_delta_sq"]
     layers, n_lin, n_conv, n_skipped = [], 0, 0, 0
     # Honor OneTrainer's layer_filter (the GUI "Layer Filter" dropdown): only layers the
     # filter SELECTS get swapped to Concord; unmatched layers stay standard nn.Linear/Conv2d
@@ -177,12 +182,14 @@ def swap_unet_to_winner(unet, device, lr, gf_consol=None, verbose=True, module_f
                 n_conv += 1
             if c is None:
                 continue
-            # Validated recipe (== baked defaults; set explicit for clarity).
+            # Validated recipe; step_cap and the trust-region delta^2 are
+            # caller-overridable (winner values when not passed). Both are
+            # launch-time scalars baked at CUDA-graph capture -- init-only.
             c.set_optimizer_kind('adamw', weight_decay=WINNER["weight_decay"],
-                                  eps=WINNER["eps"], step_cap=WINNER["step_cap"])
+                                  eps=WINNER["eps"], step_cap=step_cap)
             c.precond_p = WINNER["precond_p"]
             c.v_scale = WINNER["v_scale"]
-            c.gf_trust_delta_sq = WINNER["gf_trust_delta_sq"]
+            c.gf_trust_delta_sq = gf_trust_delta_sq
             c.gf_consol = gf_consol            # dissipation
             with torch.no_grad():
                 c.load_weights(W2d.float())

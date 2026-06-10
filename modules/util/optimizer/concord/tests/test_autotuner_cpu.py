@@ -98,13 +98,17 @@ check("3  band=None stays one-commit through a drop",
 sys.path.insert(0, str(OT / "modules" / "util" / "optimizer"))
 from concord_ot import make_concord_config
 
-oc = SimpleNamespace(dissipation=0.025, autotune_reprobe_band=0.02)
+oc = SimpleNamespace(dissipation=0.025, autotune_reprobe_band=0.02,
+                     step_cap=5.0, gf_trust_delta_sq=0.5)
 cfg = make_concord_config(7.5e-5, oc)
 check("4a dissipation picked", cfg.dissipation == 0.025)
 check("4b reprobe band picked", cfg.autotune_reprobe_band == 0.02)
+check("4c step cap / trust region picked",
+      cfg.step_cap == 5.0 and cfg.gf_trust_delta_sq == 0.5)
 cfg_default = make_concord_config(7.5e-5, SimpleNamespace())
-check("4c defaults are None (off)",
-      cfg_default.dissipation is None and cfg_default.autotune_reprobe_band is None)
+check("4d defaults: dissipation/band None (off), cap/trust at winner",
+      cfg_default.dissipation is None and cfg_default.autotune_reprobe_band is None
+      and cfg_default.step_cap == 10.0 and cfg_default.gf_trust_delta_sq == 1.0)
 
 # ---- 5. dimensionless arithmetic (mirror of controller init / table build) --
 lr = 7.5e-5
@@ -168,6 +172,8 @@ check("7e watchdog armed by default", gd["autotune_reprobe_band"] == 0.02)
 check("7f subsumed knobs pruned from the panel (config-file only)",
       not any(k in gd for k in
               ("gf_consol", "ratio_coh", "autotune_beta1_on", "autotune_beta1_coh")))
+check("7g step cap / trust region exposed at winner values",
+      gd["step_cap"] == 10.0 and gd["gf_trust_delta_sq"] == 1.0)
 
 print()
 ok = all(results)

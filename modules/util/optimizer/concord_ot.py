@@ -84,6 +84,8 @@ def make_concord_config(learning_rate: float, optimizer_config=None):
         lazy_active_thresh=float(pick("lazy_active_thresh", d.lazy_active_thresh)),
         warmup=int(pick("warmup", d.warmup)),
         lr_min_frac=float(pick("lr_min_frac", d.lr_min_frac)),
+        step_cap=float(pick("step_cap", d.step_cap)),
+        gf_trust_delta_sq=float(pick("gf_trust_delta_sq", d.gf_trust_delta_sq)),
         autotune_table=pick("autotune_table", d.autotune_table),
         autotune_beta1_on=float(pick("autotune_beta1_on", d.autotune_beta1_on)),
         autotune_beta1_coh=float(pick("autotune_beta1_coh", d.autotune_beta1_coh)),
@@ -118,8 +120,9 @@ class ConcordController:
         # preset (e.g. attn-mlp -> ["attentions"]) only the selected layers are swapped to
         # Concord; the rest stay standard bf16 and are frozen, dropping their packed state.
         self.layers = swap_unet_to_winner(
-            unet, device, self.config.lr, gf_consol=self.config.gf_consol, verbose=False,
-            module_filters=module_filters)
+            unet, device, self.config.lr, gf_consol=self.config.gf_consol,
+            step_cap=self.config.step_cap, gf_trust_delta_sq=self.config.gf_trust_delta_sq,
+            verbose=False, module_filters=module_filters)
         self.gate = GatedRebalance(self.layers)
         # Frozen-anchor TE training (CLIP-L): swapped AFTER the UNet so the shared global coh
         # flags are already set; driven with its own lr. Empty unless a text_encoder is passed.
