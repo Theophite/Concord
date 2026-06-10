@@ -544,3 +544,36 @@ Findings:
    epochs — the extra 55 epochs bought +0.07. The compute-efficient recipe for this
    protocol is 25ep + aug + lr 1e-2, and exp 10's headline number had no lr headroom
    left in it.
+
+
+## Exp 11b — apportioning the lr flatness: native Muon on the same grid (`exp11b_native_lr.py`)
+
+Native Muon has the NS normalization and none of the cascade, so its fine-grid lr curve
+(same protocol as exp 11; live weights) splits the credit for the lr insensitivity:
+
+| lr | 3e-3 | 5e-3 | 7e-3 | 1e-2 | 1.5e-2 | 2e-2 | 3e-2 | 5e-2 |
+|---|---|---|---|---|---|---|---|---|
+| native, no aug | 93.89 | 93.18 | 93.07 | 93.10 | 93.24 | 92.96 | 93.15 | 92.68 |
+| native, aug | 96.56 | 95.43 | 94.71 | 93.81 | 91.54 | 87.48 | 70.89 | **29.20 ± 5.37** |
+| Concord-NS, aug (exp 11) | 97.30 | 97.37 | 97.43 | 97.51 | 97.36 | 97.36 | 97.19 | 96.52 |
+
+1. **The lr flatness belongs to the cascade, almost entirely.** Under augmentation,
+   native Muon collapses 67 points across one decade — the sharpest lr curve measured
+   in this campaign — while Concord-NS drifts 0.8 over the same span *with friction
+   off* (exp 11 was κ = 0). The pre-registered prediction ("flatter than v̂, sharper
+   than Concord-NS, ugly at 5e-2") was right on shape and wrong on attribution: it
+   credited NS normalization with most of the robustness; the data gives it to the
+   regulation.
+2. **Division of labor, now clean**: NS's spectral bound funds the *tail* robustness
+   (cap/trust-region deletion, exp 9c); the cascade — gate-throttled consolidation +
+   chase averaging + shipping `P` instead of the live endpoint — funds the *lr*
+   robustness. Constant-magnitude steps are exactly what spectral normalization
+   produces; without an averaging/regulating layer, the endpoint of that walk is
+   lr-critical, and augmentation (faster-rotating momentum) makes it worse, not
+   better.
+3. Native's lr\* sits at or below the grid edge (≤ 3e-3; exps 9/10 ran it at 1e-3,
+   which the curve retroactively justifies), so its earlier clean numbers were not
+   handicapped.
+4. Product implication: the lr-insensitivity does **not** transfer to bare NS
+   optimizers — it is a Concord-cascade property, i.e., a real differentiator rather
+   than inherited Muon credit.
