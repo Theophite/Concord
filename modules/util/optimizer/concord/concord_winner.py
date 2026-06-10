@@ -95,8 +95,6 @@ class ConcordConfig:
     autotune_table: str = None
     autotune_beta1_on: float = 0.0
     autotune_beta1_coh: float = 0.35
-    # legacy (pre mass-preserve-fix) drift-cancel C* — same-seed A/B escape hatch only
-    cstar_legacy: bool = False
     # fluctuation (the noise)
     noise: bool = True
     sigmag_iso: bool = True

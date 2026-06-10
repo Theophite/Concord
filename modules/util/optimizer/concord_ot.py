@@ -87,7 +87,6 @@ def make_concord_config(learning_rate: float, optimizer_config=None):
         autotune_table=pick("autotune_table", d.autotune_table),
         autotune_beta1_on=float(pick("autotune_beta1_on", d.autotune_beta1_on)),
         autotune_beta1_coh=float(pick("autotune_beta1_coh", d.autotune_beta1_coh)),
-        cstar_legacy=bool(pick("cstar_legacy", d.cstar_legacy)),
     )
 
 
@@ -120,15 +119,6 @@ class ConcordController:
         # forces the coherence/noise flags but not this one, so set it explicitly from config here.
         set_lazy_gate(self.config.lazy_gate)
         set_lazy_thresh(self.config.lazy_active_thresh)
-        # Legacy (pre mass-preserve-fix) drift-cancel C*: same-seed A/B escape hatch.
-        # The layers computed the corrected C* in __init__; recompute with the legacy
-        # formula. (TE anchor layers run alpha_v_fast=0 -> C*=0 under both; skip.)
-        if getattr(self.config, "cstar_legacy", False):
-            from prototype_packed_b import compute_drift_cancel_C
-            for m in self.layers:
-                m.drift_cancel_C = compute_drift_cancel_C(
-                    m.alpha, m.alpha_v_fast, mass_preserve=False)
-            print("[concord] drift-cancel C*: LEGACY formula (cstar_legacy=true)")
         # Dissipation autotuner (probe-then-commit), opt-in via optimizer.autotune_table.
         # Built LAZILY on the first before_step(): total_steps here is a placeholder —
         # the trainer finalizes the horizon at train start.
