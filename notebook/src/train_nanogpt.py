@@ -139,7 +139,7 @@ def _spearman(a, b, cap=20000):
 def wrap_with_concord(model, device, lr, alpha=0.1, beta1=0.0,
                       weight_decay=0.0, eps=1.0, step_cap=10.0,
                       precond_p=0.5, gf_consol=0.0, v_scale=1.0,
-                      gf_trust_delta_sq=0.0):
+                      gf_trust_delta_sq=0.0, drive="vhat"):
     """Replace every nn.Linear with ConcordLinearPackedB, loading the
     from-scratch random init into s_fast (load_weights -> live weight = init
     at step 0; the chase redistributes mantissa over the first steps).
@@ -156,7 +156,8 @@ def wrap_with_concord(model, device, lr, alpha=0.1, beta1=0.0,
                 c = ConcordLinearPackedB(
                     child.in_features, child.out_features,
                     bias=child.bias is not None,
-                    device=device, alpha=alpha, beta1=beta1, lr=lr)
+                    device=device, alpha=alpha, beta1=beta1, lr=lr,
+                    drive=drive)
                 c.set_optimizer_kind('adamw', weight_decay=weight_decay,
                                      eps=eps, step_cap=step_cap)
                 c.precond_p = precond_p     # eps<1 + precond_p>0 engages the
@@ -212,6 +213,8 @@ def main():
                          "whitening (the noise filter).")
     ap.add_argument("--precond_p", type=float, default=0.5,
                     help="Padam precond power on v_proxy (0=SGD, 0.5=Adam-sqrt).")
+    ap.add_argument("--drive", choices=["vhat", "muon"], default="vhat",
+                    help="step drive: validated rank-1 v-hat AdamW, or the NS (Muon) drive (docs/MUON_DRIVE.md) — per-drive kappa/lr")
     ap.add_argument("--gf_consol", type=float, default=0.0,
                     help="coherence-gated consolidation rate (garbage filter).")
     ap.add_argument("--v_scale", type=float, default=1.0,
@@ -364,7 +367,8 @@ def main():
             model, device, lr=args.concord_lr, alpha=args.alpha,
             weight_decay=args.concord_wd, step_cap=args.step_cap,
             eps=args.eps, precond_p=args.precond_p, gf_consol=args.gf_consol,
-            v_scale=args.v_scale, gf_trust_delta_sq=args.gf_trust_delta_sq)
+            v_scale=args.v_scale, gf_trust_delta_sq=args.gf_trust_delta_sq,
+            drive=args.drive)
         if args.beta1 != 0.0:
             for m in layers:
                 m.beta1 = args.beta1   # fast-accumulator momentum (reinforce s_fast)
@@ -413,6 +417,7 @@ def main():
               f"({npacked/1e6:.2f}M packed)  aux AdamW {sum(p.numel() for p in aux)/1e6:.2f}M "
               f"(embed+LN)  concord_lr={args.concord_lr} wd={args.concord_wd} "
               f"eps={args.eps} precond_p={args.precond_p} gf_consol={args.gf_consol} "
+              f"drive={args.drive} "
               f"step_cap={args.step_cap}  aux_lr={args.aux_lr}", flush=True)
         peak_lr = args.concord_lr
     elif args.mode == "factored":
