@@ -124,8 +124,35 @@ Decision rule, by what you have:
 - **Predicted next rung (untested)**: k-NN/local-PCA-directed jitter — *on-manifold*
   chords, still domain-agnostic — should land between mixup and crop. The test is the
   same arena; the prediction is on the books.
+## 6. Target interpolation without a teacher forward (the κ identity)
+
+For MSE losses (diffusion), interpolating the target toward the deploy-weight teacher
+needs no teacher evaluation — it linearizes into the optimizer:
+
+```text
+L  = ½‖f_W − (λ·v + (1−λ)·f_P)‖²
+∇L = λ·g_plain + (1−λ)·Jᵀ(f_W − f_P)
+   ≈ λ·g_plain + (1−λ)·JᵀJ·(W − P)        [f_W − f_P = J·u + O(‖u‖²); |u| measured ~0.006]
+```
+
+The teacher term is a Gauss-Newton-weighted pull of `W` toward `P` — and its diagonal
+approximation **is the evaporation term**: `u ← u − lr·κ(1−coh)·u`, with the coherence
+gate as a per-weight adaptive λ (distill where the deviation reads as noise, exempt
+where it reads as learning). **Concord's dissipation is first-order self-distillation
+from the Polyak teacher, at zero extra forwards and zero extra memory** — which
+retrodicts κ's anti-memorization record (exps 4–12) as the known distillation-from-EMA
+label-noise remedy, reads the κ tradeoff (exp 5) as the textbook
+regularization-vs-underfitting tradeoff with an adaptive λ, and makes the autotuner a
+device that tunes distillation strength to the measured noise level. The exact teacher
+differs only by the off-diagonal metric (function-space vs weight-space pull); the
+intermediate rung, if ever needed, is `JᵀJ·u` via one JVP on the existing graph — still
+no teacher forward. The open empirical question is therefore not "does teacher
+distillation help" (κ answered it) but **what the off-diagonal Fisher buys over the
+free diagonal** — the explicit-teacher arm vs κ-matched friction, same arena.
+
 - **For the noise machinery in the optimizer**: exp 12 closes the question the σ
-  ablations kept reopening. The fluctuation half of the design was reaching for
+  ablations kept reopening, with one amendment from §6: the optimizer *can*
+  synthesize the teacher-shaped form of target dilution — it already does, as κ. The fluctuation half of the design was reaching for
   augmentation-character noise, and the measurement says that character requires
   support beyond the empirical sample — which an optimizer alone cannot synthesize,
   and a two-line trainer change can. σ stays default-off; the cascade keeps the
