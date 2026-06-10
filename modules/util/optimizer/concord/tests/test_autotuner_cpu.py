@@ -136,6 +136,37 @@ except ValueError as e:
     check("6  lam>=2 table entry raises in dissipation mode",
           "unstable" in str(e), str(e).split(":")[0])
 
+# ---- 7. shipped GUI defaults are sane: dimensionless mode on, table in lam
+# ----    units (descending coh, ceiling < 2), watchdog armed ----------------
+# (optimizer_util can't be imported standalone -- importing it first trips the
+# create.py <-> modelSetup circular import the app avoids by import order --
+# so read the literal CONCORD defaults dict out of the source via ast.)
+import ast
+
+def gui_concord_defaults():
+    tree = ast.parse((OT / "modules" / "util" / "optimizer_util.py").read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) \
+                and any(getattr(t, "id", "") == "OPTIMIZER_DEFAULT_PARAMETERS" for t in node.targets):
+            for k, v in zip(node.value.keys, node.value.values):
+                if isinstance(k, ast.Attribute) and k.attr == "CONCORD":
+                    return {kk.value: ast.literal_eval(vv)
+                            for kk, vv in zip(v.keys, v.values)}
+    raise AssertionError("CONCORD defaults dict not found")
+
+gd = gui_concord_defaults()
+check("7a default dissipation is the nanoGPT winner lam",
+      gd["dissipation"] == 0.025)
+tab = [(float(c), float(k)) for c, k in json.loads(gd["autotune_table"])]
+check("7b default table coh strictly descending",
+      all(c1 > c2 for (c1, _), (c2, _) in zip(tab, tab[1:])))
+check("7c default table lam ceiling stable (< 2)",
+      max(k for _, k in tab) < 2.0, f"ceiling={max(k for _, k in tab)}")
+check("7d default table converts to finite kappa at SDXL lr",
+      max(k / 7.5e-5 for _, k in tab) == 0.4 / 7.5e-5)
+check("7e watchdog armed by default", gd["autotune_reprobe_band"] == 0.02)
+check("7f probe-gated momentum off by default", gd["autotune_beta1_on"] == 0.0)
+
 print()
 ok = all(results)
 print(f"{'ALL PASS' if ok else 'FAILURES'} ({sum(results)}/{len(results)})")
