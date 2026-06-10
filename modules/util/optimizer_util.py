@@ -433,6 +433,11 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
         "lazy_active_thresh": 0.0001,
         "warmup": 100,
         "lr_min_frac": 0.2,
+        "dissipation": None,
+        "autotune_table": None,
+        "autotune_reprobe_band": None,
+        "autotune_beta1_on": 0.0,
+        "autotune_beta1_coh": 0.35,
     },
     Optimizer.LION: {
         "beta1": 0.9,
