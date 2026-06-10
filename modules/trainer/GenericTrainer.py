@@ -997,7 +997,7 @@ class GenericTrainer(BaseTrainer):
                                     f"  loss={accumulated_loss_cpu:.5f}"
                                     f"  smooth={ema_loss:.5f}")
                             if _gap is not None:
-                                _msg += (f"  gap={_gap:+.5f}"
+                                _msg += (f"  gap={_gap:+.2e}"
                                          f"  deploy_est={accumulated_loss_cpu + _gap:.5f}")
                             step_tqdm.write(_msg)
 
