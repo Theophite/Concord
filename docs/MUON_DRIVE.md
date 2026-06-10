@@ -233,3 +233,36 @@ reopens, the two designs the evidence points at: **annealed rank restriction**
 (full NS5 early → tighten toward the measured rank as structure emerges, the
 ratio-floor idiom applied spectrally — `wiener` mode is the adaptive
 endpoint, implemented and unrun) and the §8 pre-NS gradient EMA.
+
+## 11. Reopen note (2026-06-10): muon wants a MUCH higher dissipation λ
+
+Dimensionless-dissipation reframing of the gate-1 verdict. The friction
+update is u ← u·(1 − λ·(1−coh)) with λ = lr·κ; in steady state the drained
+incoherent power balances the injected incoherent power, so λ* scales with
+the noise-energy injection rate of the DRIVE. NS5 is indiscriminate about
+the directions it writes to — every singular direction of the update lands
+at equal magnitude, so the noise directions are amplified to signal strength
+instead of suppressed by 1/√v̂. For effective signal rank r in an N×K layer
+the injection ratio vs the v̂ drive is order min(N,K)/r — 10–100×. From the
+v̂ winner λ=0.025 that puts muon's λ* around 0.25–1+, i.e. near the Wiener
+point λ=1 (where the friction step IS the per-element MMSE filter u ← coh·u).
+
+This reinterprets gate 1: the κ sweep was v̂-calibrated, so every muon arm
+ran 10–100× under-damped — the κ-FLAT plateau at 1.538 is exactly the
+under-damped signature (loss dominated by un-drained whitened noise at every
+tested κ), and "late noise-whitening heating" is that equilibrium's symptom.
+Gate 1 never visited muon's operating regime.
+
+Prerequisite landed: the min-leak servo floor (`min_leak`, default 0.1,
+ported to both canonical kernels + the fork) clamps the per-step evaporation
+at 1−min_leak, so λ ≈ 1 no longer slams the valve shut (a fully-shut gate
+starves the coherence meter and self-seals) and λ > 1 cannot ring. High-λ
+arms are runnable now.
+
+The decisive bench (same harness as gate 1, same seed): muon arms at
+λ ∈ {0.1, 0.3, 1.0} (κ = λ/lr per run) vs the v̂ λ=0.025 control, judged on
+deployed-sv val. Prediction: the muon plateau breaks and the heating
+disappears as λ approaches the injection-balanced value; if muon + matched λ
+beats v̂ + 0.025, gate 1 reopens. SDXL-side, the same logic says any
+muon-drive port must scale `dissipation` up by the injection ratio, not
+inherit the v̂ default.

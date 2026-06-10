@@ -557,6 +557,9 @@ def _apply_packed_adamw_kernel(
     wd_sv, wd_sf,
     gf_trust_delta_sq,   # fp32: δ² in step = grad/√(Var + δ²·v̂);
                           # 0 disables (legacy: clamp by step_cap only)
+    min_leak,            # fp32: servo floor -- minimum per-step survival fraction of the
+                          # accumulated s_fast under the gf evaporation (the valve must
+                          # never fully shut; see the evap clamp below)
     gate_gain,           # fp32: scalar cosine schedule on the commitment gate
     chase_floor_ptr,     # *fp32[1]: ratio-coh fast->slow floor (DEVICE TENSOR so the per-step
     leak_floor_ptr,      # *fp32[1]: ratio-coh slow->v_slow floor   schedule survives CUDA-graph
@@ -741,7 +744,15 @@ def _apply_packed_adamw_kernel(
         # position can settle (constant-κ over-skimmed late, when small
         # late-stage signal reads as incoherent). gf_consol is now the rate
         # at unit lr; at peak lr=0.1, gf_consol=0.3 ≈ the old κ=0.03.
-        evap_mantissa = lr * gf_consol * (1.0 - coh) * d_fs
+        # Servo min-leak floor (slam-shut guard): cap the per-step evaporation
+        # fraction at (1 - min_leak) so at least min_leak of the accumulated
+        # velocity survives every step. The clamp never binds while
+        # lam*(1-coh) <= 1 - min_leak (all validated regimes); near the Wiener
+        # point lam = 1 it keeps the meter fed, and it also removes the lam > 1
+        # sign-flip ringing and the lam = 2 hard instability (the survival
+        # factor stays in [min_leak, 1]).
+        evap_frac = tl.minimum(lr * gf_consol * (1.0 - coh), 1.0 - min_leak)
+        evap_mantissa = evap_frac * d_fs
     else:
         step_live = step_live + weight_decay * s_fast_in_w
         evap_mantissa = 0.0
@@ -975,6 +986,24 @@ def _denom_diagnostic(packed_w, grad_W, row_exp, col_exp,
 # without threading through the 30-arg autograd Function. Set once before training.
 _USE_FIXED_COH = True   # validated default: Wiener coh S/(S+noise^2). False=legacy(broken units)
 # Scalar cosine schedule on the commitment gate (1.0 = off). Set per-step.
+# Servo min-leak floor (module global, set_min_leak): minimum per-step survival
+# fraction of the accumulated fast velocity under the gf evaporation. At
+# lam = lr*gf_consol -> 1 and coh ~ 0 the evaporation wipes s_fast's history
+# every step: nothing accumulates, the slow drift freezes, coh stays pinned at
+# 0 and the valve SELF-SEALS (the meter that would reopen it depends on mass
+# passing through it). The floor keeps the servo alive. Per-run constant
+# (launch-time scalar, baked at CUDA-graph capture -- set at init only).
+# Load-bearing for the high-dissipation regimes: the Wiener point lam = 1
+# (exact per-step MMSE filter u <- coh*u) and the muon drive, whose whitened
+# noise injection wants lam far above the v-hat winner.
+_MIN_LEAK = 0.1
+
+
+def set_min_leak(v):
+    global _MIN_LEAK
+    _MIN_LEAK = float(v)
+
+
 _GATE_GAIN = 1.0
 
 # EXPERIMENTAL (default OFF): centered Sigma_g-shaped gradient-noise injection. Adds a draw
@@ -1234,6 +1263,7 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         float(alpha_v_fast),
         float(wd_sv), float(wd_sf),
         float(gf_trust_delta_sq),
+        float(_MIN_LEAK),
         float(_GATE_GAIN),
         _ratio_chase_floor_ptr,
         _ratio_leak_floor_ptr,
