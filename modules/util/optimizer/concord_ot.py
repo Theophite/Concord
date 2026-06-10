@@ -241,18 +241,31 @@ class ConcordController:
         No training steps run inside the window, so nothing goes stale."""
         import prototype_packed_b as ppb
         stash = {"fused": ppb._FUSED_MATMUL, "bufs": []}
-        ppb._FUSED_MATMUL = False
         for m in self.layers:
-            stash["bufs"].append(m._bf16_weight_buf)
+            # Fused-mode layers have NO per-layer cache (shared scratch only)
+            # -> stash None and create the buffer; cached-mode layers stash
+            # their live buffer. _ensure_buffers uses a present right-shaped
+            # buffer as-is, so the cached forward reads exactly this tensor.
+            stash["bufs"].append(getattr(m, "_bf16_weight_buf", None))
             m._bf16_weight_buf = m.consolidated_weight().to(torch.bfloat16)
-        return stash
+        ppb._FUSED_MATMUL = False     # flip LAST: the loop above cannot leave
+        return stash                   # a half-flipped global on exception
 
     @torch.no_grad()
     def restore_unet_deploy(self, stash):
         import prototype_packed_b as ppb
-        for m, buf in zip(self.layers, stash["bufs"]):
-            m._bf16_weight_buf = buf
         ppb._FUSED_MATMUL = stash["fused"]
+        for m, buf in zip(self.layers, stash["bufs"]):
+            if buf is None:
+                # fused-mode layer: drop our consolidated copy entirely —
+                # the fused forward reads packed_w, and keeping it would pin
+                # ~2 bytes/param of dead bf16 per layer. (If a cached-mode
+                # layer ever lands here pre-first-forward, _ensure_buffers
+                # re-allocates and live-materializes on the next forward.)
+                if hasattr(m, "_bf16_weight_buf"):
+                    del m._bf16_weight_buf
+            else:
+                m._bf16_weight_buf = buf
 
     def materialize_te_deploy(self):
         """REVERSIBLE TE deploy: replace each text-encoder ConcordLinearPackedB with a temp
