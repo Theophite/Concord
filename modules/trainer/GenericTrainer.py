@@ -330,55 +330,61 @@ class GenericTrainer(BaseTrainer):
                          and getattr(_ctrl, "step_idx", 0) > 0
                          else None)
 
-        self.callbacks.on_update_status("Sampling ...")
+        # The deploy window MUST be unwound even if sampling raises: the
+        # in-place s_fast mask means an un-restored exception path would
+        # permanently lose the fast field (the stash is a local).
+        try:
+            self.callbacks.on_update_status("Sampling ...")
 
-        is_custom_sample = False
-        if sample_params_list:
-            is_custom_sample = True
-        elif self.config.samples is not None:
-            sample_params_list = self.config.samples
-        else:
-            try:
-                with open(self.config.sample_definition_file_name, 'r') as f:
-                    samples = json.load(f)
-                    for i in range(len(samples)):
-                        samples[i] = SampleConfig.default_values(self.config.model_type).from_dict(samples[i])
-                    sample_params_list = samples
-            # We absolutely do not want to fail training just because the sample definition file becomes missing or broken right before sampling.
-            except Exception:
-                traceback.print_exc()
-                print("Error during loading the sample definition file, proceeding without sampling")
-                sample_params_list = []
+            is_custom_sample = False
+            if sample_params_list:
+                is_custom_sample = True
+            elif self.config.samples is not None:
+                sample_params_list = self.config.samples
+            else:
+                try:
+                    with open(self.config.sample_definition_file_name, 'r') as f:
+                        samples = json.load(f)
+                        for i in range(len(samples)):
+                            samples[i] = SampleConfig.default_values(self.config.model_type).from_dict(samples[i])
+                        sample_params_list = samples
+                # We absolutely do not want to fail training just because the sample definition file becomes missing or broken right before sampling.
+                except Exception:
+                    traceback.print_exc()
+                    print("Error during loading the sample definition file, proceeding without sampling")
+                    sample_params_list = []
 
-        if self.model.ema:
-            #the EMA model only exists in the master process, so EMA sampling is done on one GPU only
-            #non-EMA sampling is done on all GPUs
-            assert multi.is_master() and self.config.ema != EMAMode.OFF
-            self.model.ema.copy_ema_to(self.parameters, store_temp=True)
+            if self.model.ema:
+                #the EMA model only exists in the master process, so EMA sampling is done on one GPU only
+                #non-EMA sampling is done on all GPUs
+                assert multi.is_master() and self.config.ema != EMAMode.OFF
+                self.model.ema.copy_ema_to(self.parameters, store_temp=True)
 
-        self.__sample_loop(
-            train_progress=train_progress,
-            train_device=train_device,
-            sample_config_list=sample_params_list,
-            is_custom_sample=is_custom_sample,
-            ema_applied = self.config.ema != EMAMode.OFF
-        )
-
-        if self.model.ema:
-            self.model.ema.copy_temp_to(self.parameters)
-
-        # ema-less sampling, if ema is enabled:
-        if self.config.ema != EMAMode.OFF and not is_custom_sample and self.config.non_ema_sampling:
             self.__sample_loop(
                 train_progress=train_progress,
                 train_device=train_device,
                 sample_config_list=sample_params_list,
-                folder_postfix=" - no-ema",
-                ema_applied = False,
+                is_custom_sample=is_custom_sample,
+                ema_applied = self.config.ema != EMAMode.OFF
             )
 
-        if _deploy_stash is not None:
-            _ctrl.restore_unet_deploy(_deploy_stash)
+            if self.model.ema:
+                self.model.ema.copy_temp_to(self.parameters)
+
+            # ema-less sampling, if ema is enabled:
+            if self.config.ema != EMAMode.OFF and not is_custom_sample and self.config.non_ema_sampling:
+                self.__sample_loop(
+                    train_progress=train_progress,
+                    train_device=train_device,
+                    sample_config_list=sample_params_list,
+                    folder_postfix=" - no-ema",
+                    ema_applied = False,
+                )
+
+
+        finally:
+            if _deploy_stash is not None:
+                _ctrl.restore_unet_deploy(_deploy_stash)
 
         self.model_setup.setup_train_device(self.model, self.config)
         # Special case for schedule-free optimizers.

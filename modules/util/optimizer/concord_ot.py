@@ -233,19 +233,19 @@ class ConcordController:
     @torch.no_grad()
     @torch.no_grad()
     def materialize_unet_deploy(self):
-        """Reversible, ZERO extra GPU residency: mask s_fast out of packed_w
-        IN PLACE (the deploy weight is exactly the low 16 bits — s_slow+v_slow
-        — dequantized), stashing the 16 s_fast bits in CPU RAM. The fused path
-        stays ON and dequantizes the deploy weight directly; the cached path
-        gets its buffer re-materialized from the masked packed state. Restore
-        ORs the bits back: bit-exact. (v1 held a per-layer bf16 copy of the
-        whole UNet — ~2 B/param pegged the card during sampling — and flipped
-        to the slow cached forward. Both wrong; this replaces it.)"""
+        """Reversible deploy window, ZERO GPU allocations: D2H-copy each packed
+        word to CPU (no device temp), extract/stash the s_fast bits CPU-side,
+        mask s_fast out of packed_w IN PLACE (the deploy weight is exactly the
+        low 16 bits). Fused mode then dequantizes the deploy weight directly;
+        cached mode re-materializes its existing buffer. Restore ORs the bits
+        back through ONE reused device scratch — no per-layer allocation churn
+        (sampling's VRAM fragmentation is the documented wedge; do not feed it)."""
         import prototype_packed_b as ppb
         stash = []
         for m in self.layers:
-            stash.append((m.packed_w >> 16).to(torch.int16).cpu())
-            m.packed_w &= 0xFFFF
+            pk_cpu = m.packed_w.detach().to("cpu")          # D2H, no device temp
+            stash.append(((pk_cpu >> 16).to(torch.int16)))  # CPU-side extract
+            m.packed_w &= 0xFFFF                            # in place
             if not ppb._FUSED_MATMUL:
                 wbuf, _, _ = m._ensure_buffers()
                 ppb.materialize_packed_bf16(m.packed_w, m.row_exp, m.col_exp,
@@ -256,8 +256,17 @@ class ConcordController:
     @torch.no_grad()
     def restore_unet_deploy(self, stash):
         import prototype_packed_b as ppb
+        dev = self.layers[0].packed_w.device if self.layers else "cuda"
+        scratch = getattr(self, "_deploy_scratch", None)
+        need = max((m.packed_w.numel() for m in self.layers), default=0)
+        if scratch is None or scratch.numel() < need:
+            scratch = torch.empty(need, dtype=torch.int32, device=dev)
+            self._deploy_scratch = scratch                   # reused across samples
         for m, sf in zip(self.layers, stash):
-            m.packed_w |= (sf.to(m.packed_w.device).to(torch.int32) << 16)
+            word = (sf.to(torch.int32) << 16)                # CPU-side
+            n = m.packed_w.numel()
+            scratch[:n].copy_(word.reshape(-1))              # one H2D, no alloc
+            m.packed_w |= scratch[:n].view_as(m.packed_w)
             if not ppb._FUSED_MATMUL:
                 wbuf, _, _ = m._ensure_buffers()
                 ppb.materialize_packed_bf16(m.packed_w, m.row_exp, m.col_exp,
