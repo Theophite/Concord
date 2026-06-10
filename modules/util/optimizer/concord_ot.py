@@ -233,39 +233,37 @@ class ConcordController:
     @torch.no_grad()
     @torch.no_grad()
     def materialize_unet_deploy(self):
-        """Reversible: present the DEPLOY weight (s_fast dropped — the object the
-        deployed-sv metric and the final save use) to the UNet forward, for
-        sampling. Fused mode dequantizes packed_w in-GEMM (live), so the window
-        flips to the cached path with per-layer consolidated buffers; restore
-        re-enters fused mode (the shared scratch's content is irrelevant there).
-        No training steps run inside the window, so nothing goes stale."""
+        """Reversible, ZERO extra GPU residency: mask s_fast out of packed_w
+        IN PLACE (the deploy weight is exactly the low 16 bits — s_slow+v_slow
+        — dequantized), stashing the 16 s_fast bits in CPU RAM. The fused path
+        stays ON and dequantizes the deploy weight directly; the cached path
+        gets its buffer re-materialized from the masked packed state. Restore
+        ORs the bits back: bit-exact. (v1 held a per-layer bf16 copy of the
+        whole UNet — ~2 B/param pegged the card during sampling — and flipped
+        to the slow cached forward. Both wrong; this replaces it.)"""
         import prototype_packed_b as ppb
-        stash = {"fused": ppb._FUSED_MATMUL, "bufs": []}
+        stash = []
         for m in self.layers:
-            # Fused-mode layers have NO per-layer cache (shared scratch only)
-            # -> stash None and create the buffer; cached-mode layers stash
-            # their live buffer. _ensure_buffers uses a present right-shaped
-            # buffer as-is, so the cached forward reads exactly this tensor.
-            stash["bufs"].append(getattr(m, "_bf16_weight_buf", None))
-            m._bf16_weight_buf = m.consolidated_weight().to(torch.bfloat16)
-        ppb._FUSED_MATMUL = False     # flip LAST: the loop above cannot leave
-        return stash                   # a half-flipped global on exception
+            stash.append((m.packed_w >> 16).to(torch.int16).cpu())
+            m.packed_w &= 0xFFFF
+            if not ppb._FUSED_MATMUL:
+                wbuf, _, _ = m._ensure_buffers()
+                ppb.materialize_packed_bf16(m.packed_w, m.row_exp, m.col_exp,
+                                            out=wbuf,
+                                            mantissa_bias=m.MANTISSA_BIAS)
+        return stash
 
     @torch.no_grad()
     def restore_unet_deploy(self, stash):
         import prototype_packed_b as ppb
-        ppb._FUSED_MATMUL = stash["fused"]
-        for m, buf in zip(self.layers, stash["bufs"]):
-            if buf is None:
-                # fused-mode layer: drop our consolidated copy entirely —
-                # the fused forward reads packed_w, and keeping it would pin
-                # ~2 bytes/param of dead bf16 per layer. (If a cached-mode
-                # layer ever lands here pre-first-forward, _ensure_buffers
-                # re-allocates and live-materializes on the next forward.)
-                if hasattr(m, "_bf16_weight_buf"):
-                    del m._bf16_weight_buf
-            else:
-                m._bf16_weight_buf = buf
+        for m, sf in zip(self.layers, stash):
+            m.packed_w |= (sf.to(m.packed_w.device).to(torch.int32) << 16)
+            if not ppb._FUSED_MATMUL:
+                wbuf, _, _ = m._ensure_buffers()
+                ppb.materialize_packed_bf16(m.packed_w, m.row_exp, m.col_exp,
+                                            out=wbuf,
+                                            mantissa_bias=m.MANTISSA_BIAS)
+
 
     def materialize_te_deploy(self):
         """REVERSIBLE TE deploy: replace each text-encoder ConcordLinearPackedB with a temp
