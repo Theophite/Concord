@@ -728,10 +728,27 @@ class GenericTrainer(BaseTrainer):
             # set false to skip it on single-stage datasets where the epoch
             # boundary is a cheap shuffle and the headroom is not needed.
             if getattr(self.config, "concord_epoch_cache_release", True):
+                # The previous epoch's loop locals live in THIS scope through the
+                # cache stage and pin GPU memory past the release: `batch` holds
+                # the last micro-batch's tensors, `model_output_data` the
+                # predicted/target latents (eager path), and in graph mode
+                # `loss`/`detached_loss` reference cap_loss INSIDE the graph's
+                # private pool — one live tensor keeps its whole allocator
+                # segment resident even after release()+empty_cache. Unbind them
+                # before releasing (plain assignment: safe whether or not the
+                # names are bound yet on the first epoch).
+                batch = None
+                model_output_data = None
+                prior_model_output_data = None
+                prior_model_prediction = None
+                loss = None
+                detached_loss = None
+                accumulated_loss = accumulated_loss.item() \
+                    if torch.is_tensor(accumulated_loss) else accumulated_loss
                 _v2e = getattr(self.model, "concord_graph_v2", None)
                 if _v2e is not None:
                     _v2e.release()
-                    torch_gc()
+                torch_gc()
 
             #call start_next_epoch with only one process at first, because it might write to the cache. All subsequent processes can read in parallel:
             for _ in multi.master_first():
