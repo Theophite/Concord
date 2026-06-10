@@ -464,3 +464,60 @@ NS.**
    (at lr = 0.1 it caps κ at 20 — high-lr + heavy-noise needs that arithmetic done).
 4. Caveats: sweep is κ = 0 / clean only, 3 seeds, this protocol; the noisy-regime lr
    envelope (where κ > 0 re-enters) is unswept.
+
+## Exp 10 — 80 epochs + augmentation on the small set: the ablation (`exp10_aug_ablation.py`)
+
+4k subset, 80 epochs, pad-2 random-crop augmentation on the train subset only,
+aug × optimizer × regime, each arm at its best-known settings (3 seeds; same-seed arms
+see identical augmented streams). The v̂ noisy cells as originally specified **diverged
+— by our own law**: the spec combined v̂'s lr\* (1e-2) with its 25-ep κ\* (400),
+lr·κ = 4 > 2, exactly the exp-1 ceiling (the fork guard of `INSTALL_SDXL.md` §2 would
+have refused the config at startup). Repaired cells (lr·κ ≤ 1.5) marked †; the Muon
+noisy no-aug cell got the symmetric κ repair (its 25-ep κ\* = 100 was equally stale) ‡.
+
+**Clean:**
+
+| arm | 25ep no-aug (ref) | 80ep no-aug | 80ep + aug |
+|---|---|---|---|
+| AdamW | 92.78 | 93.49 | 96.60 |
+| Concord v̂ | 94.68 | 94.68 | 96.43 |
+| Concord NS | 96.07 | 94.75 | **97.58 ± 0.10** |
+| native Muon | 95.40 | 95.53 | 97.46 |
+
+**30% label noise** (memorized % in parens):
+
+| arm | 80ep no-aug | 80ep + aug |
+|---|---|---|
+| AdamW | 81.17 (86.1) | 95.06 (11.2) |
+| Concord v̂ † | **90.04 (12.6)** | 94.62 (10.3) |
+| Concord NS ‡ | 86.28 (47.8) | **96.31 ± 0.22 (10.6)** |
+| native Muon | 77.17 (100.0) | 86.89 (29.0) |
+
+† best of {lr 1e-3/κ 400, lr 1e-2/κ 150}; the no-aug winner is lr 1e-2/κ 150 (lr·κ = 1.5,
+near-ceiling friction). ‡ κ = 150 at lr 1e-2; the stale κ = 100 gave 78.86 (70.8%).
+
+Findings:
+
+1. **Augmentation dominates epochs.** The pure-compute control *hurt* the strong arms
+   on clean data (NS: 96.07 @ 25ep → 94.75 @ 80ep — classic small-set overfit; the
+   25-ep schedule was ending near the sweet spot), while aug + 80ep lifts every arm.
+   The NS drive reaches **97.58 from 4,000 examples** — approaching the full-data
+   no-aug MLP ballpark (~98–98.5).
+2. **Best noisy result of the campaign: NS + aug = 96.31 at 30% label noise** — only
+   1.3 below its own clean number. Cascade and augmentation compose: aug slows
+   memorization (each wrong label must be fit across 25 crop variants), the cascade
+   blocks what leaks through (10.6% memorized).
+3. **Augmentation alone does not rescue native Muon**: it breaks the 100%
+   memorization (→ 29%) but accuracy stops at 86.89 — nearly 10 points below the same
+   drive inside the cascade. Aug is a memorization *slower*; the cascade is a
+   memorization *barrier*; they are different mechanisms and they stack.
+4. **A real regime split for the drives**: in the *extended noisy grind without data
+   diversity*, v̂ + near-ceiling friction defends best (90.04/12.6% vs NS 86.28/47.8%
+   at matched lr·κ — spectral democratization keeps re-funding wrong-label directions
+   over a 3× longer horizon). With augmentation — i.e., any realistic training diet —
+   the NS drive wins everything. Drive choice is regime-dependent at the margin;
+   NS remains the default where data diversity exists.
+5. **κ\* depends on the horizon as well as the drive and the noise** (NS noisy κ\*:
+   100 @ 25ep → ≥150 @ 80ep): the autotune table is (drive, horizon, aug)-conditioned,
+   which is one more argument for probe-based tuning over static tables — and the
+   probe-then-commit design re-measures per run by construction.

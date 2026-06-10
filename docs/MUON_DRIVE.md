@@ -136,7 +136,18 @@ gradient. Graph-capturable (static shapes); Conv2d flattens to 2D for NS, standa
 Muon practice. Full implementation design — kernel diff, NS pass placement, graph
 story, cost model, build order: [`MUON_IMPLEMENTATION.md`](MUON_IMPLEMENTATION.md).
 
-## 8. Adoption gates
+## 8. Regime caveat from exp 10
+
+The 80-epoch augmentation ablation adds one boundary: in an *extended* noisy grind
+with **no data diversity** (80ep, 30% noise, no augmentation), the v̂ drive with
+near-ceiling friction defends better than the NS drive at matched lr·κ (90.0/12.6%
+memorized vs 86.3/47.8%) — spectral democratization keeps re-funding wrong-label
+directions over long horizons. With augmentation (any realistic diet), the NS drive
+wins every cell, including the campaign-best 96.31 at 30% noise. NS stays the default
+where data diversity exists; the static-tiny-noisy-long corner belongs to v̂ + heavy
+friction. κ\* is horizon-dependent on top of drive-dependent (exp 10 §5).
+
+## 9. Adoption gates
 
 In order: (1) the same-seed nanoGPT A/B — NS drive vs v̂ drive at each one's κ\*/lr\*,
 deployed-sv the metric (the bench where native Muon previously lost; the cascade may
