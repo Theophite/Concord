@@ -422,22 +422,24 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
     # Concord: optimizer-visible params are the aux SGD's (norms/biases/embeddings); the
     # swapped UNet layers self-step in backward. lr comes from the main learning_rate field.
     # The winner knobs default to the validated sf_060 configuration.
+    # The panel shows only the live physical knobs. gf_consol (kappa, subsumed by
+    # the dimensionless dissipation), ratio_coh (the gate IS the mechanism; off is
+    # a debug state), and the probe-gated beta1 pair (one-task-validated, off)
+    # remain config-file keys with engine defaults, not panel entries.
     Optimizer.CONCORD: {
         "momentum": 0.9,
         "weight_decay": 0,
-        "gf_consol": 50.0,
         "noise": True,
         "sigmag_peak": 0.6,
-        "ratio_coh": True,
         "lazy_gate": False,
         "lazy_active_thresh": 0.0001,
         "warmup": 100,
         "lr_min_frac": 0.2,
         # Dimensionless mode ON by default: lam = lr*kappa = 0.025 (the nanoGPT
         # winner; ~kappa 333 at lr 7.5e-5 -- "kappa at diffusion lr needs to be
-        # higher"). Overrides gf_consol, which stays as the fallback when the
-        # dissipation field is cleared. The autotune table is the CPU-calibrated
-        # lam-units curve (exp 5/6/11); its kappa column is divided by lr at build.
+        # higher"). Clearing the field falls back to the engine kappa default
+        # (gf_consol 50). The autotune table is the CPU-calibrated lam-units
+        # curve (exp 5/6/11); its kappa column is divided by lr at build.
         # Caveat carried from the calibration: the COHERENCE column is calibrated
         # on the CPU task -- cross-domain transfer of the lam curve is the
         # hypothesis these defaults exist to test. Re-probe band arms the exp-11d
@@ -445,8 +447,6 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
         "dissipation": 0.025,
         "autotune_table": "[[0.387,0],[0.314,0.1],[0.288,0.2],[0.274,0.4],[0.256,0.4]]",
         "autotune_reprobe_band": 0.02,
-        "autotune_beta1_on": 0.0,
-        "autotune_beta1_coh": 0.35,
     },
     Optimizer.LION: {
         "beta1": 0.9,

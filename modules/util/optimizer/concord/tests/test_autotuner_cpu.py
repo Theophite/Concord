@@ -165,7 +165,9 @@ check("7c default table lam ceiling stable (< 2)",
 check("7d default table converts to finite kappa at SDXL lr",
       max(k / 7.5e-5 for _, k in tab) == 0.4 / 7.5e-5)
 check("7e watchdog armed by default", gd["autotune_reprobe_band"] == 0.02)
-check("7f probe-gated momentum off by default", gd["autotune_beta1_on"] == 0.0)
+check("7f subsumed knobs pruned from the panel (config-file only)",
+      not any(k in gd for k in
+              ("gf_consol", "ratio_coh", "autotune_beta1_on", "autotune_beta1_coh")))
 
 print()
 ok = all(results)
