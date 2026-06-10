@@ -231,6 +231,29 @@ class ConcordController:
         return n
 
     @torch.no_grad()
+    @torch.no_grad()
+    def materialize_unet_deploy(self):
+        """Reversible: present the DEPLOY weight (s_fast dropped — the object the
+        deployed-sv metric and the final save use) to the UNet forward, for
+        sampling. Fused mode dequantizes packed_w in-GEMM (live), so the window
+        flips to the cached path with per-layer consolidated buffers; restore
+        re-enters fused mode (the shared scratch's content is irrelevant there).
+        No training steps run inside the window, so nothing goes stale."""
+        import prototype_packed_b as ppb
+        stash = {"fused": ppb._FUSED_MATMUL, "bufs": []}
+        ppb._FUSED_MATMUL = False
+        for m in self.layers:
+            stash["bufs"].append(m._bf16_weight_buf)
+            m._bf16_weight_buf = m.consolidated_weight().to(torch.bfloat16)
+        return stash
+
+    @torch.no_grad()
+    def restore_unet_deploy(self, stash):
+        import prototype_packed_b as ppb
+        for m, buf in zip(self.layers, stash["bufs"]):
+            m._bf16_weight_buf = buf
+        ppb._FUSED_MATMUL = stash["fused"]
+
     def materialize_te_deploy(self):
         """REVERSIBLE TE deploy: replace each text-encoder ConcordLinearPackedB with a temp
         nn.Linear holding its get_weight() (keeps s_fast -> the ~16-bit deploy, NOT the

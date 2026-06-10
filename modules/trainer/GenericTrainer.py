@@ -314,6 +314,22 @@ class GenericTrainer(BaseTrainer):
         torch_gc()
         self._graphmem("post-gc")
 
+        # Concord: present the DEPLOY weight (s_fast dropped) to the sampler —
+        # samples come from the same object the deployed-sv metric and the final
+        # save use, not the live training weight. Restored below before training
+        # resumes; if sampling raises, the un-restored state degrades to the
+        # correct-but-slower cached path (the apply kernel rewrites the buffer
+        # on the next step), never to corruption.
+        # (step_idx > 0: at step 0 load_weights has the full mantissa in s_fast
+        # and the consolidated weight is ~zero — the chase fills s_slow within
+        # ~1/alpha steps. The pre-training baseline sample is the live model.)
+        _ctrl = getattr(self.model, "concord_controller", None)
+        _deploy_stash = (_ctrl.materialize_unet_deploy()
+                         if _ctrl is not None
+                         and getattr(self.config, "concord_sample_deploy", True)
+                         and getattr(_ctrl, "step_idx", 0) > 0
+                         else None)
+
         self.callbacks.on_update_status("Sampling ...")
 
         is_custom_sample = False
@@ -360,6 +376,9 @@ class GenericTrainer(BaseTrainer):
                 folder_postfix=" - no-ema",
                 ema_applied = False,
             )
+
+        if _deploy_stash is not None:
+            _ctrl.restore_unet_deploy(_deploy_stash)
 
         self.model_setup.setup_train_device(self.model, self.config)
         # Special case for schedule-free optimizers.
