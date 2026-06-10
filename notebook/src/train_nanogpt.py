@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.resolve()))
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from nanogpt import GPT, GPTConfig, load_char_data, get_batch
 from prototype_packed_b import (ConcordLinearPackedB, reset_reb_stats,
@@ -213,6 +214,12 @@ def main():
                          "whitening (the noise filter).")
     ap.add_argument("--precond_p", type=float, default=0.5,
                     help="Padam precond power on v_proxy (0=SGD, 0.5=Adam-sqrt).")
+    ap.add_argument("--target_lambda", type=float, default=1.0,
+                    help="soft-target blend: target = lambda*onehot(y) + (1-lambda)*"
+                         "softmax(f_P(ctx)/tau), f_P = the DEPLOY (slow sv) weights — "
+                         "the in-word teacher. 1.0 = pure one-hot (off)")
+    ap.add_argument("--target_tau", type=float, default=1.0,
+                    help="teacher temperature for the soft-target blend")
     ap.add_argument("--drive", choices=["vhat", "muon"], default="vhat",
                     help="step drive: validated rank-1 v-hat AdamW, or the NS (Muon) drive (docs/MUON_DRIVE.md) — per-drive kappa/lr")
     ap.add_argument("--gf_consol", type=float, default=0.0,
@@ -418,6 +425,7 @@ def main():
               f"(embed+LN)  concord_lr={args.concord_lr} wd={args.concord_wd} "
               f"eps={args.eps} precond_p={args.precond_p} gf_consol={args.gf_consol} "
               f"drive={args.drive} "
+              f"target_lam={args.target_lambda}@tau={args.target_tau} "
               f"step_cap={args.step_cap}  aux_lr={args.aux_lr}", flush=True)
         peak_lr = args.concord_lr
     elif args.mode == "factored":
@@ -630,7 +638,35 @@ def main():
             loss = _gst["loss"]
         else:
             aux_opt.zero_grad(set_to_none=True)
-            _, loss = model(x, y)
+            if args.target_lambda < 1.0 and args.mode == "concord" and layers:
+                # Soft targets from the in-word teacher: f_P = the deploy (sv)
+                # weights — the slow field teaches the live field. CE is linear
+                # in the target, so the blended-target CE decomposes exactly:
+                # lam*CE(onehot) + (1-lam)*CE(softmax(z_P/tau)). Teacher-only
+                # temperature; teacher runs dropout-free with live aux params
+                # (== how deployed-sv val is measured). Early training the slow
+                # field is ~init, so the soft term starts as label smoothing.
+                with torch.no_grad():
+                    was_training = model.training
+                    model.eval()
+                    saved = [m._bf16_weight_buf for m in layers]
+                    for m in layers:
+                        m._bf16_weight_buf = _consolidated_buf(m, "sv")
+                    t_logits, _ = model(x)
+                    for m, sw in zip(layers, saved):
+                        m._bf16_weight_buf = sw
+                    if was_training:
+                        model.train()
+                    p_T = F.softmax(t_logits.float() / args.target_tau, dim=-1)
+                logits, _ = model(x)
+                V = logits.size(-1)
+                logp = F.log_softmax(logits.float(), dim=-1).reshape(-1, V)
+                onehot_ce = F.nll_loss(logp, y.reshape(-1))
+                soft_ce = -(p_T.reshape(-1, V) * logp).sum(-1).mean()
+                loss = (args.target_lambda * onehot_ce
+                        + (1.0 - args.target_lambda) * soft_ce)
+            else:
+                _, loss = model(x, y)
             loss.backward()              # Concord layers step in backward
             aux_opt.step()
             if args.mode == "concord" and (it + 1) % args.rebalance_every == 0:
