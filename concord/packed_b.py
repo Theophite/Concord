@@ -2143,7 +2143,7 @@ class DissipationAutoTuner:
 
     def __init__(self, layers, probe_start, probe_end, table,
                  probe_kappa=50.0, measure_every=10, verbose=True,
-                 beta1_on=0.1, beta1_coh_threshold=0.35):
+                 beta1_on=0.1, beta1_coh_threshold=0.35, peak_lr=None):
         assert probe_end > probe_start >= 0
         assert all(c1 > c2 for (c1, _), (c2, _) in zip(table, table[1:])), \
             "table coh values must be strictly descending"
@@ -2164,6 +2164,19 @@ class DissipationAutoTuner:
         # gate adoption on the nanoGPT A/B like the rest.
         self.beta1_on = float(beta1_on)
         self.beta1_coh_threshold = float(beta1_coh_threshold)
+        # peak_lr: when given, `table` values and `probe_kappa` are in
+        # DIMENSIONLESS F = lr*kappa units (the friction at peak lr), and are
+        # converted to raw gf_consol via kappa = F/peak_lr. Prefer F units:
+        # kappa is per-unit-lr, so the same kappa means wildly different
+        # friction at different lr (SDXL preset kappa=50 at lr 7.5e-5 is
+        # F = 0.00375, near-frictionless; the LM winner is F = 0.025; the
+        # CPU heavy-memorization optima sit at F ~ 0.4-1.5; F < 2 is the
+        # lr-independent stability ceiling). Committing in F also keeps the
+        # friction calibration valid under an lr sweep.
+        if peak_lr is not None:
+            conv = 1.0 / float(peak_lr)
+            self.table = [(c, k * conv) for c, k in self.table]
+            self.probe_kappa = self.probe_kappa * conv
         self._samples = []
         self.committed = None
         self.committed_beta1 = None

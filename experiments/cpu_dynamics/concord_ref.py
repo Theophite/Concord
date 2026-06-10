@@ -49,7 +49,7 @@ class ConcordRef:
 
     def __init__(self, model, lr=1e-3, total_steps=1000, warmup=100,
                  alpha=0.1, alpha_v=0.001, beta1=0.0, beta2=0.999,
-                 eps=1e-10, step_cap=10.0, kappa=50.0,
+                 eps=1e-10, step_cap=10.0, kappa=50.0, friction_F=None,
                  sigma_peak=0.6, lr_min_frac=0.2,
                  chase_floor=(0.9, 0.1), leak_floor=(0.999, 0.1),
                  gate=True, noise=True, generator=None):
@@ -58,6 +58,14 @@ class ConcordRef:
         self.warmup = warmup
         self.alpha, self.alpha_v = alpha, alpha_v
         self.beta1, self.beta2 = beta1, beta2
+        # friction_F: the DIMENSIONLESS friction F = lr*kappa at peak lr.
+        # Preferred over kappa (which is per-unit-lr): F decouples the friction
+        # sweep from the lr sweep, F < 2 is the lr-independent stability
+        # ceiling, and the per-step friction F_t = F*(lr_t/lr_peak) inherits
+        # the schedule's auto-fade (warmup protects init consolidation, the
+        # cosine tail lets the position settle). kappa = F/lr_peak is derived.
+        if friction_F is not None:
+            kappa = friction_F / lr
         self.eps, self.cap, self.kappa = eps, step_cap, kappa
         self.sigma_peak, self.lr_min_frac = sigma_peak, lr_min_frac
         self.chase_floor, self.leak_floor = chase_floor, leak_floor

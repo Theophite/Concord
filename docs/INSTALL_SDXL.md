@@ -159,7 +159,9 @@ F = 0.00375 — near-frictionless in these units**, while diffusion fine-tuning 
 memorization regime Concord faces, and the field's reliance on aggressive weight-EMA is
 independent evidence it wants a strong pull toward the average. Sweep
 F ∈ {0.004, 0.025, 0.1, 0.5, 1.0}. Committing F (not κ) also keeps the friction sweep
-orthogonal to any upward lr sweep. (The C\* calibration survives high F: at the
+orthogonal to any upward lr sweep — and the package tuner supports it natively:
+`DissipationAutoTuner(..., peak_lr=lr)` interprets the table and `probe_kappa` in F
+units and derives raw `gf_consol` itself. (The C\* calibration survives high F: at the
 pure-drift fixed point coh → 1 and the friction term self-vanishes.)
 
 β1 selection (`beta1_on=0.1, beta1_coh_threshold=...`) rides the same probe; set the

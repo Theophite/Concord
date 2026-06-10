@@ -96,6 +96,14 @@ off = DissipationAutoTuner([FakeLayer()], 0, 5, TABLE, verbose=False,
 for t in range(6):
     off.step(t)
 assert off.committed_beta1 == 0.0
+# F-units mode: table/probe in dimensionless F = lr*kappa, peak_lr converts
+F_TABLE = [(0.387, 0.0), (0.314, 0.1), (0.288, 0.2), (0.274, 0.4),
+           (0.256, 0.4)]
+fu = DissipationAutoTuner([FakeLayer()], 0, 5, F_TABLE, verbose=False,
+                          probe_kappa=0.05, peak_lr=1e-3, beta1_on=0.0)
+assert abs(fu.probe_kappa - 50.0) < 1e-9, "probe F=0.05 @ lr 1e-3 -> kappa 50"
+assert abs(fu.table[3][1] - 400.0) < 1e-9, "table F=0.4 @ lr 1e-3 -> kappa 400"
+assert all(m.gf_consol == fu.probe_kappa for m in fu.layers)
 # interpolation endpoints + midpoints
 assert tuner.kappa_from_coh(0.50) == 0.0
 assert tuner.kappa_from_coh(0.20) == 400.0
