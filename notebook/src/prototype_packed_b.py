@@ -133,6 +133,62 @@ def ns5(G, steps=5, eps=1e-7):
     return X.T if transposed else X
 
 
+_MUON_RANK_ENERGY = 1.0   # 1.0 = full NS5; <1 = truncated-polar drive at the
+                          # spectral-energy rank (r90-style). Per-run constant
+                          # (python control flow in backward -> eager-only).
+
+
+def set_muon_rank_energy(e):
+    """e in (0,1]: the muon drive whitens only the top-r singular directions,
+    r = the smallest rank capturing `e` of the gradient's spectral energy
+    (sum sigma^2) — "Muon over the actual rank of the problem". The dropped
+    directions (the noise floor that full NS5 re-amplifies to unit weight on
+    low-rank tasks) get ZERO. 1.0 restores plain NS5. Stateless (transient
+    SVD, like NS5)."""
+    global _MUON_RANK_ENERGY
+    _MUON_RANK_ENERGY = float(e)
+
+
+_MUON_RANK_MODE = "hard"   # "hard" | "comp" | "wiener" — see muon_rank_drive
+
+
+def set_muon_rank_mode(m):
+    global _MUON_RANK_MODE
+    assert m in ("hard", "comp", "wiener"), m
+    _MUON_RANK_MODE = m
+
+
+def muon_rank_drive(G, energy, mode=None):
+    """Rank-aware orthogonalization — "Muon over the actual rank of the
+    problem". From the SVD of the gradient:
+      hard:   O = U_r V_r^T, r = spectral-energy rank at `energy`. Whitens the
+              signal subspace at unit weight, zeros the noise floor. Total step
+              mass shrinks ~sqrt(r/min) vs full NS5 at matched lr.
+      comp:   hard + mass compensation: O *= sqrt(min(N,K)/r), restoring the
+              full-NS5 Frobenius mass concentrated into the r signal
+              directions — "Muon's step budget over the actual rank".
+      wiener: smooth shrinkage instead of truncation: O = U f(S) V^T with
+              f = S^2/(S^2 + (2*median(S))^2) — directions fade with their
+              SNR against the spectrum's noise floor (the house gate idiom,
+              applied spectrally). `energy` is ignored.
+    All stateless (transient SVD, like NS5)."""
+    mode = _MUON_RANK_MODE if mode is None else mode
+    Gf = G.float()
+    U, S, Vh = torch.linalg.svd(Gf, full_matrices=False)
+    if mode == "wiener":
+        floor = 2.0 * S.median()
+        f = (S * S) / (S * S + floor * floor + 1e-30)
+        O = (U * f[None, :]) @ Vh
+    else:
+        e = S * S
+        cum = torch.cumsum(e, 0) / e.sum().clamp_min(1e-30)
+        r = int((cum < energy).sum().item()) + 1
+        O = U[:, :r] @ Vh[:r, :]
+        if mode == "comp":
+            O = O * (S.numel() / float(r)) ** 0.5
+    return O.to(G.dtype)
+
+
 # ============================================================
 # Triton kernels
 # ============================================================
@@ -1544,7 +1600,11 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
             # construction — Σ_g shaping is meaningless after orthogonalization.
             if grad_W.dtype != torch.bfloat16:
                 grad_W = grad_W.to(torch.bfloat16)
-            grad_W = (ctx.muon_gamma * ns5(grad_W.contiguous()))
+            if _MUON_RANK_ENERGY < 1.0:
+                grad_W = (ctx.muon_gamma
+                          * muon_rank_drive(grad_W.contiguous(), _MUON_RANK_ENERGY))
+            else:
+                grad_W = (ctx.muon_gamma * ns5(grad_W.contiguous()))
             if _SIGMAG_NOISE:
                 with torch.no_grad():
                     gwf = grad_W.float()
@@ -2292,7 +2352,11 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
             grad_W_2d = grad_W_2d.to(torch.bfloat16)
         if ctx.use_muon:
             # NS on the packed 2-D view [C_out, C_in·kh·kw] (standard Muon practice).
-            grad_W_2d = (ctx.muon_gamma * ns5(grad_W_2d)).contiguous()
+            if _MUON_RANK_ENERGY < 1.0:
+                grad_W_2d = (ctx.muon_gamma
+                             * muon_rank_drive(grad_W_2d, _MUON_RANK_ENERGY)).contiguous()
+            else:
+                grad_W_2d = (ctx.muon_gamma * ns5(grad_W_2d)).contiguous()
         if ctx.track_rebalance:
             ctx.row_max_buf.zero_()
             ctx.col_max_buf.zero_()

@@ -197,3 +197,39 @@ autotune calibration) and the fork port do NOT proceed for adoption. The
 remaining headroom marked in §8 — a pre-NS gradient EMA, the one state this
 design refused to buy — is now the obvious next experiment, since the failure
 is late-phase noise in the NS *input*, precisely what an input EMA filters.
+
+## 10. Post-gate probes (2026-06-09) — investigation paused, drive stays opt-in
+
+Two follow-ups on the gate-1 failure mode, both bench-probed same-seed before
+pausing the line of inquiry:
+
+**Soft targets from the in-word teacher** (`--target_lambda/--target_tau`:
+target = λ·onehot + (1−λ)·softmax(f_P/τ), f_P = the deploy-sv weights): helps
+the v̂ arm (see `SOFT_TARGETS.md` — the new session best), **hurts the NS arm
+at both blends** (λ0.9τ1: 1.5484; λ0.8τ2: 1.5745; control 1.5385). The
+asymmetry is the mechanism speaking: the v̂ slow field is a clean teacher,
+the NS slow field has been fed chased-in whitened noise — softening targets
+cannot fix noise the drive itself injects.
+
+**Rank-restricted orthogonalization** (`--muon_rank_energy/--muon_rank_mode`:
+truncated-polar O = U_r V_rᵀ at the per-step spectral-energy rank; `comp`
+adds √(min/r) mass compensation; `wiener` does smooth per-direction SNR
+shrinkage). Partial-run results:
+- hard e0.90: **zero heating through iter 1500** (monotone descent — the
+  noise-floor-amplification mechanism confirmed from the other side) but
+  starved: ~4× slower learning at matched lr (val 2.04 @1500 vs full-NS5
+  1.58 @1250), plus ~4× wall-clock from the per-step SVD.
+- comp e0.90: mass compensation did NOT restore the learning rate (val 2.47
+  @750, slightly *worse* than hard) → the early-phase gradient carries real
+  signal OUTSIDE the trained-net rank. Low-rank structure is EMERGENT; a
+  fixed cut from init starves the subspace-finding phase.
+- wiener: not run (paused).
+
+**Where this leaves the drive**: `drive="muon"` stays available (default
+"vhat") — its CPU profile (clean high-rank tasks, label-noise robustness
+inside the cascade, capless-lr stability at 32 b/param) is real and useful;
+it loses specifically on emergent-low-rank regimes like char-LM. If the line
+reopens, the two designs the evidence points at: **annealed rank restriction**
+(full NS5 early → tighten toward the measured rank as structure emerges, the
+ratio-floor idiom applied spectrally — `wiener` mode is the adaptive
+endpoint, implemented and unrun) and the §8 pre-NS gradient EMA.

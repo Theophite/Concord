@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 from nanogpt import GPT, GPTConfig, load_char_data, get_batch
 from prototype_packed_b import (ConcordLinearPackedB, reset_reb_stats,
+                                set_muon_rank_energy, set_muon_rank_mode,
                                 get_reb_stats, set_fixed_coh, set_gate_gain,
                                 set_coh_weighted_v, set_ratio_coh,
                                 set_ratio_coh_floors,
@@ -218,6 +219,15 @@ def main():
                     help="soft-target blend: target = lambda*onehot(y) + (1-lambda)*"
                          "softmax(f_P(ctx)/tau), f_P = the DEPLOY (slow sv) weights — "
                          "the in-word teacher. 1.0 = pure one-hot (off)")
+    ap.add_argument("--muon_rank_mode", choices=["hard", "comp", "wiener"],
+                    default="hard",
+                    help="rank drive: hard truncation | mass-compensated truncation "
+                         "(full-NS5 step budget over the actual rank) | Wiener "
+                         "spectral shrinkage (no energy threshold)")
+    ap.add_argument("--muon_rank_energy", type=float, default=1.0,
+                    help="<1: the muon drive whitens only the top-r singular directions "
+                         "(r = spectral-energy rank), zeroing the noise floor that full "
+                         "NS5 re-amplifies on low-rank tasks. 1.0 = plain NS5")
     ap.add_argument("--target_tau", type=float, default=1.0,
                     help="teacher temperature for the soft-target blend")
     ap.add_argument("--drive", choices=["vhat", "muon"], default="vhat",
@@ -355,6 +365,8 @@ def main():
                          "analysis (AdamW .weight vs Concord materialized).")
     ap.add_argument("--tag", default=None)
     args = ap.parse_args()
+    set_muon_rank_energy(args.muon_rank_energy)
+    set_muon_rank_mode(args.muon_rank_mode)
     tag = args.tag or args.mode
     device = "cuda"
     torch.manual_seed(args.seed); torch.cuda.manual_seed_all(args.seed)
@@ -426,6 +438,7 @@ def main():
               f"eps={args.eps} precond_p={args.precond_p} gf_consol={args.gf_consol} "
               f"drive={args.drive} "
               f"target_lam={args.target_lambda}@tau={args.target_tau} "
+              f"rankE={args.muon_rank_energy} "
               f"step_cap={args.step_cap}  aux_lr={args.aux_lr}", flush=True)
         peak_lr = args.concord_lr
     elif args.mode == "factored":
