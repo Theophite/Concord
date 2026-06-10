@@ -607,3 +607,63 @@ external reference. That needs the basis (SVD or a subspace sketch, the cost
 exp 10 measured at ~4×); the cube trick was worth one experiment precisely
 because it was free, and what it bought is the clean negative: energy is not
 SNR.
+
+
+## Exp 14 — the drift-referenced spectral gate: four versions, a measured bind (`exp14_rank_deficient.py`)
+
+The rank-deficient test of exp 12+13's reopen point. Task: teacher
+y = W2·tanh(W1·x) with W1, W2 both RANK 4 (64-dim inputs), infinite fresh
+data, ±0.5σ target-noise arm; metrics at the deploy weights: clean-test MSE
+and **complement leakage** — the learned delta's energy outside the
+teacher's rank-4 input row space (the dead directions an indiscriminate
+drive writes into). 3 seeds, λ=0.
+
+**The mechanism is confirmed at the weight level** (3-seed means):
+
+    drive          clean MSE   noisy MSE   leak (clean)  leak (noisy)
+    vhat           0.0015      0.0037      25.8%         23.6%
+    muon (NS5)     0.0007      0.0030      37.3%         44.4%
+    spec v4        0.0035      0.0088      41.9%         44.0%
+
+muon writes ~2× the dead-direction mass — "indiscriminate about the
+directions it writes to", quantified. **But on this task it does not pay a
+function-level price**: muon's deploy MSE beats v̂ in both arms anyway. The
+leaked mass is real and harmless here (the downstream layer nulls it; the
+absolute magnitudes are small). The task-level muon failure on
+rank-deficiency remains an EMERGENT-rank / long-horizon phenomenon (nanoGPT
+char-LM, gate 1) that this 3k-step synthetic does not reproduce. The leak
+metric is the mechanism probe, not the damage.
+
+**The retrofit gate fails in four escalating versions:**
+
+- **v1 — matched filter diag(UᵀDV)**: D and g share the live subspace but
+  not singular PAIRINGS; the diagonal scatters, the gate sits at its floor.
+  Leak 44.6% = ungated.
+- **v2 — Wiener subspace projectors from the drift D = C*(S−A)**: the drift
+  is a VELOCITY meter and the chase floor passes noise into it — measured
+  effective rank ~13/64. Leak 44.4 → 40.5%.
+- **v3 — projectors from the net learned structure R = (S+A) − W0**: the
+  right kind of reference, but SELF-CONTAMINATED — R's dead-direction
+  content IS the leakage the gate should have prevented. Leak 42.0%.
+- **v4 — calibrated knee (6× mean energy, from the measured spectrum: rank
+  spike 3.4–5.4× mean over a 1.9× bulk), smoothstep-sharpened projectors,
+  discovery-timescale floor**: the gate finally gates (mean pass 6.5%) — and
+  noisy MSE TRIPLES (0.0088) with leak unchanged (44.0%).
+
+The time-resolved diagnostic explains all four at once: **the leak is baked
+in early** — 65.5% at t=500 under the open bootstrap floor (φ=0.85),
+decaying to 44% only by dilution — and the reference spectrum only becomes
+readable at t≳1500. So the bind: an open early floor lets the dead mass
+consolidate before any internal reference can know the subspace (v1–v3); a
+floor tight enough to block it starves discovery and continued learning
+without recovering the already-consolidated leak (v4, exp 13, exp 10).
+
+**The law, final form: selectivity cannot be retrofitted downstream of an
+indiscriminate write — by the time any state-internal reference knows the
+live subspace, the dead mass is already in the state, and the state is the
+only reference there is. Selectivity must act AT the write** (the v̂ drive's
+per-element SNR scaling is exactly that). Candidate future probe, unrun:
+pre-NS v̂ scaling (orthogonalize the SNR-scaled gradient — NS re-whitens
+magnitudes but the DOMINANT SUBSPACE it preserves shifts toward signal;
+cousin of §8's pre-NS EMA). Until then: muon stays opt-in at λ≈0 for
+clean/high-rank tasks, v̂ + the element gate everywhere else.

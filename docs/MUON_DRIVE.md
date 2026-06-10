@@ -298,3 +298,27 @@ point is therefore the DRIFT-REFERENCED spectral gate: per-direction
 coherence diag(UᵀDV) against the drift matrix D — the existing Wiener meter
 transported to the singular basis with the same external reference; costs a
 basis (SVD/subspace sketch, ~4× per exp 10).
+
+**Addendum 2 (exp 14, same day): the drift-referenced gate is refuted too —
+in four escalating versions on a rank-4 synthetic.** v1 (matched-filter
+diag(UᵀDV)): D and g share the live subspace but not singular pairings —
+gate sits at its floor. v2 (Wiener subspace projectors from D): the drift is
+a velocity meter, noise passes the chase floor into it (effective rank
+13/64). v3 (projectors from the net learned structure R = S+A−W0): the
+reference is SELF-contaminated — its dead-direction content is the leakage
+the gate should have blocked. v4 (knee calibrated from the measured
+spectrum, smoothstep-sharpened, discovery-timescale floor): the gate finally
+gates and noisy MSE triples with leak unchanged. The time-resolved
+diagnostic shows why nothing in this family can work: the leak is baked in
+at t≲500 under the open bootstrap floor, while the reference spectrum is
+unreadable before t≈1500 — open floor ⇒ contaminated state-reference;
+tight floor ⇒ starvation (exp 10/13). **Selectivity cannot be retrofitted
+downstream of an indiscriminate write; it must act AT the write** — which is
+what the v̂ drive's per-element SNR scaling is. Exp 14 also quantified the
+§11 premise at the weight level (muon writes 44% of its learned delta into
+the dead complement vs v̂'s 24%) while showing the damage is NOT expressed
+in deploy MSE on a short synthetic — the rank-deficiency failure is an
+emergent-rank/long-horizon phenomenon (gate 1), as observed. One candidate
+left standing, unrun: PRE-NS v̂ scaling (orthogonalize the SNR-scaled
+gradient — NS re-whitens magnitudes but its preserved dominant subspace
+shifts toward signal; cousin of the §8 pre-NS EMA).
