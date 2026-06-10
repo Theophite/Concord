@@ -521,3 +521,26 @@ Findings:
    100 @ 25ep → ≥150 @ 80ep): the autotune table is (drive, horizon, aug)-conditioned,
    which is one more argument for probe-based tuning over static tables — and the
    probe-then-commit design re-measures per run by construction.
+
+## Exp 11 — fine lr ablation for the NS drive (`exp11_ns_lr.py`)
+
+4k × 25ep, κ = 0, σ off, deploy acc, 3 seeds; pad-2 random-crop aug off/on.
+
+| lr | 3e-3 | 5e-3 | 7e-3 | 1e-2 | 1.5e-2 | 2e-2 | 3e-2 | 5e-2 |
+|---|---|---|---|---|---|---|---|---|
+| no aug | 95.89 | 96.02 | **96.11 ± 0.08** | 96.07 | 95.57 | 95.45 | 95.38 | 95.27 |
+| aug | 97.30 | 97.37 | 97.43 | **97.51 ± 0.10** | 97.36 | 97.36 | 97.19 | 96.52 |
+
+1. **lr\* ≈ 7e-3–1e-2 in both conditions** (no-aug peak 7e-3, aug peak 1e-2 — the
+   coarse 9c grid's 1e-2 was already essentially at-peak). Augmentation nudges the
+   optimum slightly up and **widens the plateau**: under aug, everything in
+   [3e-3, 3e-2] — a full decade — is within 0.32 of the peak.
+2. **The NS drive is lr-insensitive across a decade**, now with a fine grid behind the
+   claim (±0.2% over [3e-3, 3e-2] under aug). Compare the v̂ drive (±1.0 swing over
+   the same span, 9c) and AdamW (collapse at high lr). For practitioners: any lr in
+   [5e-3, 2e-2] is within noise of optimal — precision lr tuning buys essentially
+   nothing on this drive.
+3. **25 epochs at lr\* under aug ≈ converged**: 97.51 here vs exp 10's 97.58 at 80
+   epochs — the extra 55 epochs bought +0.07. The compute-efficient recipe for this
+   protocol is 25ep + aug + lr 1e-2, and exp 10's headline number had no lr headroom
+   left in it.
