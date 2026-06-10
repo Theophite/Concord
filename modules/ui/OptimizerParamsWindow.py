@@ -95,7 +95,7 @@ class OptimizerParamsWindow(ctk.CTkToplevel):
             'adam_w_mode': {'title': 'Adam W Mode', 'tooltip': 'Whether to use weight decay correction for Adam optimizer.', 'type': 'bool'},
             'alpha': {'title': 'Alpha', 'tooltip': 'Smoothing parameter for RMSprop and others.', 'type': 'float'},
             'amsgrad': {'title': 'AMSGrad', 'tooltip': 'Whether to use the AMSGrad variant for Adam.', 'type': 'bool'},
-            'beta1': {'title': 'Beta1', 'tooltip': 'optimizer_momentum term.', 'type': 'float'},
+            'beta1': {'title': 'Beta1', 'tooltip': 'Momentum term.', 'type': 'float'},
             'beta2': {'title': 'Beta2', 'tooltip': 'Coefficients for computing running averages of gradient.', 'type': 'float'},
             'beta3': {'title': 'Beta3', 'tooltip': 'Coefficient for computing the Prodigy stepsize.', 'type': 'float'},
             'bias_correction': {'title': 'Bias Correction', 'tooltip': 'Whether to use bias correction in optimization algorithms like Adam.', 'type': 'bool'},
@@ -105,10 +105,10 @@ class OptimizerParamsWindow(ctk.CTkToplevel):
             'clip_threshold': {'title': 'Clip Threshold', 'tooltip': 'Clipping value for gradients.', 'type': 'float'},
             'd0': {'title': 'Initial D', 'tooltip': 'Initial D estimate for D-adaptation.', 'type': 'float'},
             'd_coef': {'title': 'D Coefficient', 'tooltip': 'Coefficient in the expression for the estimate of d.', 'type': 'float'},
-            'dampening': {'title': 'Dampening', 'tooltip': 'Dampening for optimizer_momentum.', 'type': 'float'},
+            'dampening': {'title': 'Dampening', 'tooltip': 'Dampening for momentum.', 'type': 'float'},
             'decay_rate': {'title': 'Decay Rate', 'tooltip': 'Rate of decay for moment estimation.', 'type': 'float'},
-            'decouple': {'title': 'Decouple', 'tooltip': 'Use AdamW style optimizer_decoupled weight decay.', 'type': 'bool'},
-            'differentiable': {'title': 'Differentiable', 'tooltip': 'Whether the optimization function is optimizer_differentiable.', 'type': 'bool'},
+            'decouple': {'title': 'Decouple', 'tooltip': 'Use AdamW style decoupled weight decay.', 'type': 'bool'},
+            'differentiable': {'title': 'Differentiable', 'tooltip': 'Whether the optimization function is differentiable.', 'type': 'bool'},
             'eps': {'title': 'EPS', 'tooltip': 'A small value to prevent division by zero.', 'type': 'float'},
             'eps2': {'title': 'EPS 2', 'tooltip': 'A small value to prevent division by zero.', 'type': 'float'},
             'foreach': {'title': 'ForEach', 'tooltip': 'Whether to use a foreach implementation if available. This implementation is usually faster.', 'type': 'bool'},
@@ -122,11 +122,11 @@ class OptimizerParamsWindow(ctk.CTkToplevel):
             'log_every': {'title': 'Log Every', 'tooltip': 'Intervals at which logging should occur.', 'type': 'int'},
             'lr_decay': {'title': 'LR Decay', 'tooltip': 'Rate at which learning rate decreases.', 'type': 'float'},
             'max_unorm': {'title': 'Max Unorm', 'tooltip': 'Maximum value for gradient clipping by norms.', 'type': 'float'},
-            'maximize': {'title': 'Maximize', 'tooltip': 'Whether to optimizer_maximize the optimization function.', 'type': 'bool'},
+            'maximize': {'title': 'Maximize', 'tooltip': 'Whether to maximize the optimization function.', 'type': 'bool'},
             'min_8bit_size': {'title': 'Min 8bit Size', 'tooltip': 'Minimum tensor size for 8-bit quantization.', 'type': 'int'},
             'quant_block_size': {'title': 'Quant Block Size', 'tooltip': 'Size of a block of normalized 8-bit quantization data. Larger values increase memory efficiency at the cost of data precision.', 'type': 'int'},
-            'momentum': {'title': 'optimizer_momentum', 'tooltip': 'Factor to accelerate SGD in relevant direction.', 'type': 'float'},
-            'nesterov': {'title': 'Nesterov', 'tooltip': 'Whether to enable Nesterov optimizer_momentum.', 'type': 'bool'},
+            'momentum': {'title': 'Momentum', 'tooltip': 'Factor to accelerate SGD in relevant direction.', 'type': 'float'},
+            'nesterov': {'title': 'Nesterov', 'tooltip': 'Whether to enable Nesterov momentum.', 'type': 'bool'},
             'no_prox': {'title': 'No Prox', 'tooltip': 'Whether to use proximity updates or not.', 'type': 'bool'},
             'optim_bits': {'title': 'Optim Bits', 'tooltip': 'Number of bits used for optimization.', 'type': 'int'},
             'percentile_clipping': {'title': 'Percentile Clipping', 'tooltip': 'Gradient clipping based on percentile values.', 'type': 'int'},
@@ -144,7 +144,7 @@ class OptimizerParamsWindow(ctk.CTkToplevel):
             'lazy_gate': {'title': 'Lazy Update Gate', 'tooltip': 'Freeze the dissipation (gf_consol evaporation + v_slow leak) on coordinates with no accumulated gradient signal this window -- sparse/lazy-Adam style, so a zero gradient is treated as no-information instead of evidence to decay toward. Helps when per-coordinate gradients are intermittent (diverse multi-image sets under grad accumulation). Off by default.', 'type': 'bool'},
             'lazy_active_thresh': {'title': 'Lazy Gate Threshold', 'tooltip': 'Activity threshold tau: a coordinate stays active iff its accumulated velocity satisfies s_fast_in_w^2 > tau * v_hat (the per-coord typical g^2). Default 1e-4 (no-op on active signal to within one int8 tick); raise it under gradient accumulation, where active windows separate sharply from idle ones.', 'type': 'float'},
             'warmup': {'title': 'Concord Warmup Steps', 'tooltip': 'Linear LR warmup steps for the Concord schedule (winner_step). Winner default 100.', 'type': 'int'},
-            'lr_min_frac': {'title': 'LR Min Fraction', 'tooltip': 'Cosine floor: minimum LR as a fraction of the peak LR over training. Winner default 0.2.', 'type': 'float'},
+            'lr_min_frac': {'title': 'LR Min Fraction', 'tooltip': 'Cosine floor: the Concord schedule decays the LR from peak to this fraction of peak by end of run (never to zero). Winner default 0.2. Also pins the end-of-run fluctuation level -- sigma rises as (1 - cosine factor), so the run ends at (1 - this) * Noise Sigma Peak.', 'type': 'float'},
             'dissipation': {'title': 'Dissipation (lam)', 'tooltip': 'Dimensionless dissipation lam = lr * kappa, the physical friction knob (per-step friction fraction): the engine runs kappa = lam/lr, so the same value means the same friction at any learning rate. nanoGPT winner 0.025 (= kappa 333 at lr 7.5e-5); CPU noisy-regime optimum up to 0.4; must stay below 2 (linear stability). Empty = the engine kappa default (gf_consol 50, settable as a config-file key).', 'type': 'float'},
             'autotune_table': {'title': 'Autotune Table', 'tooltip': 'Dissipation autotuner (probe-then-commit), opt-in. JSON [[coh, kappa], ...] with coh strictly descending: train through an early probe window at the default friction, read the mean gate coherence, commit kappa once from this table. With Dissipation set, the kappa column is read as dimensionless lam and divided by lr at build. CPU-calibrated lam table: [[0.387,0],[0.314,0.1],[0.288,0.2],[0.274,0.4],[0.256,0.4]]. Empty = autotuner off.', 'type': 'str'},
             'autotune_reprobe_band': {'title': 'Autotune Re-probe Band', 'tooltip': 'Live autotuner mode: after the commit, watch the windowed coherence mean against a slow-EMA baseline and RE-PROBE on a one-sided DROP larger than this band (a drop = noise arrived; rises are the friction working and are ignored). Try 0.02. Empty = one-commit (probe once, hold forever).', 'type': 'float'},
@@ -211,6 +211,14 @@ class OptimizerParamsWindow(ctk.CTkToplevel):
             return
 
         selected_optimizer = self.train_config.optimizer.optimizer
+
+        # CONCORD relabels: the visible momentum/weight decay belong to the plain
+        # aux SGD over the NON-swapped params (norms, biases, trained embeddings);
+        # the packed Concord layers self-step inside the fused backward and never
+        # read them. The generic SGD descriptions misattribute them to the model.
+        if selected_optimizer == Optimizer.CONCORD:
+            KEY_DETAIL_MAP['momentum'] = {'title': 'Aux SGD Momentum', 'tooltip': 'Momentum of the plain aux SGD over the NON-swapped params (norms, biases, trained embeddings). The packed Concord layers self-step inside the fused backward and never read this.', 'type': 'float'}
+            KEY_DETAIL_MAP['weight_decay'] = {'title': 'Aux SGD Weight Decay', 'tooltip': 'Weight decay of the aux SGD over the non-swapped params (norms, biases, trained embeddings). The packed Concord layers use their own engine-level decay/anchor terms (wd_sv / wd_sf / wd_anchor), not this.', 'type': 'float'}
 
         # Extract the keys for the selected optimizer
         for index, key in enumerate(OPTIMIZER_DEFAULT_PARAMETERS[selected_optimizer].keys()):
