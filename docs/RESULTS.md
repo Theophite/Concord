@@ -244,7 +244,12 @@ measured. Full write-up: [`MUON_DRIVE.md`](MUON_DRIVE.md); lab log: exps 9/9b/9c
   tradeoff. Any consumer of coh (β1 above all) inherits this.
 
 Adoption path, in order: (1) same-seed nanoGPT A/B of the C\* rescale in the real
-harness, with a small κ sweep (the consumers were tuned around the dull meter);
+harness, with a small κ sweep (the consumers were tuned around the dull meter) — **and
+an upward lr sweep**: the campaign's optima sat ~10× above AdamW's, which is the
+Polyak–Ruppert prediction (shipping the consolidation-window average licenses
+lr ≈ window × AdamW's; window = 1/(α·gc) ≈ 10–30), and the validated 5e-4 was never
+swept upward — the headline 1.4967 may be lr-handicapped exactly as exp 9's Muon
+numbers were before exp 9c;
 (2) calibrate a probe table on the target task and A/B the autotuner against the fixed
 winner; (3) only then β1, behind the probe threshold. For the SDXL fork, additionally
 port κ to a device tensor so the tuner can operate under the Stage-3 captured graph.
