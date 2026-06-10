@@ -958,6 +958,20 @@ class GenericTrainer(BaseTrainer):
                             })
                             self.tensorboard.add_scalar("smooth_loss/train_step", ema_loss, train_progress.global_step)
 
+                            # Concord memorization-gap meter: first-order (L_deploy - L_live)
+                            # accumulated in the fused backward (sum grad*s_fast -- free).
+                            # deploy_est = loss + gap is the number comparable across
+                            # friction / gamma-SNR regimes; the live loss alone is deflated
+                            # by the batch-fitted transient riding in s_fast.
+                            _ctrl = getattr(self.model, "concord_controller", None)
+                            if _ctrl is not None:
+                                _gap = _ctrl.read_memorization_gap()
+                                self.tensorboard.add_scalar(
+                                    "loss/concord_gap", _gap, train_progress.global_step)
+                                self.tensorboard.add_scalar(
+                                    "loss/deploy_est", accumulated_loss_cpu + _gap,
+                                    train_progress.global_step)
+
                         accumulated_loss = 0.0
                         self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
 

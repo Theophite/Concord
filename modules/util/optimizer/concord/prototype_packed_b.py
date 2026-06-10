@@ -652,6 +652,9 @@ def _apply_packed_adamw_kernel(
                           # capture). (1.0 = off). Anneals α·gate·s_fast consolidation.
     v_bc_ptr,            # *fp32 [1]: Adam bias-correction 1/(1-beta2^t) for v_hat
                           # (device tensor; 1.0 = off). Ported from concord_ratio_coh.
+    memgap_ptr,          # *fp32[1]: memorization-gap accumulator -- per-tile atomic add of
+                          # sum(grad * s_fast_in_W), the first-order (L_live - L_deploy).
+                          # (Distinct from gap_inv_scale, the gap-FEEDBACK split below.)
     gap_inv_scale,       # fp32: 1/gap_scale for the conserved gap-feedback pass/evap split
     step_salt_ptr,
     consolidate_ptr,     # *int32[1]: gradient-accumulation gate. 1 = consolidate (full apply,
@@ -727,6 +730,13 @@ def _apply_packed_adamw_kernel(
     # Delta convention: s_fast IS the velocity directly.
     d_fs = s_fast.to(tl.float32)
     d_sv = (s_slow_full - v_slow_full).to(tl.float32)
+
+    # ── memorization-gap meter ─────────────────────────────────
+    # grad_W is dL/dW at the LIVE weights; the deploy weight is live minus
+    # s_fast -- so sum(grad * s_fast_in_W) is the first-order (L_live -
+    # L_deploy) contribution of this tile (pre-update s_fast, the weights the
+    # gradient was computed at). Masked-out lanes load as 0 on both factors.
+    tl.atomic_add(memgap_ptr, tl.sum(grad_W * d_fs * scale_fwd))
     noise = d_fs - drift_cancel_C * d_sv
     noise_in_w = noise * scale_fwd
     v_proxy = noise_in_w * noise_in_w * v_scale
@@ -1106,6 +1116,41 @@ def set_min_leak(v):
     _MIN_LEAK = float(v)
 
 
+# Memorization-gap meter: per-device fp32[1] accumulator for the inner product
+# sum(grad * s_fast_in_W) over every packed layer's update. grad is dL/dW at the
+# LIVE weights and the live weight differs from the DEPLOY weight by exactly
+# s_fast, so this is the first-order Taylor estimate of (L_live - L_deploy):
+#     L_deploy ~ L_live - sum(grad * s_fast_in_W)
+# The kernel atomically adds per tile (~1 FMA/element inside a memory-bound
+# kernel, always on); the host reads + zeros at the logging cadence via
+# read_memgap(). Under gradient accumulation each micro-step's grad carries the
+# 1/accum scale, so the per-update-step accumulated value matches the
+# accumulated mean-batch loss normalization. CUDA-graph-safe: a static buffer
+# the captured kernel atomic-adds into; the host zero_() between replays.
+_MEMGAP_BUFS = {}
+
+
+def _memgap_buf(device):
+    key = str(device)
+    buf = _MEMGAP_BUFS.get(key)
+    if buf is None:
+        buf = torch.zeros(1, dtype=torch.float32, device=device)
+        _MEMGAP_BUFS[key] = buf
+    return buf
+
+
+def read_memgap(device, reset=True):
+    """Accumulated sum(grad * s_fast_in_W) since the last reset (one host sync).
+    First-order deploy-loss estimate: L_deploy ~ L_live - (this value)."""
+    buf = _MEMGAP_BUFS.get(str(device))
+    if buf is None:
+        return 0.0
+    v = float(buf.item())
+    if reset:
+        buf.zero_()
+    return v
+
+
 _GATE_GAIN = 1.0
 
 # EXPERIMENTAL (default OFF): centered Sigma_g-shaped gradient-noise injection. Adds a draw
@@ -1391,6 +1436,7 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         _ratio_chase_floor_ptr,
         _ratio_leak_floor_ptr,
         bc_buf,
+        _memgap_buf(packed_w.device),
         float(gap_inv),
         step_counter,
         consolidate_ptr,

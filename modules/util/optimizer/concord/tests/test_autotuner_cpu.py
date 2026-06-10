@@ -253,6 +253,22 @@ check("9f pick-through", cfg9.min_leak == 0.25
       and make_concord_config(7.5e-5, SimpleNamespace()).min_leak == 0.1)
 check("9g GUI default exposed", gui_concord_defaults()["min_leak"] == 0.1)
 
+# ---- 10. memorization-gap meter (buffer machinery + controller sign) --------
+buf = ppb._memgap_buf("cpu")
+check("10a buffer zero-init and idempotent accessor",
+      float(buf[0]) == 0.0 and ppb._memgap_buf("cpu") is buf)
+buf += 0.25                          # stand in for the kernel's atomic adds
+check("10b read returns accumulated value and resets",
+      ppb.read_memgap("cpu") == 0.25 and float(buf[0]) == 0.0
+      and ppb.read_memgap("cpu") == 0.0)
+buf += -0.5                          # s_fast anti-aligned with grad (typical)
+rig10 = SimpleNamespace(layers=[SimpleNamespace(packed_w=torch.zeros(1))])
+gap = ConcordController.read_memorization_gap(rig10)
+check("10c controller flips sign: deploy reads HIGHER than live",
+      gap == 0.5 and float(buf[0]) == 0.0)
+check("10d empty-layers path returns 0.0",
+      ConcordController.read_memorization_gap(SimpleNamespace(layers=[])) == 0.0)
+
 print()
 ok = all(results)
 print(f"{'ALL PASS' if ok else 'FAILURES'} ({sum(results)}/{len(results)})")

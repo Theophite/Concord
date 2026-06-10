@@ -210,6 +210,20 @@ class ConcordController:
     # lam < 2 linear-stability ceiling), whatever the batch's SNR draw.
     _LAM_MOD_CAP = 1.0
 
+    def read_memorization_gap(self):
+        """Memorization-gap meter: first-order estimate of (L_deploy - L_live),
+        accumulated in the fused backward since the last call (one host sync --
+        call at the logging cadence, once per update step). Positive = the live
+        weights carry batch-fitted transient (s_fast) the deploy weights don't;
+        logged_loss + gap is the deploy-loss estimate that IS comparable across
+        friction / gamma-SNR regimes (the live loss is deflated by the
+        transient). Trend-accurate while s_fast is small; the exact deploy
+        validation at sample time calibrates drift."""
+        from prototype_packed_b import read_memgap
+        if not self.layers:
+            return 0.0
+        return -read_memgap(self.layers[0].packed_w.device)
+
     @torch.no_grad()
     def on_timesteps(self, timesteps, alphas_cumprod):
         """gamma-SNR dissipation modulation (opt-in via optimizer.autotune_gamma_snr).
