@@ -187,15 +187,29 @@ class ConcordController:
         # warmup AND the ~1/alpha init-consolidation transient, or the meter reads ~0
         # regardless of data quality and commits the table's max-friction kappa.
         # Observed on a short bs=2 overfit: probe steps 4-12 -> coh 0.002 -> kappa
-        # ceiling on CLEAN data (visible deploy damage). Warn loudly; short mechanical
-        # smoke runs may proceed knowingly.
+        # ceiling on CLEAN data (visible deploy damage). Warn-and-misfire was the
+        # old behavior; now AUTO-DEFER the window past the transient, and if a
+        # clean probe can't fit in the first half of the run, disable the tuner
+        # for this run instead of committing garbage (the configured base
+        # kappa/dissipation then holds end-to-end).
         transient = int(2.0 / max(self.config.alpha, 1e-6))
-        if probe_start < max(int(self.config.warmup), transient):
-            print(f"[concord] WARNING: autotune probe window [{probe_start},{probe_end}) does "
-                  f"not clear warmup ({self.config.warmup}) / the ~{transient}-step init "
-                  f"transient: the coherence meter reads ~0 there and will commit the "
-                  f"table's max kappa regardless of data quality. Lengthen the run or "
-                  f"recalibrate the probe window.")
+        min_start = max(int(self.config.warmup), transient)
+        if probe_start < min_start:
+            window = probe_end - probe_start
+            probe_start = min_start
+            probe_end = probe_start + window
+            if probe_end > self.total_steps // 2:
+                print(f"[concord] autotune DISABLED for this run: a clean probe "
+                      f"window ({window} steps past warmup={self.config.warmup}/"
+                      f"transient~{transient}) does not fit in the first half of "
+                      f"{self.total_steps} steps. The configured kappa "
+                      f"(gf_consol={self.config.gf_consol:.0f}) holds end-to-end. "
+                      f"Lengthen the run to re-enable autotuning.")
+                self.autotuner = None
+                return
+            print(f"[concord] autotune probe deferred to [{probe_start},{probe_end}) "
+                  f"to clear warmup ({self.config.warmup}) / the ~{transient}-step "
+                  f"init transient (the meter reads ~0 inside them).")
         self.autotuner = DissipationAutoTuner(
             self.layers,
             probe_start=probe_start,
