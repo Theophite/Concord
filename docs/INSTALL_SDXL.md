@@ -19,7 +19,8 @@ root; verified to apply cleanly and all touched files compile). It includes the
 F-units autotuner (`autotune_table_in_F=True`: the table is dimensionless F = lr·κ,
 `probe` converts the configured `gf_consol` via F = κ·lr so default behavior is
 unchanged until a table is passed). The manual steps below remain the reference for
-review or for applying onto a moved branch tip.
+review or for applying onto a moved branch tip. Machine-level runbook (from a clean
+clone to verified install, Windows/Git Bash): [`INSTALL_LOCAL.md`](INSTALL_LOCAL.md).
 
 ---
 
