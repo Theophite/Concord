@@ -720,36 +720,42 @@ class GenericTrainer(BaseTrainer):
                 return
             self.callbacks.on_update_status("Starting epoch/caching")
 
-            # Multistage-caching headroom (concord_epoch_cache_release, default ON):
-            # per-epoch cache stages run TE/VAE work while the captured Concord
-            # graph still holds its multi-GB private pool — the cache stage then
-            # pegs VRAM and thrashes. Mirror the sampling path: release the graph
-            # (it recaptures transparently on the next training step) + gc before
-            # start_next_epoch. Costs one recapture per epoch on graph runs;
-            # set false to skip it on single-stage datasets where the epoch
-            # boundary is a cheap shuffle and the headroom is not needed.
+            # Epoch-boundary hygiene (ALWAYS, regardless of the release flag):
+            # the previous epoch's loop locals live in THIS scope through the
+            # cache stage and pin GPU memory: `batch` holds the last
+            # micro-batch's tensors, `model_output_data` the predicted/target
+            # latents (eager path), and in graph mode `loss`/`detached_loss`
+            # reference cap_loss INSIDE the graph's private pool — one live
+            # tensor keeps its whole allocator segment resident. Unbind them
+            # (plain assignment: safe whether or not the names are bound yet
+            # on the first epoch) and gc.
+            batch = None
+            model_output_data = None
+            prior_model_output_data = None
+            prior_model_prediction = None
+            loss = None
+            detached_loss = None
+            accumulated_loss = accumulated_loss.item() \
+                if torch.is_tensor(accumulated_loss) else accumulated_loss
+            torch_gc()
+            # Graph release (concord_epoch_cache_release, default ON): drop the
+            # captured graph + its multi-GB private pool so the cache stage has
+            # maximum headroom; the graph recaptures transparently on the next
+            # training step. TRADE-OFF, observed live: the recapture re-allocates
+            # eager warmup activations + a fresh pool on a heavily-exercised
+            # allocator and can OOM where the train-start capture succeeded
+            # (fragmentation) — even with the post-cache gc that already runs
+            # below. Set FALSE for keep-graph mode: the capture stays alive
+            # across the boundary (no recapture, no OOM risk); the cache runs
+            # with less headroom, which may slow it on tight VRAM — a soft
+            # failure instead of a hard one. With the locals unbound above, the
+            # pool may coexist with the cache workspace where it previously
+            # could not.
             if getattr(self.config, "concord_epoch_cache_release", True):
-                # The previous epoch's loop locals live in THIS scope through the
-                # cache stage and pin GPU memory past the release: `batch` holds
-                # the last micro-batch's tensors, `model_output_data` the
-                # predicted/target latents (eager path), and in graph mode
-                # `loss`/`detached_loss` reference cap_loss INSIDE the graph's
-                # private pool — one live tensor keeps its whole allocator
-                # segment resident even after release()+empty_cache. Unbind them
-                # before releasing (plain assignment: safe whether or not the
-                # names are bound yet on the first epoch).
-                batch = None
-                model_output_data = None
-                prior_model_output_data = None
-                prior_model_prediction = None
-                loss = None
-                detached_loss = None
-                accumulated_loss = accumulated_loss.item() \
-                    if torch.is_tensor(accumulated_loss) else accumulated_loss
                 _v2e = getattr(self.model, "concord_graph_v2", None)
                 if _v2e is not None:
                     _v2e.release()
-                torch_gc()
+                    torch_gc()
 
             #call start_next_epoch with only one process at first, because it might write to the cache. All subsequent processes can read in parallel:
             for _ in multi.master_first():
