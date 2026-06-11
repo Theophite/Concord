@@ -94,6 +94,24 @@ commits3 = drive(tuner3, sched1)          # same drop schedule
 check("3  band=None stays one-commit through a drop",
       tuner3.reprobes == 0 and len(commits3) == 1 and tuner3._baseline is None)
 
+# ---- 3b. watchdog arm delay: secular-relaxation drops inside the blackout are
+# ----     absorbed into the baseline; real drops after it fire normally ------
+def sched3b(t):
+    if t < 100:
+        return 0.40            # clean probe -> commit
+    if t < 500:
+        return 0.30            # secular fall INSIDE the blackout (telescope)
+    return 0.20                # real drop after the blackout
+sched3b.total = 700
+
+tuner3b = ppb.DissipationAutoTuner(mklayers(), probe_start=0, probe_end=30, table=TABLE,
+                                   probe_kappa=50.0, measure_every=10, verbose=False,
+                                   beta1_on=0.0, reprobe_band=0.02, watchdog_min_t=300)
+commits3b = drive(tuner3b, sched3b)
+check("3b blackout drop absorbed; post-blackout drop re-probes once",
+      tuner3b.reprobes == 1 and len(commits3b) == 2 and commits3b[1][0] > 500,
+      f"reprobes={tuner3b.reprobes} commits={commits3b}")
+
 # ---- 4. config plumb-through ------------------------------------------------
 sys.path.insert(0, str(OT / "modules" / "util" / "optimizer"))
 from concord_ot import make_concord_config

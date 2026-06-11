@@ -231,7 +231,11 @@ class ConcordController:
             probe_kappa=self.config.gf_consol,
             beta1_on=self.config.autotune_beta1_on,
             beta1_coh_threshold=self.config.autotune_beta1_coh,
-            reprobe_band=self.config.autotune_reprobe_band)
+            reprobe_band=self.config.autotune_reprobe_band,
+            # arm the watchdog only after the telescope has fully settled
+            # (~3 time constants) -- before that the meter falls secularly
+            # and every windowed mean reads as a "drop"
+            watchdog_min_t=3 * telescope)
 
     # gamma-SNR modulation cap: lam_t = lr*kappa_t never exceeds this (half the
     # lam < 2 linear-stability ceiling), whatever the batch's SNR draw.

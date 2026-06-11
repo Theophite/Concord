@@ -2890,7 +2890,7 @@ class DissipationAutoTuner:
     def __init__(self, layers, probe_start, probe_end, table,
                  probe_kappa=50.0, measure_every=10, verbose=True,
                  beta1_on=0.1, beta1_coh_threshold=0.35,
-                 reprobe_band=None, reprobe_beta=0.7):
+                 reprobe_band=None, reprobe_beta=0.7, watchdog_min_t=0):
         assert probe_end > probe_start >= 0
         assert all(c1 > c2 for (c1, _), (c2, _) in zip(table, table[1:])), \
             "table coh values must be strictly descending"
@@ -2919,6 +2919,15 @@ class DissipationAutoTuner:
         # failure, exp 11b/c.)
         self.reprobe_band = None if reprobe_band is None else float(reprobe_band)
         self.reprobe_beta = float(reprobe_beta)
+        # Watchdog arm delay: the hold-mode baseline neither forms nor fires
+        # before this step. The meter's level falls SECULARLY while the
+        # telescope anchor fills (leak 2*alpha_v_fast, tau ~ 500 steps) -- a
+        # baseline formed on the relaxation tail reads the decline as a
+        # coherence drop and re-probes spuriously (observed live: re-probe at
+        # ~step 1245 chasing the relaxation curve). Trade-off, documented: a
+        # REAL noise arrival during the blackout is absorbed into the
+        # post-blackout baseline and missed; arrivals after it fire normally.
+        self.watchdog_min_t = int(watchdog_min_t)
         self._probe_len = self.probe_end - self.probe_start
         self._baseline = None
         self._hold = []
@@ -2946,6 +2955,8 @@ class DissipationAutoTuner:
         Returns the committed kappa once, at t == probe_end; else None."""
         if self.committed is not None:
             if self.reprobe_band is None:
+                return None
+            if t < self.watchdog_min_t:
                 return None
             if (t - self.probe_end) % self.measure_every == 0:
                 vals = [measure_coherence(m) for m in self.layers]
