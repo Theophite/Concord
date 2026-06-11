@@ -1,0 +1,44 @@
+diff --git a/modules/trainer/GenericTrainer.py b/modules/trainer/GenericTrainer.py
+index ec1346c..78e9f56 100644
+--- a/modules/trainer/GenericTrainer.py
++++ b/modules/trainer/GenericTrainer.py
+@@ -361,6 +361,13 @@ class GenericTrainer(BaseTrainer):
+                 ema_applied = False,
+             )
+ 
++        # Return the sampler's dead heap to the driver BEFORE setup_train_device recommits
++        # the UNet to dedicated VRAM. With the gc after the move-back (the old order), the
++        # driver briefly saw sampler leftovers + the returning UNet, tipped past the VRAM
++        # ceiling by a sliver, and WDDM demoted the last fraction of the recommit to shared
++        # memory -- silently, stickily (no promotion path), so training crawled afterward.
++        self._graphmem("post-sample")
++        torch_gc()
+         self.model_setup.setup_train_device(self.model, self.config)
+         # Special case for schedule-free optimizers.
+         if self.config.optimizer.optimizer.is_schedule_free:
+@@ -368,6 +375,7 @@ class GenericTrainer(BaseTrainer):
+             self.model.optimizer.train()
+ 
+         torch_gc()
++        self._graphmem("post-restore")
+ 
+         # Concord v2 checkpoint-restart (Windows): the post-sample graph recapture wedges because
+         # sampling fragments the VRAM heap irreversibly -- empty_cache/reset/defrag cannot reclaim
+@@ -521,6 +529,9 @@ class GenericTrainer(BaseTrainer):
+             if self.config.rolling_backup:
+                 self.__prune_backups(self.config.rolling_backup_count)
+ 
++        # Same recommit-ordering discipline as the sample path: empty the heap before
++        # setup_train_device recommits the UNet, or WDDM can demote the tail to shared memory.
++        torch_gc()
+         self.model_setup.setup_train_device(self.model, self.config)
+         # Special case for schedule-free optimizers.
+         if self.config.optimizer.optimizer.is_schedule_free:
+@@ -528,6 +539,7 @@ class GenericTrainer(BaseTrainer):
+             self.model.optimizer.train()
+ 
+         torch_gc()
++        self._graphmem("post-backup-restore")
+ 
+     def __save(self, train_progress: TrainProgress, print_msg: bool = True, print_cb: Callable[[str], None] = print):
+         torch_gc()

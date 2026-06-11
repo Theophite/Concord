@@ -136,7 +136,18 @@ gradient. Graph-capturable (static shapes); Conv2d flattens to 2D for NS, standa
 Muon practice. Full implementation design — kernel diff, NS pass placement, graph
 story, cost model, build order: [`MUON_IMPLEMENTATION.md`](MUON_IMPLEMENTATION.md).
 
-## 8. Adoption gates
+## 8. Regime caveat from exp 10
+
+The 80-epoch augmentation ablation adds one boundary: in an *extended* noisy grind
+with **no data diversity** (80ep, 30% noise, no augmentation), the v̂ drive with
+near-ceiling friction defends better than the NS drive at matched lr·κ (90.0/12.6%
+memorized vs 86.3/47.8%) — spectral democratization keeps re-funding wrong-label
+directions over long horizons. With augmentation (any realistic diet), the NS drive
+wins every cell, including the campaign-best 96.31 at 30% noise. NS stays the default
+where data diversity exists; the static-tiny-noisy-long corner belongs to v̂ + heavy
+friction. κ\* is horizon-dependent on top of drive-dependent (exp 10 §5).
+
+## 9. Adoption gates
 
 In order: (1) the same-seed nanoGPT A/B — NS drive vs v̂ drive at each one's κ\*/lr\*,
 deployed-sv the metric (the bench where native Muon previously lost; the cascade may
@@ -146,7 +157,7 @@ lr\* shift together). Native Muon's clean-protocol showing (95.40, lr unswept) m
 the remaining headroom a pre-NS gradient EMA might buy — the one piece of state this
 design refuses to purchase.
 
-## 9. Gate 1 verdict: the nanoGPT A/B (2026-06-09) — not passed
+## 10. Gate 1 verdict: the nanoGPT A/B (2026-06-09) — not passed
 
 The drive is implemented (package + notebook bench; `ns5` bit-exact vs the exp-9
 reference, CUDA smoke + determinism green on triton 3.1/3.5) and the same-seed
@@ -198,7 +209,7 @@ remaining headroom marked in §8 — a pre-NS gradient EMA, the one state this
 design refused to buy — is now the obvious next experiment, since the failure
 is late-phase noise in the NS *input*, precisely what an input EMA filters.
 
-## 10. Post-gate probes (2026-06-09) — investigation paused, drive stays opt-in
+## 11. Post-gate probes (2026-06-09) — investigation paused, drive stays opt-in
 
 Two follow-ups on the gate-1 failure mode, both bench-probed same-seed before
 pausing the line of inquiry:
@@ -232,9 +243,9 @@ it loses specifically on emergent-low-rank regimes like char-LM. If the line
 reopens, the two designs the evidence points at: **annealed rank restriction**
 (full NS5 early → tighten toward the measured rank as structure emerges, the
 ratio-floor idiom applied spectrally — `wiener` mode is the adaptive
-endpoint, implemented and unrun) and the §8 pre-NS gradient EMA.
+endpoint, implemented and unrun) and the §9 pre-NS gradient EMA.
 
-## 11. Reopen note (2026-06-10): muon wants a MUCH higher dissipation λ
+## 12. Reopen note (2026-06-10): muon wants a MUCH higher dissipation λ
 
 Dimensionless-dissipation reframing of the gate-1 verdict. The friction
 update is u ← u·(1 − λ·(1−coh)) with λ = lr·κ; in steady state the drained
@@ -281,7 +292,7 @@ oracle κ at every noise level (largest where v̂ needs κ most: ρ45% 90.64 vs
 small-λ end of a near-uniform tax, not under-damping. The GPU bench above is
 NOT worth running as specced. The surviving reopen point is a SPECTRAL gate
 — coherence in the singular basis — which addresses both this meter-blindness
-and §10's emergent-rank starvation. Full table:
+and §11's emergent-rank starvation. Full table:
 experiments/cpu_dynamics/EXPERIMENTS.md exp 12.
 
 **Addendum (exp 13, same day): the zero-cost spectral gate is also refuted.**
@@ -321,7 +332,7 @@ in deploy MSE on a short synthetic — the rank-deficiency failure is an
 emergent-rank/long-horizon phenomenon (gate 1), as observed. One candidate
 left standing, unrun: PRE-NS v̂ scaling (orthogonalize the SNR-scaled
 gradient — NS re-whitens magnitudes but its preserved dominant subspace
-shifts toward signal; cousin of the §8 pre-NS EMA).
+shifts toward signal; cousin of the §9 pre-NS EMA).
 
 **Addendum 3 (exp 15, same day): pre-NS v̂ scaling is erased by NS — the
 line closes.** Identical leak to plain muon on the rank-4 synthetic (37/43%

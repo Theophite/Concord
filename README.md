@@ -48,7 +48,7 @@ project's reason to exist.
 | where | what |
 |---|---|
 | [`concord/`](concord/) | **the canonical package** — `packed_b.py` is the optimizer: layers, Triton kernels, coherence meter, dissipation autotuner |
-| [`docs/`](docs/) | [`SDXL_WINNER_REPORT.md`](docs/SDXL_WINNER_REPORT.md) (what it is) → [`HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md) (mechanism deep-dive) → [`RESULTS.md`](docs/RESULTS.md) (measured dynamics & autotuning) → [`INSTALL_SDXL.md`](docs/INSTALL_SDXL.md) (porting into the fork) → [`BIBLIOGRAPHY.md`](docs/BIBLIOGRAPHY.md) (relation to prior work) → [`MUON_DRIVE.md`](docs/MUON_DRIVE.md) (spectral preconditioning from the packed state) |
+| [`docs/`](docs/) | [`SDXL_WINNER_REPORT.md`](docs/SDXL_WINNER_REPORT.md) (what it is) → [`HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md) (mechanism deep-dive) → [`RESULTS.md`](docs/RESULTS.md) (measured dynamics & autotuning) → [`INSTALL_SDXL.md`](docs/INSTALL_SDXL.md) (porting into the fork) → [`BIBLIOGRAPHY.md`](docs/BIBLIOGRAPHY.md) (relation to prior work) → [`MUON_DRIVE.md`](docs/MUON_DRIVE.md) (spectral preconditioning from the packed state) → [`MIXUP.md`](docs/MIXUP.md) (the noise model that generalizes augmentation) |
 | [`WINNING_CONFIG.md`](WINNING_CONFIG.md) | the validated configuration, exact, with provenance |
 | [`experiments/cpu_dynamics/`](experiments/cpu_dynamics/) | active CPU experiment suite: reference implementation of the update rule, exps 1–8, parity tests, lab log |
 | [`dist/concord_winner/`](dist/concord_winner/) | frozen snapshot of the distilled winner (bug fixes synced in; no new features) |

@@ -243,8 +243,22 @@ measured. Full write-up: [`MUON_DRIVE.md`](MUON_DRIVE.md); lab log: exps 9/9b/9c
   generalizing drift from memorizing drift; only the friction level manages that
   tradeoff. Any consumer of coh (β1 above all) inherits this.
 
+**Post-synthesis addendum (exps 13–14b)**: the matched-F gate ablation — never run
+before, on any bench — found the gate's friction-exemption net-negative wherever
+labels can be wrong (−2.8 at 10% noise, −6.3 at 30% no-aug) and positive only on
+clean data under high friction (+0.5); κ\* ≠ 0 even on clean data at long horizons
+(friction is general anti-overfit). The gate's meter role is unaffected. Lab log
+exp 19b; **add the matched-F gate ablation to the bench A/B as the top-priority
+cell** — LM's real-Bayes-error noise is incoherent by nature and may be where the
+exemption genuinely pays.
+
 Adoption path, in order: (1) same-seed nanoGPT A/B of the C\* rescale in the real
-harness, with a small κ sweep (the consumers were tuned around the dull meter);
+harness, with a small κ sweep (the consumers were tuned around the dull meter) — **and
+an upward lr sweep**: the campaign's optima sat ~10× above AdamW's, which is the
+Polyak–Ruppert prediction (shipping the consolidation-window average licenses
+lr ≈ window × AdamW's; window = 1/(α·gc) ≈ 10–30), and the validated 5e-4 was never
+swept upward — the headline 1.4967 may be lr-handicapped exactly as exp 9's Muon
+numbers were before exp 9c;
 (2) calibrate a probe table on the target task and A/B the autotuner against the fixed
 winner; (3) only then β1, behind the probe threshold. For the SDXL fork, additionally
 port κ to a device tensor so the tuner can operate under the Stage-3 captured graph.

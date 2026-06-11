@@ -465,6 +465,63 @@ NS.**
 4. Caveats: sweep is κ = 0 / clean only, 3 seeds, this protocol; the noisy-regime lr
    envelope (where κ > 0 re-enters) is unswept.
 
+## Exp 10 — 80 epochs + augmentation on the small set: the ablation (`exp10_aug_ablation.py`)
+
+4k subset, 80 epochs, pad-2 random-crop augmentation on the train subset only,
+aug × optimizer × regime, each arm at its best-known settings (3 seeds; same-seed arms
+see identical augmented streams). The v̂ noisy cells as originally specified **diverged
+— by our own law**: the spec combined v̂'s lr\* (1e-2) with its 25-ep κ\* (400),
+lr·κ = 4 > 2, exactly the exp-1 ceiling (the fork guard of `INSTALL_SDXL.md` §2 would
+have refused the config at startup). Repaired cells (lr·κ ≤ 1.5) marked †; the Muon
+noisy no-aug cell got the symmetric κ repair (its 25-ep κ\* = 100 was equally stale) ‡.
+
+**Clean:**
+
+| arm | 25ep no-aug (ref) | 80ep no-aug | 80ep + aug |
+|---|---|---|---|
+| AdamW | 92.78 | 93.49 | 96.60 |
+| Concord v̂ | 94.68 | 94.68 | 96.43 |
+| Concord NS | 96.07 | 94.75 | **97.58 ± 0.10** |
+| native Muon | 95.40 | 95.53 | 97.46 |
+
+**30% label noise** (memorized % in parens):
+
+| arm | 80ep no-aug | 80ep + aug |
+|---|---|---|
+| AdamW | 81.17 (86.1) | 95.06 (11.2) |
+| Concord v̂ † | **90.04 (12.6)** | 94.62 (10.3) |
+| Concord NS ‡ | 86.28 (47.8) | **96.31 ± 0.22 (10.6)** |
+| native Muon | 77.17 (100.0) | 86.89 (29.0) |
+
+† best of {lr 1e-3/κ 400, lr 1e-2/κ 150}; the no-aug winner is lr 1e-2/κ 150 (lr·κ = 1.5,
+near-ceiling friction). ‡ κ = 150 at lr 1e-2; the stale κ = 100 gave 78.86 (70.8%).
+
+Findings:
+
+1. **Augmentation dominates epochs.** The pure-compute control *hurt* the strong arms
+   on clean data (NS: 96.07 @ 25ep → 94.75 @ 80ep — classic small-set overfit; the
+   25-ep schedule was ending near the sweet spot), while aug + 80ep lifts every arm.
+   The NS drive reaches **97.58 from 4,000 examples** — approaching the full-data
+   no-aug MLP ballpark (~98–98.5).
+2. **Best noisy result of the campaign: NS + aug = 96.31 at 30% label noise** — only
+   1.3 below its own clean number. Cascade and augmentation compose: aug slows
+   memorization (each wrong label must be fit across 25 crop variants), the cascade
+   blocks what leaks through (10.6% memorized).
+3. **Augmentation alone does not rescue native Muon**: it breaks the 100%
+   memorization (→ 29%) but accuracy stops at 86.89 — nearly 10 points below the same
+   drive inside the cascade. Aug is a memorization *slower*; the cascade is a
+   memorization *barrier*; they are different mechanisms and they stack.
+4. **A real regime split for the drives**: in the *extended noisy grind without data
+   diversity*, v̂ + near-ceiling friction defends best (90.04/12.6% vs NS 86.28/47.8%
+   at matched lr·κ — spectral democratization keeps re-funding wrong-label directions
+   over a 3× longer horizon). With augmentation — i.e., any realistic training diet —
+   the NS drive wins everything. Drive choice is regime-dependent at the margin;
+   NS remains the default where data diversity exists.
+5. **κ\* depends on the horizon as well as the drive and the noise** (NS noisy κ\*:
+   100 @ 25ep → ≥150 @ 80ep): the autotune table is (drive, horizon, aug)-conditioned,
+   which is one more argument for probe-based tuning over static tables — and the
+   probe-then-commit design re-measures per run by construction.
+
 ## Exp 11 — computing the dissipation curve LIVE (`exp11_live_kappa.py`, `exp11d_reprobe.py`)
 
 Can κ be controlled live, instead of (or beyond) probe-then-commit? Four
@@ -505,7 +562,7 @@ conditions; its deviations belong to the watchdog. The calibration burden
 
 ## Exp 12 — the muon dissipation curve: high-λ gates, prediction refuted (`exp12_muon_lambda.py`)
 
-Tests MUON_DRIVE.md §11: λ* should scale with the drive's noise-energy
+Tests MUON_DRIVE.md §12: λ* should scale with the drive's noise-energy
 injection rate, so the NS5 drive (every singular direction written at equal
 magnitude) should want λ 10–100× above the v̂ winner — plausibly near the
 Wiener point λ=1. Exp-5 protocol exactly (4k×25ep, σ=0, fixed C*, seeds
@@ -565,7 +622,7 @@ What survives for the muon line: a SPECTRAL gate. The per-element meter is
 the wrong basis for a whitened drive; coherence measured in the singular
 basis (the `wiener` rank mode — implemented, unrun) would restore the
 contrast the evaporation needs, and is now the single reopen point that
-addresses both this result and the emergent-rank starvation of exp 10/§10.
+addresses both this result and the emergent-rank starvation of exp 10/§11.
 
 
 ## Exp 13 — the spectral gate inside Newton-Schulz: energy is not SNR (`exp13_spectral_gate.py`)
@@ -702,3 +759,233 @@ research program, not a patch; the muon line CLOSES here. Standing verdict:
 muon opt-in at λ≈0 for clean/high-rank tasks (where it beats v̂ outright —
 exp 12), v̂ + the element gate everywhere else; nothing about the winner
 configuration changes.
+
+## Exp 16 — fine lr ablation for the NS drive (`exp16_ns_lr.py`)
+
+4k × 25ep, κ = 0, σ off, deploy acc, 3 seeds; pad-2 random-crop aug off/on.
+
+| lr | 3e-3 | 5e-3 | 7e-3 | 1e-2 | 1.5e-2 | 2e-2 | 3e-2 | 5e-2 |
+|---|---|---|---|---|---|---|---|---|
+| no aug | 95.89 | 96.02 | **96.11 ± 0.08** | 96.07 | 95.57 | 95.45 | 95.38 | 95.27 |
+| aug | 97.30 | 97.37 | 97.43 | **97.51 ± 0.10** | 97.36 | 97.36 | 97.19 | 96.52 |
+
+1. **lr\* ≈ 7e-3–1e-2 in both conditions** (no-aug peak 7e-3, aug peak 1e-2 — the
+   coarse 9c grid's 1e-2 was already essentially at-peak). Augmentation nudges the
+   optimum slightly up and **widens the plateau**: under aug, everything in
+   [3e-3, 3e-2] — a full decade — is within 0.32 of the peak.
+2. **The NS drive is lr-insensitive across a decade**, now with a fine grid behind the
+   claim (±0.2% over [3e-3, 3e-2] under aug). Compare the v̂ drive (±1.0 swing over
+   the same span, 9c) and AdamW (collapse at high lr). For practitioners: any lr in
+   [5e-3, 2e-2] is within noise of optimal — precision lr tuning buys essentially
+   nothing on this drive.
+3. **25 epochs at lr\* under aug ≈ converged**: 97.51 here vs exp 10's 97.58 at 80
+   epochs — the extra 55 epochs bought +0.07. The compute-efficient recipe for this
+   protocol is 25ep + aug + lr 1e-2, and exp 10's headline number had no lr headroom
+   left in it.
+
+
+## Exp 16b — apportioning the lr flatness: native Muon on the same grid (`exp16b_native_lr.py`)
+
+Native Muon has the NS normalization and none of the cascade, so its fine-grid lr curve
+(same protocol as exp 16; live weights) splits the credit for the lr insensitivity:
+
+| lr | 3e-3 | 5e-3 | 7e-3 | 1e-2 | 1.5e-2 | 2e-2 | 3e-2 | 5e-2 |
+|---|---|---|---|---|---|---|---|---|
+| native, no aug | 93.89 | 93.18 | 93.07 | 93.10 | 93.24 | 92.96 | 93.15 | 92.68 |
+| native, aug | 96.56 | 95.43 | 94.71 | 93.81 | 91.54 | 87.48 | 70.89 | **29.20 ± 5.37** |
+| Concord-NS, aug (exp 16) | 97.30 | 97.37 | 97.43 | 97.51 | 97.36 | 97.36 | 97.19 | 96.52 |
+
+1. **The lr flatness belongs to the cascade, almost entirely.** Under augmentation,
+   native Muon collapses 67 points across one decade — the sharpest lr curve measured
+   in this campaign — while Concord-NS drifts 0.8 over the same span *with friction
+   off* (exp 16 was κ = 0). The pre-registered prediction ("flatter than v̂, sharper
+   than Concord-NS, ugly at 5e-2") was right on shape and wrong on attribution: it
+   credited NS normalization with most of the robustness; the data gives it to the
+   regulation.
+2. **Division of labor, now clean**: NS's spectral bound funds the *tail* robustness
+   (cap/trust-region deletion, exp 9c); the cascade — gate-throttled consolidation +
+   chase averaging + shipping `P` instead of the live endpoint — funds the *lr*
+   robustness. Constant-magnitude steps are exactly what spectral normalization
+   produces; without an averaging/regulating layer, the endpoint of that walk is
+   lr-critical, and augmentation (faster-rotating momentum) makes it worse, not
+   better.
+3. Native's lr\* sits at or below the grid edge (≤ 3e-3; exps 9/10 ran it at 1e-3,
+   which the curve retroactively justifies), so its earlier clean numbers were not
+   handicapped.
+4. Product implication: the lr-insensitivity does **not** transfer to bare NS
+   optimizers — it is a Concord-cascade property, i.e., a real differentiator rather
+   than inherited Muon credit.
+
+## Exp 17 — noise with the character of augmentation: the hierarchy test (`exp17_noise_character.py`)
+
+Arena: the exp-10 corner where augmentation mattered most (4k, 30% label noise, 80ep,
+NS drive, κ=150 @ lr 1e-2 — stale-high κ biases *against* the diversity arms, so the
+ordering is conservative). References on the books: none = 86.28 (47.8% mem),
+crop-aug = 96.31 (10.6% mem).
+
+| arm | level | deploy acc | memorized |
+|---|---|---|---|
+| none (ref) | — | 86.28 ± 0.77 | 47.8% |
+| iso, post-NS σ=0.6 | L0 | 86.79 ± 0.69 | 46.2% |
+| Σ_g-shaped, pre-NS | L1 | 87.20 ± 0.85 | 46.1% |
+| vicinal (chord jitter, labels fixed) | L2a | 89.14 ± 0.62 | 38.6% |
+| **mixup (chords + label interp.)** | L2b | **92.52 ± 0.35** | 25.8% |
+| small-batch (32) control | temp. | 89.56 ± 0.27 | **22.6%** |
+| crop-aug (ref) | L3 | **96.31 ± 0.22** | 10.6% |
+
+The ladder is monotone in the hierarchy (L0 ≈ none < L1 < L2a < L2b < L3), with four
+refinements to the model:
+
+1. **Σ_g is nearly inert (+0.9), and the reason refines the theory**: its covariance is
+   right but its *support is static* — it re-injects directions already present in the
+   same 4k gradients every epoch (including the wrong-label directions themselves!),
+   so it adds no per-visit decorrelation beyond what SGD already provides. The
+   operative augmentation property is not the covariance; it is **fresh support beyond
+   the empirical points, resampled per visit**. (This also retro-explains the original
+   nanoGPT ablation's isotropic ≥ Σ_g verdict more deeply than "BN-mediated.")
+2. **Label interpolation is load-bearing at Level 2**: chord geometry alone (vicinal)
+   buys +2.9; adding target mixing (mixup) buys +6.2 — under label noise, mixing
+   dilutes every wrong label so the model is never trained on a pure corrupted target.
+   Level 2 splits into L2a (vicinity) and L2b (vicinity + target dilution), and most
+   of the practical power is in the dilution.
+3. **The remaining gap to crop (+3.8 over mixup) is the on-manifold premium**: chords
+   between digits are off-manifold blends; shifts are on-manifold orbits. Domain
+   knowledge buys exactly that.
+4. **Small batch is a different axis, not a rung**: temperature, not information. It
+   suppresses memorization hardest of all injectables (22.6%) but converts little of
+   it into accuracy (89.56) — more SGD noise blurs signal and noise alike, where
+   diversity arms replace noise-fitting with signal.
+
+Refined principle: *the character of augmentation = per-visit-decorrelated vicinity
+with support beyond the empirical sample, ideally on-manifold, plus target dilution
+where labels can be wrong.* Predicted next rung (untested): k-NN/local-PCA-directed
+jitter — on-manifold chords — should land between mixup and crop without domain
+knowledge. For label-free domains (diffusion), the mixup analogue is target-space
+mixing, not class interpolation.
+
+## Exp 18 — the telescope window in epoch units (`exp18_telescope_window.py`)
+
+α_v had never been swept (0.001 in every experiment and, per the records, the repo's
+history) — an *absolute* 500-step window meaning 16 epochs on this protocol and a
+quarter-epoch on a 2k-image bs1 SDXL run. Sweep: window = 1/(2·α_v) in epoch units,
+80ep protocol, NS drive, lr 1e-2, κ: clean 0 / 30%-noise 150 (κ not retuned per
+window — caveat), 3 seeds. Boundary cells and a gate-closure control added after the
+grid optimum landed on the edge.
+
+| window (ep) | clean deploy | noisy deploy | noisy memorized | noisy late coh |
+|---|---|---|---|---|
+| 1 | 94.58 | **80.21 ± 0.93** | **72.5%** | 0.296 |
+| 4 | 94.80 | 82.52 | 64.1% | 0.282 |
+| 16 (historical) | 94.85 | 86.68 | 48.2% | 0.246 |
+| 64 | 94.73 | 91.29 | 31.5% | 0.166 |
+| 256 | — | 92.50 | 27.2% | 0.101 |
+| 1024 | — | 92.40 | 25.9% | 0.074 |
+| 4096 | — | 92.56 | 26.0% | 0.063 |
+| **control: gate closed (C\*=0), same F** | — | **92.56 ± 0.36** | **25.8%** | 0 |
+
+1. **The control collapses the mechanism.** The long-window plateau is *exactly* the
+   gateless limit — at 256+ epoch windows the gate is nearly shut (coh 0.06–0.10) and
+   the residual telescope signal adds nothing. The initially attractive
+   "temporal-prior / early-phase-anchoring" interpretation is **not supported**: the
+   monotone improvement from 1 → 64 epochs is progressively *less gate-approval of
+   memorization drift*, and the asymptote is no approval at all.
+2. **Short windows are actively dangerous under noise**: at a 1-epoch window the gate
+   re-anchors on the most recent motion — including the memorization phase — and
+   exempts it from friction: 72.5% memorized at the very same F that achieves 25.8%
+   with the gate shut. **The window is the gate's trust timescale**: short = trusts
+   the present; long = trusts almost nothing.
+3. **Regime conclusion, consistent with exps 10/12**: in the heavy-memorization,
+   no-diversity corner the gate is a liability (its blind spot is the regime's
+   dominant failure), and the optimum is strong *ungated* friction — reachable either
+   by window → ∞ or directly by closing the gate. 92.56/25.8% **ties** (does not beat —
+   an earlier draft of this entry miscredited it) the standing no-aug record, exp 17's
+   mixup at 92.52/25.8%: two unrelated mechanisms — ungated weight-space friction
+   (= EMA-teacher distillation, per the κ-identity) and data-space target dilution —
+   converging on the same number, both 3.8 below crop-aug + *gated* cascade (96.31). In the regimes the product targets (real data diversity), the gated
+   arms have consistently won — the conclusion is not "delete the gate" but "gate
+   trust is a regime knob, and the noisy-static corner wants it at zero."
+4. **Clean regime: window-insensitive** (94.6–94.9 across 64×; mild dip only at 1ep) —
+   one more entry in the cascade's insensitivity ledger.
+5. **Parametrization stands regardless of mechanism**: α_v belongs in epoch units,
+   derived per-run like `total_steps` (the current absolute constant silently spans
+   ¼-epoch to 16-epoch windows across real regimes), and the SDXL fork's ¼-epoch
+   window sits on the *dangerous* short side for memorization-pressured fine-tunes.
+   The telescope amplitude grew sublinearly (|d|max ×30 over a ×64 window range, no
+   int8 pressure at these scales).
+
+
+### Exp 18 addendum — do the two 92.5s stack? (suppression bound)
+
+| arm (30% noise, 80ep, no crop-aug) | deploy | memorized |
+|---|---|---|
+| gateless friction F=1.5 alone | 92.56 ± 0.36 | 25.8% |
+| mixup, gated, F=1.5 | 92.52 ± 0.35 | 25.8% |
+| **gateless F=1.5 + mixup** | **93.15 ± 0.10** | **18.0%** |
+| gateless F=0.5 + mixup | 87.35 ± 0.89 | 74.2% |
+| crop-aug + gated (exp 10 ref) | **96.31 ± 0.22** | 10.6% |
+
+1. **Mostly the same 92.5**: stacking buys only +0.6 accuracy (though memorization
+   composes better, 25.8 → 18.0). Consistent with a **suppression bound**: friction
+   and dilution can stop wrong labels from being fitted but cannot recover the
+   information the corrupted 30% would have carried — while crops *add* information
+   (orbit structure) and raise the ceiling itself. Optimizer-side and loss-side
+   defenses plateau ~92.5–93.2 in this corner; the data-side fix reaches 96.3 — and
+   does so with the gate ON, because augmentation repairs the coherence signal the
+   gate needs.
+2. **Friction is load-bearing, mixup is an adjuvant**: at F=0.5 ungated, mixup alone
+   collapses (74.2% memorized) — dilution *slows* memorization per step but over 80
+   epochs the diluted wrong labels still get fitted unless friction deletes the drift.
+   Exp 17's mixup number was partly riding on its F=1.5.
+3. Standing conclusion for the corner: best-known no-aug = gateless F=1.5 + mixup
+   (93.15); best-known overall = restore data diversity and keep the gate (96.31).
+
+## Exp 19 — augmentation × long horizon (`exp19_aug_long.py`)
+
+160ep (2× exp 10), 30% noise + crop-aug, NS drive, lr 1e-2, F=1.5, 3 seeds. The
+pre-registered prediction (with aug repairing the coherence signal, the gated default
+should beat the corner's gate-disabled winners) **failed**:
+
+| arm (noisy+aug, 160ep) | deploy | memorized |
+|---|---|---|
+| gated, default window | 95.88 ± 0.23 | 11.2% |
+| long window (64ep) | 96.07 ± 0.37 | 10.9% |
+| **gateless F=1.5** | **96.26 ± 0.06** | 10.7% |
+| full stack (crop+mixup+gated) | 96.10 ± 0.36 | 10.5% |
+| clean+aug gated (ceiling) | 97.54 ± 0.10 | — |
+
+Longer horizon helped nothing (80ep was already past optimum; clean flat at 97.54),
+eroded the gated arm most (−0.43; aug decorrelates pixel-keyed memorization but a
+wrong label still pushes a coherent class-level direction across crops, which the
+gate slowly approves), and mixup is redundant once crops are present.
+
+### Exp 19b — the gate ablation at matched F (the missing cells)
+
+Every prior κ sweep confounded gate with friction. Measured exemption value at
+matched F:
+
+| regime | gated | gateless | gate Δ |
+|---|---|---|---|
+| clean, F=1.5, 80ep | **96.25 ± 0.06** | 95.74 ± 0.02 | **+0.51** |
+| 10% noise, F=1.0, 80ep | 92.07 (40.1%) | **94.85 ± 0.15 (22.1%)** | **−2.78** |
+| 30% noise no-aug, F=1.5 (exp 18) | 86.28 (47.8%) | 92.56 (25.8%) | −6.28 |
+| 30% noise + aug, F=1.5, 80ep | 96.31 (10.6%) | 96.15 (10.2%) | +0.16 |
+| 30% + aug, 160ep (exp 19) | 95.88 | 96.26 | −0.38 |
+
+1. **The "mild-noise home turf" hypothesis is inverted**: at 10% noise the exemption
+   posts its worst score — few wrong labels, but perfectly coherent drift, exempted
+   from friction (memorization 40% vs 22%). Coherent wrong-label drift is the typical
+   case at every noise level; **the exemption is net-negative wherever labels can be
+   wrong**.
+2. **The gate's one clear win is clean data under high friction** (+0.51) — and that
+   cell also revises exp 5: clean gated F=1.5 @ 80ep (96.25) ≫ clean κ=0 @ 80ep
+   (94.85). **κ\* ≠ 0 on clean data at long horizons** — friction is a general
+   anti-overfit regularizer; the horizon-dependence of κ\* (exps 5/10/13) reduces to
+   this.
+3. **Scope caveat, load-bearing**: all cells are the label-corruption family
+   (adversarially coherent noise). The LM/diffusion regimes have real Bayes error —
+   incoherent by nature — and the original nanoGPT validation never gate-ablated at
+   matched F either (the "split" = gate+friction vs neither). **The matched-F gate
+   ablation is now the top-priority cell for the GPU bench.** The gate's *meter* role
+   (the probe; exp 6) is unaffected — only the exemption is in question.
+4. Design implication: split the roles — keep the meter; make the exemption a
+   probe-committed dial (0 = gateless … 1 = full), alongside F and β1.

@@ -13,6 +13,15 @@ Reference implementations all live on this branch in `concord/packed_b.py`
 (search markers given below); the evidence is in [`RESULTS.md`](RESULTS.md) and
 [`experiments/cpu_dynamics/EXPERIMENTS.md`](../experiments/cpu_dynamics/EXPERIMENTS.md).
 
+**Ready-made patch**: [`patches/0001-concord-integration-cstar-tuner-guard.patch`](../patches/0001-concord-integration-cstar-tuner-guard.patch)
+applies all of §1–§3 onto `concord-integration` at `d62931b` (`git apply` from the fork
+root; verified to apply cleanly and all touched files compile). It includes the
+F-units autotuner (`autotune_table_in_F=True`: the table is dimensionless F = lr·κ,
+`probe` converts the configured `gf_consol` via F = κ·lr so default behavior is
+unchanged until a table is passed). The manual steps below remain the reference for
+review or for applying onto a moved branch tip. Machine-level runbook (from a clean
+clone to verified install, Windows/Git Bash): [`INSTALL_LOCAL.md`](INSTALL_LOCAL.md).
+
 ---
 
 ## 1. The C\* fix (the bug)
@@ -147,6 +156,22 @@ The table maps *probe-window coherence* → κ for **your** task/architecture/sc
    400}) to the deployed-metric optimum — this is the exp-5 procedure.
 3. Table = [(coh_i, κ\*_i)] sorted by descending coherence. Expect the same *shape* as
    the CPU result (κ\* rising with incoherence, then plateauing), not the same numbers.
+
+**Calibrate in F = lr·κ, not κ.** κ is defined per unit lr, so the dimensionless
+friction F = lr·κ is the real knob: F·(1−coh) is the per-step velocity decay (and, via
+the κ-identity in `MIXUP.md` §6, the per-step self-distillation weight toward the EMA
+teacher), F(1−coh)/(α·gc) the deleted-vs-consolidated split, F < 2 the stability
+ceiling. Reference points from the campaign: MNIST heavy-memorization optimum
+F ≈ 1.0–1.5; nanoGPT validated winner F = 0.025; **the current SDXL preset runs
+F = 0.00375 — near-frictionless in these units**, while diffusion fine-tuning (noisy
+ε/t-sampled gradients, small datasets, many steps) is plausibly the heaviest-
+memorization regime Concord faces, and the field's reliance on aggressive weight-EMA is
+independent evidence it wants a strong pull toward the average. Sweep
+F ∈ {0.004, 0.025, 0.1, 0.5, 1.0}. Committing F (not κ) also keeps the friction sweep
+orthogonal to any upward lr sweep — and the package tuner supports it natively:
+`DissipationAutoTuner(..., peak_lr=lr)` interprets the table and `probe_kappa` in F
+units and derives raw `gf_consol` itself. (The C\* calibration survives high F: at the
+pure-drift fixed point coh → 1 and the friction term self-vanishes.)
 
 β1 selection (`beta1_on=0.1, beta1_coh_threshold=...`) rides the same probe; set the
 threshold between your cleanest and next quality level's probe coherence, or pass
