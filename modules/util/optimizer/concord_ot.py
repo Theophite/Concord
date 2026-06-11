@@ -196,23 +196,33 @@ class ConcordController:
         # for this run instead of committing garbage (the configured base
         # kappa/dissipation then holds end-to-end).
         transient = int(2.0 / max(self.config.alpha, 1e-6))
-        min_start = max(int(self.config.warmup), transient)
+        # The meter's "signal" is C*(S - A), and the anchor fills at the leak
+        # rate 2*alpha_v_fast (time constant ~500 steps at the winner 0.001).
+        # Before ~1 time constant, d_sv is dominated by UN-LEAKED INIT WEIGHT,
+        # not learned drift — the probe then reads init residue (~0.5 coh on
+        # SDXL, observed) regardless of data quality. A probe is only
+        # data-calibrated once the telescope has relaxed.
+        telescope = int(0.5 / max(self.config.alpha_v_fast, 1e-9))
+        min_start = max(int(self.config.warmup), transient, telescope)
         if probe_start < min_start:
             window = probe_end - probe_start
             probe_start = min_start
             probe_end = probe_start + window
             if probe_end > self.total_steps // 2:
                 print(f"[concord] autotune DISABLED for this run: a clean probe "
-                      f"window ({window} steps past warmup={self.config.warmup}/"
-                      f"transient~{transient}) does not fit in the first half of "
-                      f"{self.total_steps} steps. The configured kappa "
-                      f"(gf_consol={self.config.gf_consol:.0f}) holds end-to-end. "
-                      f"Lengthen the run to re-enable autotuning.")
+                      f"window ({window} steps past warmup={self.config.warmup}, "
+                      f"the ~{transient}-step init transient, and the "
+                      f"~{telescope}-step telescope relaxation) does not fit in "
+                      f"the first half of {self.total_steps} steps. The "
+                      f"configured kappa (gf_consol={self.config.gf_consol:.0f}) "
+                      f"holds end-to-end. Lengthen the run to re-enable "
+                      f"autotuning.")
                 self.autotuner = None
                 return
             print(f"[concord] autotune probe deferred to [{probe_start},{probe_end}) "
                   f"to clear warmup ({self.config.warmup}) / the ~{transient}-step "
-                  f"init transient (the meter reads ~0 inside them).")
+                  f"init transient / the ~{telescope}-step telescope relaxation "
+                  f"(the meter reads init residue, not data, before they pass).")
         self.autotuner = DissipationAutoTuner(
             self.layers,
             probe_start=probe_start,

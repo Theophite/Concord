@@ -142,30 +142,31 @@ except ValueError as e:
 
 # ---- 6b/6c. probe placement: auto-defer past warmup/transient; disable when
 # ----        a clean window cannot fit in the first half of the run ----------
-def probe_rig(total_steps, warmup=100, alpha=0.1):
+def probe_rig(total_steps, warmup=100, alpha=0.1, alpha_v_fast=0.001):
     return SimpleNamespace(config=SimpleNamespace(
         autotune_table=json.dumps([[0.387, 0.0], [0.256, 0.3]]),
         dissipation=0.1, lr=lr, gf_consol=1333.0, alpha=alpha, warmup=warmup,
+        alpha_v_fast=alpha_v_fast,
         autotune_beta1_on=0.0, autotune_beta1_coh=0.35,
         autotune_reprobe_band=None), total_steps=total_steps,
         layers=[SimpleNamespace(gf_consol=None, beta1=None)],
         _autotune_pending=True, autotuner=None)
 
-rig = probe_rig(1178)          # the reported run: 4% = 47 < warmup 100
+rig = probe_rig(1178)          # the reported run: 4% = 47; telescope floor 500
 ConcordController._build_autotuner(rig)
-check("6b short-run probe auto-defers past warmup (47 -> 100)",
-      rig.autotuner is not None and rig.autotuner.probe_start == 100
-      and rig.autotuner.probe_end == 170,
+check("6b probe auto-defers past the telescope relaxation (47 -> 500)",
+      rig.autotuner is not None and rig.autotuner.probe_start == 500
+      and rig.autotuner.probe_end == 570,
       f"window=[{getattr(rig.autotuner, 'probe_start', None)},"
       f"{getattr(rig.autotuner, 'probe_end', None)})")
-rig = probe_rig(220)           # deferred window [100,113) > 110 = half the run
+rig = probe_rig(220)           # deferred window cannot fit in the first half
 ConcordController._build_autotuner(rig)
 check("6c too-short run disables the tuner instead of mis-committing",
       rig.autotuner is None)
-rig = probe_rig(5000)          # 4% = 200 >= warmup: untouched window
+rig = probe_rig(20000)         # 4% = 800 >= all floors: untouched window
 ConcordController._build_autotuner(rig)
 check("6d long-run window untouched",
-      rig.autotuner.probe_start == 200 and rig.autotuner.probe_end == 500)
+      rig.autotuner.probe_start == 800 and rig.autotuner.probe_end == 2000)
 
 # ---- 7. shipped GUI defaults are sane: dimensionless mode on, table in lam
 # ----    units (descending coh, ceiling < 2), watchdog armed ----------------
