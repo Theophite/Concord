@@ -296,6 +296,28 @@ check("10c controller flips sign: deploy reads HIGHER than live",
 check("10d empty-layers path returns 0.0",
       ConcordController.read_memorization_gap(SimpleNamespace(layers=[])) == 0.0)
 
+# ---- 11. evap build threshold (hypothesis-infancy guard) --------------------
+def evap_with_build(lam, coh, d_fs, min_leak=0.1, build_min=128.0):
+    """Mirror of the kernel: evaporated amount on one element."""
+    frac = min(lam * (1.0 - coh), 1.0 - min_leak)
+    build_ok = 1.0 if abs(d_fs) >= build_min else 0.0
+    return frac * d_fs * build_ok
+
+check("11a sub-tick velocity is never dissipated (|u| < 128)",
+      evap_with_build(1.0, 0.0, 100.0) == 0.0
+      and evap_with_build(1.0, 0.0, -127.0) == 0.0)
+check("11b committable velocity dissipates normally (|u| >= 128)",
+      abs(evap_with_build(0.4, 0.0, 200.0) - 80.0) < 1e-9
+      and evap_with_build(1.0, 0.0, -130.0) == -130.0 * 0.9)
+check("11c build_min=0 is bit-exact legacy",
+      evap_with_build(0.4, 0.0, 1.0, build_min=0.0) == 0.4)
+check("11d module default and setter",
+      hasattr(ppb, "set_evap_build_min") and ppb._EVAP_BUILD_MIN == 128.0)
+cfg11 = make_concord_config(7.5e-5, SimpleNamespace(evap_build_min=64.0))
+check("11e pick-through", cfg11.evap_build_min == 64.0
+      and make_concord_config(7.5e-5, SimpleNamespace()).evap_build_min == 128.0)
+check("11f GUI default exposed", gui_concord_defaults()["evap_build_min"] == 128.0)
+
 print()
 ok = all(results)
 print(f"{'ALL PASS' if ok else 'FAILURES'} ({sum(results)}/{len(results)})")

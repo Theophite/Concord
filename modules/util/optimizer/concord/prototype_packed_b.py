@@ -646,6 +646,9 @@ def _apply_packed_adamw_kernel(
     min_leak,            # fp32: servo floor -- minimum per-step survival fraction of the
                           # accumulated s_fast under the gf evaporation (the valve must
                           # never fully shut; see the evap clamp below)
+    evap_build_min,      # fp32: hypothesis-infancy guard -- evaporation fires only where
+                          # |s_fast| >= this many mantissa units (128 = one s_slow LSB =
+                          # one deploy tick = first committable size). 0 = legacy.
     gate_gain,           # fp32: scalar cosine schedule on the commitment gate
     chase_floor_ptr,     # *fp32[1]: ratio-coh fast->slow floor (DEVICE TENSOR so the per-step
     leak_floor_ptr,      # *fp32[1]: ratio-coh slow->v_slow floor   schedule survives CUDA-graph
@@ -848,7 +851,12 @@ def _apply_packed_adamw_kernel(
         # sign-flip ringing and the lam = 2 hard instability (the survival
         # factor stays in [min_leak, 1]).
         evap_frac = tl.minimum(lr * gf_consol * (1.0 - coh), 1.0 - min_leak)
-        evap_mantissa = evap_frac * d_fs * g_active
+        # Hypothesis-infancy guard: no dissipation below the first committable
+        # size (one s_slow LSB). Sub-tick mass is invisible at deploy, so
+        # friction there only kills nascent hypotheses the meter cannot yet
+        # judge. evap_build_min = 0 -> all pass (bit-exact legacy).
+        build_ok = (tl.abs(d_fs) >= evap_build_min).to(tl.float32)
+        evap_mantissa = evap_frac * d_fs * g_active * build_ok
     else:
         step_live = step_live + weight_decay * s_fast_in_w
         evap_mantissa = 0.0
@@ -1109,6 +1117,24 @@ _USE_FIXED_COH = True   # validated default: Wiener coh S/(S+noise^2). False=leg
 # passing through it). The floor keeps the servo alive. Per-run constant
 # (launch-time scalar, baked at CUDA-graph capture -- set at init only).
 _MIN_LEAK = 0.1
+
+# Evaporation build threshold (module global, set_evap_build_min): the
+# dissipation only fires on coordinates whose accumulated velocity |s_fast|
+# has reached this many MANTISSA units. 128 = one s_slow LSB = one
+# deploy-weight tick: the size where a hypothesis first becomes committable.
+# Below it the velocity is invisible at deploy by construction (rounds to
+# zero slow ticks), so friction there cannot protect the deploy weight --
+# it can only kill hypotheses in the cradle before the meter can judge them.
+# Noise random-walks up to the threshold, is judged and drained there, and
+# equilibrates below one deploy tick. 0 = legacy (dissipate at any size).
+# Composes with the lazy gate (idle-vs-active; this is building-vs-judged)
+# and the min-leak floor. Per-run constant, baked at CUDA-graph capture.
+_EVAP_BUILD_MIN = 128.0
+
+
+def set_evap_build_min(v):
+    global _EVAP_BUILD_MIN
+    _EVAP_BUILD_MIN = float(v)
 
 
 def set_min_leak(v):
@@ -1432,6 +1458,7 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         float(wd_sv), float(wd_sf), float(wd_anchor),
         float(gf_trust_delta_sq),
         float(_MIN_LEAK),
+        float(_EVAP_BUILD_MIN),
         float(_GATE_GAIN),
         _ratio_chase_floor_ptr,
         _ratio_leak_floor_ptr,

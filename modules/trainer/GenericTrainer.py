@@ -710,6 +710,7 @@ class GenericTrainer(BaseTrainer):
         lr_scheduler = None
         accumulated_loss = torch.tensor(0.0, device=train_device)
         ema_loss = None
+        ema_deploy = None
         ema_loss_steps = 0
         epochs = range(train_progress.epoch, self.config.epochs, 1)
 
@@ -984,11 +985,17 @@ class GenericTrainer(BaseTrainer):
                             _gap = None
                             if _ctrl is not None:
                                 _gap = _ctrl.read_memorization_gap()
+                                _deploy = accumulated_loss_cpu + _gap
+                                # the gap flickers at high lam (transient ~ noise), so the
+                                # readable deploy number is the EMA (same decay as smooth loss)
+                                ema_deploy = _deploy if ema_deploy is None else \
+                                    (ema_deploy * ema_loss_decay + _deploy * (1 - ema_loss_decay))
                                 self.tensorboard.add_scalar(
                                     "loss/concord_gap", _gap, train_progress.global_step)
                                 self.tensorboard.add_scalar(
-                                    "loss/deploy_est", accumulated_loss_cpu + _gap,
-                                    train_progress.global_step)
+                                    "loss/deploy_est", _deploy, train_progress.global_step)
+                                self.tensorboard.add_scalar(
+                                    "smooth_loss/deploy_est", ema_deploy, train_progress.global_step)
                             # Plain stdout loss line: the tqdm postfix is transient
                             # (overwritten in place, lost on redirect); this survives in
                             # console scrollback and piped logs. tqdm.write keeps the
@@ -998,7 +1005,7 @@ class GenericTrainer(BaseTrainer):
                                     f"  smooth={ema_loss:.5f}")
                             if _gap is not None:
                                 _msg += (f"  gap={_gap:+.2e}"
-                                         f"  deploy_est={accumulated_loss_cpu + _gap:.5f}")
+                                         f"  deploy_smooth={ema_deploy:.5f}")
                             step_tqdm.write(_msg)
 
                         accumulated_loss = 0.0

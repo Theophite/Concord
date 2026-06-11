@@ -98,6 +98,7 @@ class TrainOptimizerConfig(BaseConfig):
     step_cap: float
     gf_trust_delta_sq: float
     min_leak: float
+    evap_build_min: float
     weight_lr_power: float
     decoupled_decay: bool
     fixed_decay: bool
@@ -230,6 +231,7 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("step_cap", None, float, True))
         data.append(("gf_trust_delta_sq", None, float, True))
         data.append(("min_leak", None, float, True))
+        data.append(("evap_build_min", None, float, True))
         data.append(("weight_lr_power", None, float, True))
         data.append(("decoupled_decay", False, bool, False))
         data.append(("fixed_decay", False, bool, False))

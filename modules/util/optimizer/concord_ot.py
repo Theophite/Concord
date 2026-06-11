@@ -87,6 +87,7 @@ def make_concord_config(learning_rate: float, optimizer_config=None):
         step_cap=float(pick("step_cap", d.step_cap)),
         gf_trust_delta_sq=float(pick("gf_trust_delta_sq", d.gf_trust_delta_sq)),
         min_leak=float(pick("min_leak", d.min_leak)),
+        evap_build_min=float(pick("evap_build_min", d.evap_build_min)),
         autotune_table=pick("autotune_table", d.autotune_table),
         autotune_beta1_on=float(pick("autotune_beta1_on", d.autotune_beta1_on)),
         autotune_beta1_coh=float(pick("autotune_beta1_coh", d.autotune_beta1_coh)),
@@ -104,7 +105,7 @@ class ConcordController:
     def __init__(self, unet, device, learning_rate: float, total_steps: int, optimizer_config=None,
                  module_filters=None, text_encoder=None, te_lr=None, te_wd_anchor=0.5):
         from concord_winner import swap_unet_to_winner, GatedRebalance, swap_text_encoder_to_anchor, \
-            set_lazy_gate, set_lazy_thresh, set_min_leak
+            set_lazy_gate, set_lazy_thresh, set_min_leak, set_evap_build_min
         self.config = make_concord_config(learning_rate, optimizer_config)
         # Dimensionless dissipation: the physical friction knob is lam = lr*kappa
         # (u <- u - lr*kappa*(1-coh)*u). When `dissipation` is set it overrides
@@ -140,6 +141,8 @@ class ConcordController:
         # Servo min-leak floor: module global like the lazy gate (per-run constant,
         # baked at CUDA-graph capture). Guards the lam -> 1 regime from slam-shut.
         set_min_leak(self.config.min_leak)
+        # Hypothesis-infancy guard: no dissipation below one deploy tick.
+        set_evap_build_min(self.config.evap_build_min)
         # Dissipation autotuner (probe-then-commit), opt-in via optimizer.autotune_table.
         # Built LAZILY on the first before_step(): total_steps here is a placeholder —
         # the trainer finalizes the horizon at train start.
