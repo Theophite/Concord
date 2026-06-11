@@ -497,6 +497,7 @@ class TrainConfig(BaseConfig):
     dynamic_timestep_shifting: bool
     concord_epoch_cache_release: bool
     concord_sample_deploy: bool
+    concord_embedding_anchor: bool
     concord_antithetic_timesteps: bool
     concord_antithetic_noise: bool
     concord_antithetic_same_example: bool
@@ -1097,6 +1098,7 @@ class TrainConfig(BaseConfig):
         data.append(("resolution_aware_loss_weight", False, bool, False))
         data.append(("concord_epoch_cache_release", True, bool, False))
         data.append(("concord_sample_deploy", True, bool, False))
+        data.append(("concord_embedding_anchor", True, bool, False))
         data.append(("concord_antithetic_timesteps", False, bool, False))
         data.append(("concord_antithetic_noise", False, bool, False))
         data.append(("concord_antithetic_same_example", False, bool, False))

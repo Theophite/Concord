@@ -452,6 +452,46 @@ finally:
 check("15b bridge masks embedding s_fast and restores bit-exactly",
       bool((masked == (before & 0xFFFF)).all()) and bool((after == before).all()))
 
+# ---- 16. embedding anchor mode -----------------------------------------------
+from concord_embedding_packed import ConcordPackedEmbedding
+
+# CPU rig: the constructor/_resync paths launch the Triton materialize kernel
+# (GPU-only); it only refreshes the bf16 scratch and is irrelevant to the
+# bit-level assertions below -- no-op it for the test.
+_orig_resync = ppb.ConcordLinearPackedB._resync_weight_buf
+_orig_mat = ppb.materialize_packed_bf16
+ppb.ConcordLinearPackedB._resync_weight_buf = lambda self: None
+ppb.materialize_packed_bf16 = lambda *a, **k: k.get("out")
+
+def unpack(pw):
+    return (pw >> 16), ((pw << 16) >> 24), ((pw << 24) >> 24)   # s_fast, s_slow, v_slow
+
+torch.manual_seed(0)
+init_vec = torch.randn(2, 16) * 0.05
+emb_a = ConcordPackedEmbedding(2, 16, device="cpu", lr=1e-3, target_norm=0.5)
+emb_a.init_tokens(init=init_vec.clone(), anchor=True)
+sf, ss, vs = unpack(emb_a.core.packed_w)
+check("16a anchor mode: position lives in v_slow, s_slow empty",
+      int(ss.abs().sum()) == 0 and int(vs.abs().sum()) > 0)
+check("16b leak frozen and C* zeroed",
+      emb_a.core.alpha_v_fast == 0.0 and emb_a.core.drift_cancel_C == 0.0)
+dep = emb_a.deploy_weight().float()
+cos = torch.nn.functional.cosine_similarity(dep, init_vec, dim=1)
+check("16c deploy ~ init direction at the pinned norm",
+      bool((cos > 0.95).all()) and bool(((dep.norm(dim=1) - 0.5).abs() < 0.05).all()),
+      f"cos={cos.min():.3f} norms={dep.norm(dim=1).tolist()}")
+before = emb_a.core.packed_w.clone()
+emb_a._pin_norm(torch.arange(2))
+check("16d per-step pin is a no-op under anchor (no requant churn)",
+      bool((emb_a.core.packed_w == before).all()))
+emb_l = ConcordPackedEmbedding(2, 16, device="cpu", lr=1e-3, target_norm=0.5)
+emb_l.init_tokens(init=init_vec.clone(), anchor=False)
+sf2, ss2, vs2 = unpack(emb_l.core.packed_w)
+check("16e legacy mode unchanged: position in s_slow",
+      int(ss2.abs().sum()) > 0 and int(vs2.abs().sum()) == 0)
+ppb.ConcordLinearPackedB._resync_weight_buf = _orig_resync
+ppb.materialize_packed_bf16 = _orig_mat
+
 print()
 ok = all(results)
 print(f"{'ALL PASS' if ok else 'FAILURES'} ({sum(results)}/{len(results)})")

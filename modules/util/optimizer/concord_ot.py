@@ -632,7 +632,8 @@ def setup_packed_embeddings(model, config):
                 inits.append(emb.vector[k].detach().float())
                 row_map.append((emb, k))
         if tids:
-            cp.attach_trainable(tids, torch.stack(inits).to(base.weight.device), lr, median)
+            cp.attach_trainable(tids, torch.stack(inits).to(base.weight.device), lr, median,
+                                anchor=bool(getattr(config, "concord_embedding_anchor", True)))
         te.text_model.embeddings.token_embedding = cp
         planes.append({"te_idx": te_idx, "te": te, "cp": cp, "base": base, "row_map": row_map})
     model.concord_control_planes = planes
@@ -647,8 +648,10 @@ def setup_packed_embeddings(model, config):
     model.embedding_wrapper_1 = None
     model.embedding_wrapper_2 = None
     rows = len(planes[0]["row_map"]) if planes else 0
+    anchored = bool(getattr(config, "concord_embedding_anchor", True))
     print(f"[concord] packed embeddings ON: {rows} trainable token row(s)/TE, lr={lr}; "
-          f"deploy-norm pinned to vocab median; plain-SGD embedding path bypassed")
+          f"{'ANCHORED (init frozen in v_slow, deploy = init + gated delta)' if anchored else 'deploy-norm pinned to vocab median'}; "
+          f"plain-SGD embedding path bypassed")
 
 
 def reenable_packed_embedding_grad(model):

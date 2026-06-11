@@ -71,14 +71,34 @@ class ConcordPackedEmbedding(nn.Module):
         self.target.fill_(float(v))
 
     @torch.no_grad()
-    def init_tokens(self, init=None, scale=0.05):
+    def init_tokens(self, init=None, scale=0.05, anchor=False):
         if init is None:
             init = torch.randn(self.K, self.dim, device=self.target.device) * scale
         self.core.load_weights(init)                     # mantissa lands in s_fast
-        # move the position into s_slow so DEPLOY (s_slow+v_slow) is non-zero at init
-        # (else pinning the deploy norm divides by ~0). s_slow is the x128 coarse field.
         pw = self.core.packed_w
         sf = (pw >> 16)
+        if anchor:
+            # ANCHOR MODE: the init vector is FROZEN in v_slow (alpha_v = 0 ->
+            # the leak never moves it, C* = 0 exactly), and everything learned
+            # accumulates in s_slow as a friction-disciplined delta:
+            #     deploy = init (immutable) + gated-learned-delta
+            # The token can never drift off its founding semantics -- the
+            # fried-embedding mechanism is structurally impossible. The anchor
+            # also carries the norm, so the per-step norm pin (and its
+            # requantization churn) is skipped; we pin ONCE here so the init
+            # row lands at the vocab-median norm.
+            vs = (sf.float() / V_SLOW_FACTOR).round().clamp(-128, 127).to(torch.int32)
+            sf = (sf - vs * V_SLOW_FACTOR).clamp(INT16_MIN, INT16_MAX).to(torch.int32)
+            self.core.packed_w.copy_(((sf & 0xFFFF) << 16) | (vs & 0xFF))
+            self.core._resync_weight_buf()
+            self._pin_norm(torch.arange(self.K, device=self.target.device))
+            self.core.alpha_v_fast = 0.0
+            self.core.drift_cancel_C = 0.0               # C*(alpha_v=0) = 0 exactly
+            self._anchored = True
+            return
+        # legacy: position into s_slow so DEPLOY (s_slow+v_slow) is non-zero at
+        # init (else pinning the deploy norm divides by ~0); the leak telescopes
+        # it toward v_slow over the run. s_slow is the x128 coarse field.
         ss = (sf.float() / S_SLOW_FACTOR).round().clamp(-128, 127).to(torch.int32)
         sf = (sf - ss * S_SLOW_FACTOR).clamp(INT16_MIN, INT16_MAX).to(torch.int32)
         self.core.packed_w.copy_(((sf & 0xFFFF) << 16) | ((ss & 0xFF) << 8))
@@ -99,6 +119,11 @@ class ConcordPackedEmbedding(nn.Module):
 
     @torch.no_grad()
     def _pin_norm(self, rows):
+        # Anchor mode: the frozen init carries the norm; per-step pinning would
+        # only re-quantize all three fields every backward (multiplicative
+        # round churn on the "frozen" anchor included). Pin only at init.
+        if getattr(self, "_anchored", False):
+            return
         core = self.core
         pw = core.packed_w[rows]
         s_fast = (pw >> 16)

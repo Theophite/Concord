@@ -93,12 +93,13 @@ class ControlPlaneEmbedding(nn.Module):
         self.static_vals = torch.cat([self.static_vals, vec.to(self.static_vals).reshape(1, self.dim)])
         self.kind[tid] = 1; self.idx[tid] = row
 
-    def attach_trainable(self, tids, inits, lr, target_norm):
+    def attach_trainable(self, tids, inits, lr, target_norm, anchor=False):
         """tids: list of ids; inits: [K, dim]. Builds the Concord trainable embedding
-        and routes those ids to its rows."""
+        and routes those ids to its rows. anchor=True freezes the init vector in
+        v_slow (deploy = init + gated-learned-delta; see init_tokens)."""
         self.trainable = ConcordPackedEmbedding(len(tids), self.dim, device=self.kind.device,
                                                 lr=lr, target_norm=target_norm)
-        self.trainable.init_tokens(init=inits)
+        self.trainable.init_tokens(init=inits, anchor=anchor)
         with torch.no_grad():
             for row, tid in enumerate(tids):
                 self._grow(tid); self.kind[tid] = 2; self.idx[tid] = row
