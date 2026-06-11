@@ -255,17 +255,23 @@ class ConcordController:
         import math
         return 1.0 - math.exp(-2.0 * alpha_v_fast * t)
 
-    def read_boil_fraction(self):
-        """False-kill audit: fraction of evaporated ENERGY since the last call
-        that was drift-aligned (learned-direction) mass -- the only channel
-        through which learning can dissipate (S/A are structurally immune).
-        Healthy gate ~ 0; rising = the (1-coh) tax is eating slow-cohering
-        signal. None when nothing evaporated in the window."""
+    def read_flow_audit(self):
+        """Dissipation flow audit since the last call (one host sync). Returns
+        (boil, waste), each None when its denominator is empty:
+          boil  = drift-aligned fraction of the killed energy -- gate errors
+                  on ESTABLISHED signal (S/A are structurally immune; in-flight
+                  kill is the only channel through which learning dissipates);
+          waste = killed/(killed+consolidated) energy throughput -- high waste
+                  with LOW boil is the lag-tax signature: mass killed before
+                  the justification machinery (sig = C*(S-A), which lags the
+                  chase) could recognize it. The commit-to-fast-first price."""
         from prototype_packed_b import read_boil
         if not self.layers:
-            return None
-        a, b = read_boil(self.layers[0].packed_w.device)
-        return (a / b) if b > 0 else None
+            return None, None
+        a, b, c = read_boil(self.layers[0].packed_w.device)
+        boil = (a / b) if b > 0 else None
+        waste = (b / (b + c)) if (b + c) > 0 else None
+        return boil, waste
 
     def read_memorization_gap(self):
         """Memorization-gap meter: first-order estimate of (L_deploy - L_live),

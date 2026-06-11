@@ -658,9 +658,9 @@ def _apply_packed_adamw_kernel(
     memgap_ptr,          # *fp32[1]: memorization-gap accumulator -- per-tile atomic add of
                           # sum(grad * s_fast_in_W), the first-order (L_live - L_deploy).
                           # (Distinct from gap_inv_scale, the gap-FEEDBACK split below.)
-    boil_ptr,            # *fp32[2]: false-kill audit -- [0] += sum(killed_w^2 * coh),
-                          # [1] += sum(killed_w^2); killed_w = realized evaporation in W
-                          # units. boil fraction = [0]/[1] (see _BOIL_BUFS).
+    boil_ptr,            # *fp32[3]: flow audit -- [0] += sum(killed_w^2 * coh),
+                          # [1] += sum(killed_w^2), [2] += sum(chase_w^2); killed_w /
+                          # chase_w in W units. boil = [0]/[1]; waste = [1]/([1]+[2]).
     gap_inv_scale,       # fp32: 1/gap_scale for the conserved gap-feedback pass/evap split
     step_salt_ptr,
     consolidate_ptr,     # *int32[1]: gradient-accumulation gate. 1 = consolidate (full apply,
@@ -917,6 +917,9 @@ def _apply_packed_adamw_kernel(
             tl.store(coh_pre_ptr + p_off, coh_pre_new, mask=nk_mask)
         # consf gate: 0 during accumulation -> no chase (s_fast keeps accumulating).
         chase_mantissa = alpha * gate * gate_gain * s_fast.to(tl.float32) * consf
+        # flow audit: consolidated-energy counterpart of the kill meter above
+        chase_w = chase_mantissa * scale_fwd
+        tl.atomic_add(boil_ptr + 2, tl.sum(chase_w * chase_w))
         chase_int8_f = chase_mantissa / 128.0
         r2 = _hash_uniform(s_fast, pos_hash, step_salt ^ 0x5A5A5A5A)
         floor_s = tl.floor(chase_int8_f)
@@ -1163,8 +1166,19 @@ def set_min_leak(v):
 # the captured kernel atomic-adds into; the host zero_() between replays.
 _MEMGAP_BUFS = {}
 
-# Boil meter: per-device fp32[2] accumulator auditing the gate's false-kill
-# rate. Per element the evaporated vector's drift-aligned energy fraction IS
+# Boil/waste meter: per-device fp32[3] accumulator auditing the dissipation's
+# flows. [0] = killed-energy aligned with the drift, [1] = killed energy,
+# [2] = chase-consolidated energy (the expectation flow alpha*gate*s_fast).
+#   boil  = [0]/[1]      -- of what was killed, how much did the drift
+#                           already recognize? (gate errors on ESTABLISHED
+#                           signal)
+#   waste = [1]/([1]+[2]) -- of this step's throughput, how much boiled vs
+#                           consolidated? High waste with LOW boil is the
+#                           lag-tax signature: mass killed BEFORE the
+#                           justification machinery could recognize it (the
+#                           commit-to-fast-first architecture's price; the
+#                           boil meter alone is structurally blind to it).
+# False-kill rate. Per element the evaporated vector's drift-aligned energy fraction IS
 # coh (sig/noise decomposition is element-wise), so
 #     boil = sum(killed^2 * coh) / sum(killed^2)   in [0,1]
 # = the fraction of evaporated ENERGY that was drift-aligned (learned-
@@ -1181,21 +1195,22 @@ def _boil_buf(device):
     key = str(device)
     buf = _BOIL_BUFS.get(key)
     if buf is None:
-        buf = torch.zeros(2, dtype=torch.float32, device=device)
+        buf = torch.zeros(3, dtype=torch.float32, device=device)
         _BOIL_BUFS[key] = buf
     return buf
 
 
 def read_boil(device, reset=True):
-    """Returns (aligned_energy, total_energy) accumulated since last reset
-    (one host sync). boil fraction = aligned/total; total == 0 -> no kills."""
+    """Returns (aligned_kill, total_kill, chase_flow) energies accumulated
+    since last reset (one host sync). boil = aligned/total_kill;
+    waste = total_kill/(total_kill + chase_flow)."""
     buf = _BOIL_BUFS.get(str(device))
     if buf is None:
-        return 0.0, 0.0
-    a, b = float(buf[0]), float(buf[1])
+        return 0.0, 0.0, 0.0
+    a, b, c = float(buf[0]), float(buf[1]), float(buf[2])
     if reset:
         buf.zero_()
-    return a, b
+    return a, b, c
 
 
 def _memgap_buf(device):

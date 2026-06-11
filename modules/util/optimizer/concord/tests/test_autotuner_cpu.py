@@ -363,21 +363,29 @@ check("12e GUI default exposed", gui_concord_defaults()["dissipation_fill_ramp"]
 bbuf = ppb._boil_buf("cpu")
 check("13a buffer zero-init and idempotent accessor",
       float(bbuf.sum()) == 0.0 and ppb._boil_buf("cpu") is bbuf)
-# formula mirror: killed=(2,1) in W units, coh=(0,1) ->
-#   aligned = 4*0 + 1*1 = 1 ; total = 4 + 1 = 5 ; boil = 0.2
+# formula mirror: killed=(2,1) in W units, coh=(0,1); chase flow energy 15 ->
+#   aligned = 1 ; total kill = 5 ; boil = 0.2 ; waste = 5/(5+15) = 0.25
 for killed, coh_v in ((2.0, 0.0), (1.0, 1.0)):
     bbuf[0] += killed * killed * coh_v
     bbuf[1] += killed * killed
-a, b = ppb.read_boil("cpu")
+bbuf[2] += 15.0
+a, b, c = ppb.read_boil("cpu")
 check("13b energy decomposition and reset",
-      a == 1.0 and b == 5.0 and float(bbuf.sum()) == 0.0)
-bbuf[0] += 1.0; bbuf[1] += 5.0
+      a == 1.0 and b == 5.0 and c == 15.0 and float(bbuf.sum()) == 0.0)
+bbuf[0] += 1.0; bbuf[1] += 5.0; bbuf[2] += 15.0
 rig13 = SimpleNamespace(layers=[SimpleNamespace(packed_w=torch.zeros(1))])
-check("13c controller boil fraction",
-      abs(ConcordController.read_boil_fraction(rig13) - 0.2) < 1e-12)
-check("13d no kills -> None; no layers -> None",
-      ConcordController.read_boil_fraction(rig13) is None
-      and ConcordController.read_boil_fraction(SimpleNamespace(layers=[])) is None)
+boil13, waste13 = ConcordController.read_flow_audit(rig13)
+check("13c controller boil and waste fractions",
+      abs(boil13 - 0.2) < 1e-12 and abs(waste13 - 0.25) < 1e-12)
+check("13d empty window -> (None, None); no layers -> (None, None)",
+      ConcordController.read_flow_audit(rig13) == (None, None)
+      and ConcordController.read_flow_audit(SimpleNamespace(layers=[])) == (None, None))
+# lag-tax signature is representable: kills with NO drift recognition + small
+# chase flow -> waste high, boil ~ 0
+bbuf[1] += 8.0; bbuf[2] += 2.0
+boil13b, waste13b = ConcordController.read_flow_audit(rig13)
+check("13e lag-tax signature: high waste, boil ~ 0",
+      boil13b == 0.0 and waste13b == 0.8)
 
 print()
 ok = all(results)
