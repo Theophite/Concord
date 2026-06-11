@@ -100,6 +100,7 @@ class TrainOptimizerConfig(BaseConfig):
     min_leak: float
     evap_build_min: float
     dissipation_fill_ramp: bool
+    telescope_epoch_window: bool
     weight_lr_power: float
     decoupled_decay: bool
     fixed_decay: bool
@@ -234,6 +235,7 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("min_leak", None, float, True))
         data.append(("evap_build_min", None, float, True))
         data.append(("dissipation_fill_ramp", None, bool, True))
+        data.append(("telescope_epoch_window", None, bool, True))
         data.append(("weight_lr_power", None, float, True))
         data.append(("decoupled_decay", False, bool, False))
         data.append(("fixed_decay", False, bool, False))

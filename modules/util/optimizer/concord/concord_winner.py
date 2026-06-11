@@ -88,6 +88,16 @@ class ConcordConfig:
                                         # in transit and the meter is init-blind. Makes the
                                         # dissipation rising-late like the fluctuation sigma.
                                         # False = legacy (friction peaks at end of warmup)
+    telescope_epoch_window: bool = True  # pin the telescope window to the dataset revisit
+                                         # period: alpha_v_fast = 1/(2*steps_per_epoch), set at
+                                         # train start once the horizon is known, with C*
+                                         # re-derived per layer. The exp-20 freshness law:
+                                         # friction is selective only against a FRESH trust
+                                         # reference (window = 1 epoch optimal; longer = lag,
+                                         # stale reference, friction taxes signal). At the
+                                         # current SDXL size this is ~the 0.001 default; the
+                                         # flag keeps it true if the dataset grows. False =
+                                         # fixed alpha_v_fast (the legacy constant)
     # dissipation (the "split")
     gf_consol: float = 50.0
     # DIMENSIONLESS dissipation: the per-step friction fraction lam = lr*kappa

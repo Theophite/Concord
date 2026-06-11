@@ -817,6 +817,11 @@ class GenericTrainer(BaseTrainer):
                           f"steps ({self.config.epochs} epochs, "
                           f"len~{self.data_loader.get_data_set().approximate_length()}, "
                           f"bs={self.config.batch_size}, accum={self.config.gradient_accumulation_steps})")
+                    # Telescope epoch window (exp-20 freshness law): pin the
+                    # anchor's integration window to the dataset revisit period
+                    # now that the horizon (and so steps-per-epoch) is known.
+                    self.model.concord_controller.apply_epoch_window(
+                        self.model.concord_controller.total_steps / max(1, self.config.epochs))
                     # Resume-aware controller clock: step_idx restarts at 0 each
                     # process, but the fill ramp / autotune probe / watchdog arm
                     # delay are calendar mechanisms — on a resumed run (backup

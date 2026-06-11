@@ -89,6 +89,7 @@ def make_concord_config(learning_rate: float, optimizer_config=None):
         min_leak=float(pick("min_leak", d.min_leak)),
         evap_build_min=float(pick("evap_build_min", d.evap_build_min)),
         dissipation_fill_ramp=bool(pick("dissipation_fill_ramp", d.dissipation_fill_ramp)),
+        telescope_epoch_window=bool(pick("telescope_epoch_window", d.telescope_epoch_window)),
         autotune_table=pick("autotune_table", d.autotune_table),
         autotune_beta1_on=float(pick("autotune_beta1_on", d.autotune_beta1_on)),
         autotune_beta1_coh=float(pick("autotune_beta1_coh", d.autotune_beta1_coh)),
@@ -254,6 +255,32 @@ class ConcordController:
             return 1.0
         import math
         return 1.0 - math.exp(-2.0 * alpha_v_fast * t)
+
+    @torch.no_grad()
+    def apply_epoch_window(self, steps_per_epoch):
+        """Pin the telescope window to the dataset revisit period (exp-20
+        freshness law): alpha_v_fast = 1/(2*steps_per_epoch), so the anchor
+        integrates exactly one full pass before motion counts as drift --
+        every example votes once. C* is a function of alpha_v, so it is
+        re-derived per layer; the telescope-clock consumers (fill ramp,
+        probe floor, watchdog arm delay) read config.alpha_v_fast and follow
+        automatically. UNet layers only (the TE anchor is pinned). Call at
+        horizon-finalize time, BEFORE the first training step / capture
+        (alpha_v_fast and C* are launch-time scalars baked at capture).
+        Idempotent across resumes."""
+        from prototype_packed_b import compute_drift_cancel_C
+        if not self.config.telescope_epoch_window or steps_per_epoch <= 0:
+            return
+        new_av = 1.0 / (2.0 * float(steps_per_epoch))
+        old_av = self.config.alpha_v_fast
+        self.config.alpha_v_fast = new_av
+        for m in self.layers:
+            m.alpha_v_fast = new_av
+            m.drift_cancel_C = compute_drift_cancel_C(
+                m.alpha, new_av, mass_preserve=bool(getattr(m, "mass_preserve_v", True)))
+        print(f"[concord] telescope epoch window: alpha_v {old_av:g} -> {new_av:g} "
+              f"(window = {steps_per_epoch:.0f} steps = 1 epoch; C* re-derived; "
+              f"fill ramp / probe floor / watchdog follow)", flush=True)
 
     def read_flow_audit(self):
         """Dissipation flow audit since the last call (one host sync). Returns

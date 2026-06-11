@@ -387,6 +387,39 @@ boil13b, waste13b = ConcordController.read_flow_audit(rig13)
 check("13e lag-tax signature: high waste, boil ~ 0",
       boil13b == 0.0 and waste13b == 0.8)
 
+# ---- 14. telescope epoch window ----------------------------------------------
+def ew_rig(flag=True, av=0.001):
+    return SimpleNamespace(
+        config=SimpleNamespace(telescope_epoch_window=flag, alpha_v_fast=av),
+        layers=[SimpleNamespace(alpha=0.1, alpha_v_fast=av, drift_cancel_C=0.0,
+                                mass_preserve_v=True) for _ in range(2)])
+
+rig14 = ew_rig()
+ConcordController.apply_epoch_window(rig14, 471.0)
+av_new = 1.0 / (2.0 * 471.0)
+check("14a alpha_v pinned to the revisit period (1/(2*SPE))",
+      abs(rig14.config.alpha_v_fast - av_new) < 1e-15
+      and all(abs(m.alpha_v_fast - av_new) < 1e-15 for m in rig14.layers))
+check("14b C* re-derived per layer (mass-preserve form)",
+      all(abs(m.drift_cancel_C
+              - ppb.compute_drift_cancel_C(0.1, av_new, mass_preserve=True)) < 1e-15
+          for m in rig14.layers))
+check("14c at the current SDXL size the change is ~6% (near no-op)",
+      abs(av_new / 0.001 - 1.0) < 0.07)
+rig14b = ew_rig(flag=False)
+ConcordController.apply_epoch_window(rig14b, 471.0)
+check("14d flag off -> untouched",
+      rig14b.config.alpha_v_fast == 0.001
+      and all(m.alpha_v_fast == 0.001 for m in rig14b.layers))
+rig14c = ew_rig()
+ConcordController.apply_epoch_window(rig14c, 0)
+check("14e degenerate SPE -> untouched", rig14c.config.alpha_v_fast == 0.001)
+cfg14 = make_concord_config(7.5e-5, SimpleNamespace(telescope_epoch_window=False))
+check("14f pick-through and default ON",
+      cfg14.telescope_epoch_window is False
+      and make_concord_config(7.5e-5, SimpleNamespace()).telescope_epoch_window is True)
+check("14g GUI default exposed", gui_concord_defaults()["telescope_epoch_window"] is True)
+
 print()
 ok = all(results)
 print(f"{'ALL PASS' if ok else 'FAILURES'} ({sum(results)}/{len(results)})")
