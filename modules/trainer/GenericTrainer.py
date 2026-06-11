@@ -802,6 +802,20 @@ class GenericTrainer(BaseTrainer):
                           f"steps ({self.config.epochs} epochs, "
                           f"len~{self.data_loader.get_data_set().approximate_length()}, "
                           f"bs={self.config.batch_size}, accum={self.config.gradient_accumulation_steps})")
+                    # Resume-aware controller clock: step_idx restarts at 0 each
+                    # process, but the fill ramp / autotune probe / watchdog arm
+                    # delay are calendar mechanisms — on a resumed run (backup
+                    # continue, or the restart-on-sample wrapper's per-segment
+                    # relaunches) a zeroed clock would re-ramp the friction from
+                    # 0 after EVERY sample and re-run the probe each segment.
+                    # Seed it from the resumed global step (update-step units).
+                    _resumed_updates = int(getattr(train_progress, "global_step", 0)
+                                           // max(1, self.config.gradient_accumulation_steps))
+                    if _resumed_updates > self.model.concord_controller.step_idx:
+                        self.model.concord_controller.step_idx = _resumed_updates
+                        print(f"[concord] controller clock seeded at update-step "
+                              f"{_resumed_updates} (resumed run): fill ramp / probe / "
+                              f"watchdog continue instead of restarting", flush=True)
 
             current_epoch_length = self.data_loader.get_data_set().approximate_length()
 
