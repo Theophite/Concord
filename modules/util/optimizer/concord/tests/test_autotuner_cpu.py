@@ -198,7 +198,8 @@ check("7d default table converts to finite kappa at SDXL lr",
 check("7e watchdog armed by default", gd["autotune_reprobe_band"] == 0.02)
 check("7f subsumed knobs pruned from the panel (config-file only)",
       not any(k in gd for k in
-              ("gf_consol", "ratio_coh", "autotune_beta1_on", "autotune_beta1_coh")))
+              ("gf_consol", "ratio_coh", "autotune_beta1_on", "autotune_beta1_coh",
+               "lazy_gate", "lazy_active_thresh")))
 check("7g step cap / trust region exposed at winner values",
       gd["step_cap"] == 10.0 and gd["gf_trust_delta_sq"] == 1.0)
 
