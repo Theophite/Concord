@@ -81,6 +81,49 @@ changes into the fork).
     the full packed state, and resume must resync `weight_buf` after restoring
     `packed_w`.
 
+## The flow audit: boil and waste (integration branch)
+
+Every `[loss]` stdout line on `concord-integration` carries the kernel's flow audit
+next to the loss/gap numbers (TensorBoard: `loss/concord_boil`, `loss/concord_waste`).
+The two meters answer different trust questions about the dissipation — read them as a
+pair, neither alone is sufficient.
+
+**Plumbing.** The step kernel accumulates three energy sums per device into an fp32[3]
+buffer via atomics (graph-safe, same device-buffer pattern as memgap;
+`prototype_packed_b.py:661`): `[0] += Σ killed_w²·coh`, `[1] += Σ killed_w²`,
+`[2] += Σ chase_w²` — killed_w is evaporated mass, chase_w is consolidated
+(fast→slow committed) mass, both in W units.
+`ConcordController.read_flow_audit()` (`concord_ot.py:314`) reads-and-zeroes per print
+window; an empty denominator drops the field from the line.
+
+- **boil = [0]/[1]** — the drift-recognized fraction of killed energy. *Of what
+  friction destroyed this window, how much did the telescope's own coherence meter
+  recognize as real drift?* Healthy ≈ 0: the evaporator eats unrecognized mass
+  (hygiene working). Sustained high boil = friction is burning weight with evidence
+  behind it → λ too high for the regime.
+- **waste = [1]/([1]+[2])** — the kill share of total moved energy (kills vs
+  commits). The lag tax: weight commits to `s_fast` first, so mass can be destroyed
+  *before* its evidence accumulates — and those kills carry coh≈0 at kill time, so
+  they look legitimate to boil. **Boil is structurally blind to infanticide; waste is
+  the meter that sees it.** High waste + low boil = commit-then-kill churn (raise
+  `evap_build_min`, or the lr is outrunning the gate).
+
+**Expected transients — don't tune on them:**
+
+- **Init consolidation** (first ~2/α optimizer steps): coh reads init residue, so boil
+  climbs and collapses while the fill ramp still holds λ at a few % of target — a high
+  ratio on negligible flow. Receipt (SDXL 2026-06-11, λ=0.5, γ-SNR, epoch window):
+  boil peaked 0.20 at log-step ~95, fell to ≤0.005 by ~115, stayed ≤0.005 with
+  waste ≤0.006 through epoch 2. That trace is the healthy signature.
+- **Anchored TE rows** run coh≡0 (invariant 9), so embedding kills land entirely in
+  the denominators: they dilute boil and put occasional small waste blips on the line
+  that are not UNet churn. Negligible mass at SDXL scale, but expect nonzero waste
+  noise whenever packed embeddings train.
+
+(`gap` on the same line is unrelated plumbing: the first-order deploy−live loss
+estimate from the memgap buffer. Positive spikes at init and after backup/restore that
+re-converge within ~10 prints are bridge behavior, not flow.)
+
 ## Methodology norms (the repo's culture — follow them)
 
 - **Same-seed A/B is the validation currency.** Concord is bit-deterministic at fixed
