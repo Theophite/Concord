@@ -700,3 +700,54 @@ grid optimum landed on the edge.
    Exp 12's mixup number was partly riding on its F=1.5.
 3. Standing conclusion for the corner: best-known no-aug = gateless F=1.5 + mixup
    (93.15); best-known overall = restore data diversity and keep the gate (96.31).
+
+## Exp 14 — augmentation × long horizon (`exp14_aug_long.py`)
+
+160ep (2× exp 10), 30% noise + crop-aug, NS drive, lr 1e-2, F=1.5, 3 seeds. The
+pre-registered prediction (with aug repairing the coherence signal, the gated default
+should beat the corner's gate-disabled winners) **failed**:
+
+| arm (noisy+aug, 160ep) | deploy | memorized |
+|---|---|---|
+| gated, default window | 95.88 ± 0.23 | 11.2% |
+| long window (64ep) | 96.07 ± 0.37 | 10.9% |
+| **gateless F=1.5** | **96.26 ± 0.06** | 10.7% |
+| full stack (crop+mixup+gated) | 96.10 ± 0.36 | 10.5% |
+| clean+aug gated (ceiling) | 97.54 ± 0.10 | — |
+
+Longer horizon helped nothing (80ep was already past optimum; clean flat at 97.54),
+eroded the gated arm most (−0.43; aug decorrelates pixel-keyed memorization but a
+wrong label still pushes a coherent class-level direction across crops, which the
+gate slowly approves), and mixup is redundant once crops are present.
+
+### Exp 14b — the gate ablation at matched F (the missing cells)
+
+Every prior κ sweep confounded gate with friction. Measured exemption value at
+matched F:
+
+| regime | gated | gateless | gate Δ |
+|---|---|---|---|
+| clean, F=1.5, 80ep | **96.25 ± 0.06** | 95.74 ± 0.02 | **+0.51** |
+| 10% noise, F=1.0, 80ep | 92.07 (40.1%) | **94.85 ± 0.15 (22.1%)** | **−2.78** |
+| 30% noise no-aug, F=1.5 (exp 13) | 86.28 (47.8%) | 92.56 (25.8%) | −6.28 |
+| 30% noise + aug, F=1.5, 80ep | 96.31 (10.6%) | 96.15 (10.2%) | +0.16 |
+| 30% + aug, 160ep (exp 14) | 95.88 | 96.26 | −0.38 |
+
+1. **The "mild-noise home turf" hypothesis is inverted**: at 10% noise the exemption
+   posts its worst score — few wrong labels, but perfectly coherent drift, exempted
+   from friction (memorization 40% vs 22%). Coherent wrong-label drift is the typical
+   case at every noise level; **the exemption is net-negative wherever labels can be
+   wrong**.
+2. **The gate's one clear win is clean data under high friction** (+0.51) — and that
+   cell also revises exp 5: clean gated F=1.5 @ 80ep (96.25) ≫ clean κ=0 @ 80ep
+   (94.85). **κ\* ≠ 0 on clean data at long horizons** — friction is a general
+   anti-overfit regularizer; the horizon-dependence of κ\* (exps 5/10/13) reduces to
+   this.
+3. **Scope caveat, load-bearing**: all cells are the label-corruption family
+   (adversarially coherent noise). The LM/diffusion regimes have real Bayes error —
+   incoherent by nature — and the original nanoGPT validation never gate-ablated at
+   matched F either (the "split" = gate+friction vs neither). **The matched-F gate
+   ablation is now the top-priority cell for the GPU bench.** The gate's *meter* role
+   (the probe; exp 6) is unaffected — only the exemption is in question.
+4. Design implication: split the roles — keep the meter; make the exemption a
+   probe-committed dial (0 = gateless … 1 = full), alongside F and β1.
