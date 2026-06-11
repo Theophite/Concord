@@ -424,15 +424,15 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
     # The winner knobs default to the validated sf_060 configuration.
     # The panel shows only the live physical knobs. gf_consol (kappa, subsumed by
     # the dimensionless dissipation), ratio_coh (the gate IS the mechanism; off is
-    # a debug state), the probe-gated beta1 pair (one-task-validated, off), and
-    # the lazy gate pair (superseded by evap_build_min -- the infancy guard at
-    # the commit quantum replaces the idle detector) remain config-file keys
-    # with engine defaults, not panel entries.
+    # a debug state), and the probe-gated beta1 pair (one-task-validated, off)
+    # remain config-file keys with engine defaults, not panel entries.
     Optimizer.CONCORD: {
         "momentum": 0.9,
         "weight_decay": 0,
         "noise": True,
         "sigmag_peak": 0.6,
+        "lazy_gate": False,
+        "lazy_active_thresh": 0.0001,
         "warmup": 100,
         "lr_min_frac": 0.2,
         "step_cap": 10.0,
