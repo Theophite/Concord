@@ -367,6 +367,13 @@ class ConcordController:
             print(f"[concord] gamma-SNR dissipation modulation ON: knee={float(knee):g}, "
                   f"base kappa={float(base):.0f}, cap lam={self._LAM_MOD_CAP:g} "
                   f"(kappa <= {cap:.0f} @ lr={self.config.lr:g})")
+            if float(base) > cap:
+                print(f"[concord] WARNING: base kappa {float(base):.0f} EXCEEDS the "
+                      f"gamma-SNR cap ({cap:.0f}, lam={self._LAM_MOD_CAP:g}) -- since the "
+                      f"modulation only scales UP and then clamps, every modulated step "
+                      f"runs at the cap: effective lam = {self._LAM_MOD_CAP:g} < your "
+                      f"base. Lower the base into the plateau (exp 21: lam* ~ 0.5-1.0) "
+                      f"or disable gamma-SNR to run above it.")
         for layer in self.layers:
             layer._gf_consol_buf.copy_(kappa_t)
 
