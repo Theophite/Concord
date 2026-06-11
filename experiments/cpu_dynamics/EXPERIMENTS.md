@@ -1043,3 +1043,40 @@ noisy → F=1.5 (floored) with alpha_v = 1/(2·steps_per_epoch). SDXL
 translation: keep alpha_v pinned to the epoch (scale it if the dataset
 grows); the floored high-λ sweep has CPU support under noise for the first
 time.
+
+
+## Exp 21 — the F sweep at the champion configuration (`exp21_f_sweep_optimal.py`)
+
+Exp 20's configuration (NS @ lr 1e-2, crop-aug, gate on, window = 1 epoch,
+min-leak floor) with the F axis filled in, including the classically
+forbidden F >= 2 zone (runnable only because the floor clamps survival —
+no ringing, no divergence). 4k×25ep, 3 seeds; F = 0/1.5 anchors from exp 20.
+
+    F           0      0.1    0.25   0.5    1.0    1.5    2.5    4.0
+    clean       97.45  97.51  97.42  97.37  97.21  96.93  96.60  96.31
+    30% noise   94.42  95.00  95.60  96.03  96.00  95.60  94.90  94.48
+    (memorized) 12.0   11.5   10.7   10.7   10.3   10.1   10.1   10.0
+
+1. **Noisy F\* is interior: ~0.5–1.0, peak 96.03.** A genuine optimum, not
+   exp 12's λ\*=0 (stale window) and not the SDXL monotone-past-the-ceiling
+   pattern: at the fresh window, friction works — then over-friction taxes
+   signal faster than the scrub pays (memorization keeps falling past the
+   peak while deploy drops: the kills stay "good" but become too many).
+2. **Clean has a free shoulder to F ≈ 0.5** (everything in [0, 0.5] within
+   ~0.1; F=0.1 nominally tops the table at 97.51). "Friction only costs on
+   clean data" was an artifact of the stale-window regimes; at the fresh
+   window, light friction is free insurance. Decline is real past F ≈ 1.
+3. **The floor makes over-friction graceful**: F = 4 (2× the classical
+   stability ceiling) costs only −1.1/−1.5 from peak instead of diverging.
+   The lam < 2 ceiling is now advisory in every sense.
+4. **Universal default: F ≈ 0.5** — at the clean shoulder's edge AND the
+   noisy peak simultaneously (clean −0.08, noisy +1.61 vs F=0). One number,
+   both regimes, no per-dataset tuning at this protocol.
+
+SDXL implication, stated carefully: the freshness-repaired CPU now supports
+moderate friction with an INTERIOR peak — it does NOT reproduce unbounded
+monotone improvement in λ. The SDXL sweep (different noise character,
+deploy-sample metric) may still peak elsewhere, but this predicts it HAS a
+peak, plausibly at lam below where the sweep was heading. The fork's
+λ ∈ {0.25, 0.5, 1.0} bracket at the epoch window is the decisive next GPU
+run.
