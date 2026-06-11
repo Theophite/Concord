@@ -386,6 +386,15 @@ class GenericTrainer(BaseTrainer):
             if _deploy_stash is not None:
                 _ctrl.restore_unet_deploy(_deploy_stash)
 
+        # [main patch 0003] Return the sampler's dead heap to the driver BEFORE
+        # setup_train_device recommits the UNet to dedicated VRAM. With the gc
+        # after the move-back (the old order), the driver briefly saw sampler
+        # leftovers + the returning UNet, tipped past the VRAM ceiling by a
+        # sliver, and WDDM demoted the last fraction of the recommit to shared
+        # memory -- silently, stickily (no promotion path), so training crawled
+        # afterward.
+        self._graphmem("post-sample")
+        torch_gc()
         self.model_setup.setup_train_device(self.model, self.config)
         # Special case for schedule-free optimizers.
         if self.config.optimizer.optimizer.is_schedule_free:
@@ -393,6 +402,7 @@ class GenericTrainer(BaseTrainer):
             self.model.optimizer.train()
 
         torch_gc()
+        self._graphmem("post-restore")
 
         # Concord v2 checkpoint-restart (Windows): the post-sample graph recapture wedges because
         # sampling fragments the VRAM heap irreversibly -- empty_cache/reset/defrag cannot reclaim
@@ -546,6 +556,10 @@ class GenericTrainer(BaseTrainer):
             if self.config.rolling_backup:
                 self.__prune_backups(self.config.rolling_backup_count)
 
+        # [main patch 0003] Same recommit-ordering discipline as the sample
+        # path: empty the heap before setup_train_device recommits the UNet, or
+        # WDDM can demote the tail to shared memory.
+        torch_gc()
         self.model_setup.setup_train_device(self.model, self.config)
         # Special case for schedule-free optimizers.
         if self.config.optimizer.optimizer.is_schedule_free:
@@ -553,6 +567,7 @@ class GenericTrainer(BaseTrainer):
             self.model.optimizer.train()
 
         torch_gc()
+        self._graphmem("post-backup-restore")
 
     def __save(self, train_progress: TrainProgress, print_msg: bool = True, print_cb: Callable[[str], None] = print):
         torch_gc()
@@ -1020,6 +1035,10 @@ class GenericTrainer(BaseTrainer):
                             # (overwritten in place, lost on redirect); this survives in
                             # console scrollback and piped logs. tqdm.write keeps the
                             # progress bars intact.
+                            # spike-logger step attribution (no-op when the
+                            # logger is disabled; see modules/util/spike_log.py)
+                            from modules.util import spike_log as _spike_log
+                            _spike_log.SPIKE_LOG.set_step(train_progress.global_step)
                             _msg = (f"[loss] step {train_progress.global_step}"
                                     f"  loss={accumulated_loss_cpu:.5f}"
                                     f"  smooth={ema_loss:.5f}")

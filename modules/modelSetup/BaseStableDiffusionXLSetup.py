@@ -2,6 +2,7 @@ from abc import ABCMeta
 from random import Random
 
 import modules.util.multi_gpu_util as multi
+import modules.util.spike_log as spike_log
 from modules.model.StableDiffusionXLModel import StableDiffusionXLModel, StableDiffusionXLModelEmbedding
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupDebugMixin import ModelSetupDebugMixin
@@ -438,13 +439,15 @@ class BaseStableDiffusionXLSetup(
             data: dict,
             config: TrainConfig,
     ) -> Tensor:
-        return self._diffusion_losses(
+        losses = self._diffusion_losses(
             batch=batch,
             data=data,
             config=config,
             train_device=self.train_device,
             betas=model.noise_scheduler.betas,
-        ).mean()
+        )
+        spike_log.SPIKE_LOG.log(losses, data, batch)   # no-op unless CONCORD_SPIKE_LOG is set
+        return losses.mean()
 
     def prepare_text_caching(self, model: StableDiffusionXLModel, config: TrainConfig):
         model.to(self.temp_device)
