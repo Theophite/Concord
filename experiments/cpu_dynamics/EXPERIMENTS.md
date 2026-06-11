@@ -989,3 +989,57 @@ matched F:
    (the probe; exp 6) is unaffected — only the exemption is in question.
 4. Design implication: split the roles — keep the meter; make the exemption a
    probe-committed dial (0 = gateless … 1 = full), alongside F and β1.
+
+
+## Exp 20 — best-of-both synthesis: the floored gate at the epoch window (`exp20_window_floor_synthesis.py`)
+
+Crosses the two campaigns' winners: NS drive at its own lr (1e-2, exp 16),
+crop-aug, F = 1.5 WITH the min-leak floor (every F=1.5 cell in exps 18/19
+ran unfloored — survival factor 1 − 1.5(1−coh) < 0 wherever coh < 1/3:
+sign-flip ringing), the window swept in epoch units, and the F=0 control
+exp 12 taught us to always run. 4k×25ep, 3 seeds, deploy acc.
+
+    gated, F=1.5        W=1ep    W=4     W=16    W=64    W=256
+    clean               96.93    96.64   95.96   95.35   95.13
+    30% noise           95.60    95.07   94.24   93.73   93.49
+
+    controls (W=16 unless noted)   clean          30% noise
+    gateless F=1.5                 95.13          93.48
+    gated    F=0                   97.46          94.69
+    gated    F=0, W=1ep            97.45          94.42
+
+Three reversals:
+
+1. **The window optimum is ONE EPOCH — and shorter beats longer everywhere.**
+   Monotone-decreasing in W in both regimes; W=1ep memorizes at chance
+   (10.1%). Exp 18's "1ep windows are catastrophic (72.5% memorized)" was
+   measured unfloored: at short windows coh reads low, the unfloored F=1.5
+   survival factor went deeply negative, and the resulting ringing — not the
+   window — destroyed the run. The trust-timescale rule lands exactly at the
+   dataset revisit period: every example votes once, then motion counts.
+
+2. **The floor flips the gate-ablation verdict.** Gated beats gateless at
+   matched F=1.5 in BOTH regimes now (+1.80 clean, +2.12 noisy at W=16) —
+   exp 19b's "exemption net-negative under any label noise" (−2.78 to −6.28)
+   was the ringing artifact, not the gate.
+
+3. **Friction's value is set by reference freshness (F × W interaction).**
+   Noisy: F=1.5@W=1 (95.60) > F=0 at any window (94.4–94.7) > F=1.5@W=16
+   (94.24). Friction with a FRESH trust reference is selective and wins;
+   friction against a stale reference taxes signal and loses; with no
+   friction the window barely matters. Clean: F=0 stays champion (97.46 —
+   reproducing exp 16's 97.51); friction only costs where there is nothing
+   to scrub.
+
+The freshness law retroactively unifies the campaigns' λ disagreement:
+exp 12's λ*≈0 was measured at the CPU default window (≈16ep — stale), while
+the SDXL fork's monotone-quality-in-λ observation runs at alpha_v=0.001 ≈ a
+ONE-EPOCH window at that dataset size (len~1885, bs4) — the fresh-reference
+regime where this grid says friction pays. The CPU default was the mis-set
+one, not the SDXL default.
+
+Recipe (this protocol): NS @ lr 1e-2 + aug + gate on; clean → F=0;
+noisy → F=1.5 (floored) with alpha_v = 1/(2·steps_per_epoch). SDXL
+translation: keep alpha_v pinned to the epoch (scale it if the dataset
+grows); the floored high-λ sweep has CPU support under noise for the first
+time.
