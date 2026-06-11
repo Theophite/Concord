@@ -152,6 +152,8 @@ class ConcordController:
         self._autotune_pending = bool(getattr(self.config, "autotune_table", None))
         self._snr_mod_announced = False
         self._current_fill_ramp = 1.0
+        self.emb_cores = []         # packed-embedding cores (register_embedding_cores)
+        self.emb_lr = 0.0
         self.step_idx = 0
         print(f"[concord] swapped {len(self.layers)} UNet layers | lr={self.config.lr} "
               f"gf_consol={self.config.gf_consol} noise={self.config.noise} "
@@ -255,6 +257,33 @@ class ConcordController:
             return 1.0
         import math
         return 1.0 - math.exp(-2.0 * alpha_v_fast * t)
+
+    def register_embedding_cores(self, planes, emb_lr):
+        """Bring the packed-embedding cores under the controller's physics. As
+        created they are the LEAST protected, HIGHEST leverage parameters in
+        the system: gf_consol = 0 (zero dissipation -- the only trainables
+        without friction), a CONSTANT lr (outside winner_step: no warmup, no
+        cosine -- they keep churning at full rate into a converged model, the
+        textbook fried-embedding mechanism), per-step norm-pin requantization,
+        and excluded from the deploy bridge (mid-train samples used the LIVE
+        rows, transient included). Registration fixes all of it: dimensionless
+        friction at THEIR lr (kappa_emb = lam/lr_emb), their own winner_step
+        schedule group (warmup + cosine, sigma OFF -- the fluctuation never
+        earned its keep on embeddings), and inclusion in the deploy bridge."""
+        self.emb_cores = [p["cp"].trainable.core for p in planes
+                          if p.get("cp") is not None and p["cp"].trainable is not None]
+        self.emb_lr = float(emb_lr)
+        if not self.emb_cores:
+            return
+        lam = (float(self.config.dissipation) if self.config.dissipation is not None
+               else float(self.config.gf_consol) * float(self.config.lr))
+        kappa_emb = lam / max(self.emb_lr, 1e-12)
+        for c in self.emb_cores:
+            c.gf_consol = kappa_emb
+        print(f"[concord] embedding cores registered: {len(self.emb_cores)} TE plane(s) "
+              f"under the controller -- lam={lam:g} @ lr_emb={self.emb_lr:g} -> "
+              f"kappa_emb={kappa_emb:.0f}; warmup+cosine schedule, sigma off; "
+              f"deploy bridge now masks embedding s_fast during sampling")
 
     @torch.no_grad()
     def apply_epoch_window(self, steps_per_epoch):
@@ -401,6 +430,11 @@ class ConcordController:
         if self.te_layers:
             winner_step(self.step_idx, self.total_steps, self.te_layers,
                         peak_lr=self.te_lr, config=self.config)
+        if self.emb_cores:
+            # embeddings get their OWN schedule group: warmup + cosine at the
+            # embedding lr, fluctuation off (see register_embedding_cores)
+            winner_step(self.step_idx, self.total_steps, self.emb_cores,
+                        peak_lr=self.emb_lr, noise=False, config=self.config)
 
     @torch.no_grad()
     def after_step(self):
@@ -454,7 +488,9 @@ class ConcordController:
         (sampling's VRAM fragmentation is the documented wedge; do not feed it)."""
         import prototype_packed_b as ppb
         stash = []
-        for m in self.layers:
+        # embedding cores included: their forward gathers reconstruct from
+        # packed_w directly, so masking alone makes sampling deploy-true
+        for m in self.layers + self.emb_cores:
             pk_cpu = m.packed_w.detach().to("cpu")          # D2H, no device temp
             stash.append(((pk_cpu >> 16).to(torch.int16)))  # CPU-side extract
             m.packed_w &= 0xFFFF                            # in place
@@ -468,13 +504,14 @@ class ConcordController:
     @torch.no_grad()
     def restore_unet_deploy(self, stash):
         import prototype_packed_b as ppb
-        dev = self.layers[0].packed_w.device if self.layers else "cuda"
+        targets = self.layers + self.emb_cores
+        dev = targets[0].packed_w.device if targets else "cuda"
         scratch = getattr(self, "_deploy_scratch", None)
-        need = max((m.packed_w.numel() for m in self.layers), default=0)
+        need = max((m.packed_w.numel() for m in targets), default=0)
         if scratch is None or scratch.numel() < need:
             scratch = torch.empty(need, dtype=torch.int32, device=dev)
             self._deploy_scratch = scratch                   # reused across samples
-        for m, sf in zip(self.layers, stash):
+        for m, sf in zip(targets, stash):
             word = (sf.to(torch.int32) << 16)                # CPU-side
             n = m.packed_w.numel()
             scratch[:n].copy_(word.reshape(-1))              # one H2D, no alloc
@@ -599,6 +636,11 @@ def setup_packed_embeddings(model, config):
         te.text_model.embeddings.token_embedding = cp
         planes.append({"te_idx": te_idx, "te": te, "cp": cp, "base": base, "row_map": row_map})
     model.concord_control_planes = planes
+    # bring the packed cores under the controller's physics (friction at the
+    # embedding lr, warmup+cosine schedule, deploy-bridge inclusion)
+    _ctrl = getattr(model, "concord_controller", None)
+    if _ctrl is not None:
+        _ctrl.register_embedding_cores(planes, lr)
     # The plain-SGD wrapper path is bypassed; ensure both wrapper refs are None so
     # after_optimizer_step's preserve_embedding_norm guard short-circuits (the model's
     # __init__ leaves embedding_wrapper_2 unset).

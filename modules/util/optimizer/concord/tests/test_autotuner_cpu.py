@@ -420,6 +420,38 @@ check("14f pick-through and default ON",
       and make_concord_config(7.5e-5, SimpleNamespace()).telescope_epoch_window is True)
 check("14g GUI default exposed", gui_concord_defaults()["telescope_epoch_window"] is True)
 
+# ---- 15. embedding-core registration ------------------------------------------
+def fake_core():
+    return SimpleNamespace(gf_consol=0.0,
+                           packed_w=torch.tensor([[0x7FFF1234, 0x00015678]],
+                                                 dtype=torch.int32))
+
+core15 = fake_core()
+rig15 = SimpleNamespace(config=SimpleNamespace(dissipation=0.1, gf_consol=1333.0,
+                                               lr=7.5e-5),
+                        emb_cores=[], emb_lr=0.0, layers=[])
+planes15 = [{"cp": SimpleNamespace(trainable=SimpleNamespace(core=core15))},
+            {"cp": SimpleNamespace(trainable=None)}]
+ConcordController.register_embedding_cores(rig15, planes15, 1e-3)
+check("15a friction at the EMBEDDING lr: kappa_emb = lam/lr_emb",
+      len(rig15.emb_cores) == 1 and abs(core15.gf_consol - 100.0) < 1e-9,
+      f"kappa_emb={core15.gf_consol}")
+# 15b: deploy bridge masks + restores embedding cores (CPU tensors; fused mode
+# so the materialize branch is skipped)
+_fused = ppb._FUSED_MATMUL
+ppb._FUSED_MATMUL = True
+try:
+    before = core15.packed_w.clone()
+    stash = ConcordController.materialize_unet_deploy(rig15)
+    masked = core15.packed_w.clone()
+    rig15._deploy_scratch = None
+    ConcordController.restore_unet_deploy(rig15, stash)
+    after = core15.packed_w.clone()
+finally:
+    ppb._FUSED_MATMUL = _fused
+check("15b bridge masks embedding s_fast and restores bit-exactly",
+      bool((masked == (before & 0xFFFF)).all()) and bool((after == before).all()))
+
 print()
 ok = all(results)
 print(f"{'ALL PASS' if ok else 'FAILURES'} ({sum(results)}/{len(results)})")
