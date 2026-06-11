@@ -88,6 +88,7 @@ def make_concord_config(learning_rate: float, optimizer_config=None):
         gf_trust_delta_sq=float(pick("gf_trust_delta_sq", d.gf_trust_delta_sq)),
         min_leak=float(pick("min_leak", d.min_leak)),
         evap_build_min=float(pick("evap_build_min", d.evap_build_min)),
+        dissipation_fill_ramp=bool(pick("dissipation_fill_ramp", d.dissipation_fill_ramp)),
         autotune_table=pick("autotune_table", d.autotune_table),
         autotune_beta1_on=float(pick("autotune_beta1_on", d.autotune_beta1_on)),
         autotune_beta1_coh=float(pick("autotune_beta1_coh", d.autotune_beta1_coh)),
@@ -149,6 +150,7 @@ class ConcordController:
         self.autotuner = None
         self._autotune_pending = bool(getattr(self.config, "autotune_table", None))
         self._snr_mod_announced = False
+        self._current_fill_ramp = 1.0
         self.step_idx = 0
         print(f"[concord] swapped {len(self.layers)} UNet layers | lr={self.config.lr} "
               f"gf_consol={self.config.gf_consol} noise={self.config.noise} "
@@ -241,6 +243,18 @@ class ConcordController:
     # lam < 2 linear-stability ceiling), whatever the batch's SNR draw.
     _LAM_MOD_CAP = 1.0
 
+    @staticmethod
+    def _fill_ramp(t, alpha_v_fast):
+        """Telescope anchor-fill fraction 1 - exp(-2*alpha_v_fast*t): the run-level
+        infancy ramp. Friction engages in proportion to how much weight has been
+        decided into the anchor -- which is also exactly how data-calibrated the
+        coherence meter is (its signal C*(S-A) is init-residue-dominated before
+        the anchor fills). alpha_v_fast <= 0 (pinned anchor) => no ramp."""
+        if alpha_v_fast <= 0:
+            return 1.0
+        import math
+        return 1.0 - math.exp(-2.0 * alpha_v_fast * t)
+
     def read_memorization_gap(self):
         """Memorization-gap meter: first-order estimate of (L_deploy - L_live),
         accumulated in the fused backward since the last call (one host sync --
@@ -300,7 +314,9 @@ class ConcordController:
         snr = ac / (1.0 - ac).clamp_min(1e-8)
         mod = (snr / float(knee)).clamp_min(1.0).mean()
         cap = self._LAM_MOD_CAP / max(self.config.lr, 1e-12)
-        kappa_t = (mod * float(base)).clamp_max(cap)
+        # compose with the fill ramp (run-level infancy) -- this hook runs after
+        # before_step and would otherwise overwrite the ramped buffer value
+        kappa_t = (mod * float(base) * self._current_fill_ramp).clamp_max(cap)
         if not self._snr_mod_announced:
             self._snr_mod_announced = True
             print(f"[concord] gamma-SNR dissipation modulation ON: knee={float(knee):g}, "
@@ -319,6 +335,17 @@ class ConcordController:
         if self.autotuner is not None:
             self.autotuner.step(self.step_idx)
         winner_step(self.step_idx, self.total_steps, self.layers, config=self.config)
+        # Run-level infancy (dissipation_fill_ramp): write kappa_base * ramp into
+        # the per-layer device buffers each step (the lr/sigma pattern; the host
+        # mirror _gf_consol_value keeps the unmodulated base, so tuner commits and
+        # this compose cleanly). Don't boil weight off while the pretrained mass
+        # is in transit: friction ~0 early, 63% at the telescope time constant,
+        # ~full by 3 tau, then the cosine lr takes it down -- rising-late, like
+        # the fluctuation sigma. UNet layers only (the TE anchor path is pinned).
+        if self.config.dissipation_fill_ramp:
+            self._current_fill_ramp = self._fill_ramp(self.step_idx, self.config.alpha_v_fast)
+            for m in self.layers:
+                m._gf_consol_buf.fill_(m._gf_consol_value * self._current_fill_ramp)
         if self.te_layers:
             winner_step(self.step_idx, self.total_steps, self.te_layers,
                         peak_lr=self.te_lr, config=self.config)

@@ -231,7 +231,8 @@ def snr_hook_rig(knee, base_committed, lr=7.5e-5, tuner=True, gf_consol=333.0):
         config=SimpleNamespace(autotune_gamma_snr=knee, gf_consol=gf_consol, lr=lr),
         autotuner=SimpleNamespace(committed=base_committed) if tuner else None,
         layers=[SimpleNamespace(_gf_consol_buf=torch.full((1,), -1.0)) for _ in range(3)],
-        _snr_mod_announced=True, _LAM_MOD_CAP=ConcordController._LAM_MOD_CAP)
+        _snr_mod_announced=True, _LAM_MOD_CAP=ConcordController._LAM_MOD_CAP,
+        _current_fill_ramp=1.0)
     return rig
 
 def snr_to_alphas(snrs):
@@ -337,6 +338,25 @@ cfg11 = make_concord_config(7.5e-5, SimpleNamespace(evap_build_min=64.0))
 check("11e pick-through", cfg11.evap_build_min == 64.0
       and make_concord_config(7.5e-5, SimpleNamespace()).evap_build_min == 128.0)
 check("11f GUI default exposed", gui_concord_defaults()["evap_build_min"] == 128.0)
+
+# ---- 12. telescope-fill dissipation ramp ------------------------------------
+import math as _math
+fr = ConcordController._fill_ramp
+check("12a ramp 0 at t=0; 63% at tau; ~1 late",
+      fr(0, 0.001) == 0.0
+      and abs(fr(500, 0.001) - (1 - _math.exp(-1))) < 1e-12
+      and fr(5000, 0.001) > 0.9999)
+check("12b pinned anchor (alpha_v=0) -> no ramp", fr(1000, 0.0) == 1.0)
+rig12 = snr_hook_rig(5.0, base_committed=200.0)
+rig12._current_fill_ramp = 0.5
+bufs = run_hook(rig12, [10.0])     # m = 2; base 200 * 2 * ramp 0.5 = 200
+check("12c gamma-SNR composes with the fill ramp",
+      all(abs(b - 200.0) < 1e-2 for b in bufs), f"bufs={bufs}")
+cfg12 = make_concord_config(7.5e-5, SimpleNamespace(dissipation_fill_ramp=False))
+check("12d pick-through and default ON",
+      cfg12.dissipation_fill_ramp is False
+      and make_concord_config(7.5e-5, SimpleNamespace()).dissipation_fill_ramp is True)
+check("12e GUI default exposed", gui_concord_defaults()["dissipation_fill_ramp"] is True)
 
 print()
 ok = all(results)

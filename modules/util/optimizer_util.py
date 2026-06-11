@@ -439,6 +439,7 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
         "gf_trust_delta_sq": 1.0,
         "min_leak": 0.1,
         "evap_build_min": 128.0,
+        "dissipation_fill_ramp": True,
         # Dimensionless mode ON by default: lam = lr*kappa = 0.025 (the nanoGPT
         # winner; ~kappa 333 at lr 7.5e-5 -- "kappa at diffusion lr needs to be
         # higher"). Clearing the field falls back to the engine kappa default

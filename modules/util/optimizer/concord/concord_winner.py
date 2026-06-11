@@ -82,6 +82,12 @@ class ConcordConfig:
     evap_build_min: float = 128.0  # hypothesis-infancy guard: dissipation fires only at
                                    # |s_fast| >= this many mantissa units (128 = one s_slow
                                    # LSB = one deploy tick = first committable size). 0 = off
+    dissipation_fill_ramp: bool = True  # run-level infancy: scale the friction by the
+                                        # anchor-fill fraction 1 - exp(-2*alpha_v_fast*t) --
+                                        # don't boil weight off while the pretrained mass is
+                                        # in transit and the meter is init-blind. Makes the
+                                        # dissipation rising-late like the fluctuation sigma.
+                                        # False = legacy (friction peaks at end of warmup)
     # dissipation (the "split")
     gf_consol: float = 50.0
     # DIMENSIONLESS dissipation: the per-step friction fraction lam = lr*kappa
