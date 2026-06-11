@@ -159,6 +159,26 @@ Cost when enabled: one small GPU→CPU sync per forward (same order as the
 trainer's existing per-step `.item()`); the hook is in the eager loss path,
 outside the CUDA-graph capture region, so graph discipline is untouched.
 
+## 6c. Optional: the post-sample WDDM-spill fix (patch 0003)
+
+`patches/0003-sample-recommit-order.patch` (independent; applies on `d62931b`
+alone or stacked on 0001/0002). Fixes the silent slowdown after mid-training
+sampling on Windows: the trainer ran `setup_train_device` (recommitting the
+10–16 GB UNet to dedicated VRAM) **before** the `torch_gc()` that returns the
+sampler's dead heap to the driver, so committed memory briefly tipped past the
+VRAM ceiling and WDDM demoted the tail of the recommit to shared memory —
+no OOM, no error, just sticky PCIe-speed pages (WDDM has no promotion path
+back). The patch moves a `torch_gc()` ahead of the recommit in the sample and
+backup paths, and adds `[graphmem]` probes (`post-sample`, `post-restore`,
+`post-backup-restore`) bracketing the transition.
+
+Verifying it worked: on the first sample after applying, the new probe lines
+should show `device_committed` staying under the card's total across the
+restore, and it/s after the sample should match it/s before. If `post-restore`
+is clean but training still crawls, the demotion happened *inside* the sample
+loop on your config — fall back to the `CONCORD_RESTART_ON_SAMPLE` wrapper
+(§7 / `scripts/concord_train_restart.py`), which is immune by construction.
+
 ## 7. Run
 
 GUI: optimizer = **CONCORD**, model SDXL, fine-tune; or load
