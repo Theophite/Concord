@@ -336,27 +336,27 @@ class ManualUNetGraph:
         if _ctrl is not None and self._alphas_cumprod is not None:
             _ctrl.on_timesteps(prep["timestep"], self._alphas_cumprod)
         if self.graph is None:
-            if os.environ.get("CONCORD_RESAWARE_DEBUG") and self._min_snr:
-                self._log_resaware()
-            if os.environ.get("CONCORD_GRAPH_DEBUG"):
-                # eager warmup (no side stream) under anomaly detection -> precise traceback
-                # of the op whose backward is replayed. Diagnostic only; off by default.
-                with torch.autograd.detect_anomaly():
-                    for i in range(self.warmup):
-                        print(f"[concord_graph] anomaly warmup iter {i}", flush=True)
-                        self._step_fn()
-            else:
-                strm = torch.cuda.Stream(); strm.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(strm):
-                    for _ in range(self.warmup):
-                        self._step_fn()                  # real-gradient warmup (no corruption)
-                torch.cuda.current_stream().wait_stream(strm)
-            self._zero_warmup_grads(model)               # discard warmup-accumulated grads
-            if not self.graph_te:
-                self._zero_input_grads()                 # fresh static-input grads for capture
-            self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph):
-                self.cap_loss = self._step_fn()
+            try:
+                self._warmup_and_capture(model)
+            except torch.cuda.OutOfMemoryError:
+                # Recapture on a heavily-exercised allocator (post-sample,
+                # post-cache) can OOM on fragmentation where the train-start
+                # capture succeeded. Retry ONCE from maximum headroom: drop the
+                # static buffers + any partial pool, gc, rebuild, recapture.
+                # If the retry also OOMs, the allocator is truly wedged --
+                # run via scripts/concord_train_restart.py (fresh-process
+                # relaunch per sample) instead.
+                print("[concord_graph] capture OOM (fragmented allocator) -> "
+                      "dropping static buffers and retrying once; if this also "
+                      "fails, run via scripts/concord_train_restart.py",
+                      flush=True)
+                self.release()
+                self.static = None
+                self._alloc(prep, model)
+                self._shape_key = shape_key
+                self._ensure_vhat(model).switch_to(shape_key)
+                self._copy_in(prep)
+                self._warmup_and_capture(model)
         else:
             if not self.graph_te:
                 self._zero_input_grads()                 # fresh static-input grads for this replay
@@ -371,6 +371,31 @@ class ManualUNetGraph:
                          if id(p) not in aux_ids and p.grad is not None)
                 print(f"[concord_graph] TE-graph: embedding/TE grad-norm sum {gn:.5f}", flush=True)
         return self.cap_loss
+
+    def _warmup_and_capture(self, model):
+        # Real-gradient warmup on a side stream, then capture. Factored out so
+        # the fragmentation-OOM retry in step() can re-run it after a rebuild.
+        if os.environ.get("CONCORD_RESAWARE_DEBUG") and self._min_snr:
+            self._log_resaware()
+        if os.environ.get("CONCORD_GRAPH_DEBUG"):
+            # eager warmup (no side stream) under anomaly detection -> precise traceback
+            # of the op whose backward is replayed. Diagnostic only; off by default.
+            with torch.autograd.detect_anomaly():
+                for i in range(self.warmup):
+                    print(f"[concord_graph] anomaly warmup iter {i}", flush=True)
+                    self._step_fn()
+        else:
+            strm = torch.cuda.Stream(); strm.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(strm):
+                for _ in range(self.warmup):
+                    self._step_fn()                  # real-gradient warmup (no corruption)
+            torch.cuda.current_stream().wait_stream(strm)
+        self._zero_warmup_grads(model)               # discard warmup-accumulated grads
+        if not self.graph_te:
+            self._zero_input_grads()                 # fresh static-input grads for capture
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self.cap_loss = self._step_fn()
 
     def _zero_warmup_grads(self, model):
         # Discard grads accumulated during warmup so the captured backward writes exactly this
