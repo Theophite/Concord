@@ -255,6 +255,18 @@ class ConcordController:
         import math
         return 1.0 - math.exp(-2.0 * alpha_v_fast * t)
 
+    def read_boil_fraction(self):
+        """False-kill audit: fraction of evaporated ENERGY since the last call
+        that was drift-aligned (learned-direction) mass -- the only channel
+        through which learning can dissipate (S/A are structurally immune).
+        Healthy gate ~ 0; rising = the (1-coh) tax is eating slow-cohering
+        signal. None when nothing evaporated in the window."""
+        from prototype_packed_b import read_boil
+        if not self.layers:
+            return None
+        a, b = read_boil(self.layers[0].packed_w.device)
+        return (a / b) if b > 0 else None
+
     def read_memorization_gap(self):
         """Memorization-gap meter: first-order estimate of (L_deploy - L_live),
         accumulated in the fused backward since the last call (one host sync --

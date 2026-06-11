@@ -658,6 +658,9 @@ def _apply_packed_adamw_kernel(
     memgap_ptr,          # *fp32[1]: memorization-gap accumulator -- per-tile atomic add of
                           # sum(grad * s_fast_in_W), the first-order (L_live - L_deploy).
                           # (Distinct from gap_inv_scale, the gap-FEEDBACK split below.)
+    boil_ptr,            # *fp32[2]: false-kill audit -- [0] += sum(killed_w^2 * coh),
+                          # [1] += sum(killed_w^2); killed_w = realized evaporation in W
+                          # units. boil fraction = [0]/[1] (see _BOIL_BUFS).
     gap_inv_scale,       # fp32: 1/gap_scale for the conserved gap-feedback pass/evap split
     step_salt_ptr,
     consolidate_ptr,     # *int32[1]: gradient-accumulation gate. 1 = consolidate (full apply,
@@ -857,6 +860,11 @@ def _apply_packed_adamw_kernel(
         # judge. evap_build_min = 0 -> all pass (bit-exact legacy).
         build_ok = (tl.abs(d_fs) >= evap_build_min).to(tl.float32)
         evap_mantissa = evap_frac * d_fs * g_active * build_ok
+        # boil meter: energy decomposition of the realized kill (W units)
+        killed_w = evap_mantissa * scale_fwd
+        killed_sq = killed_w * killed_w
+        tl.atomic_add(boil_ptr, tl.sum(killed_sq * coh))
+        tl.atomic_add(boil_ptr + 1, tl.sum(killed_sq))
     else:
         step_live = step_live + weight_decay * s_fast_in_w
         evap_mantissa = 0.0
@@ -1154,6 +1162,40 @@ def set_min_leak(v):
 # accumulated mean-batch loss normalization. CUDA-graph-safe: a static buffer
 # the captured kernel atomic-adds into; the host zero_() between replays.
 _MEMGAP_BUFS = {}
+
+# Boil meter: per-device fp32[2] accumulator auditing the gate's false-kill
+# rate. Per element the evaporated vector's drift-aligned energy fraction IS
+# coh (sig/noise decomposition is element-wise), so
+#     boil = sum(killed^2 * coh) / sum(killed^2)   in [0,1]
+# = the fraction of evaporated ENERGY that was drift-aligned (learned-
+# direction) mass. A healthy gate kills where coh ~ 0 -> boil ~ 0; boil
+# rising means the dissipation is eating in-flight learned signal (the
+# slow-cohering tax). Consolidated mass (S, A) is structurally immune --
+# the evaporation only touches s_fast -- so this meter covers the ONLY
+# channel through which learning can dissipate. killed is the realized
+# evaporation (all guards included), in W units for cross-layer summing.
+_BOIL_BUFS = {}
+
+
+def _boil_buf(device):
+    key = str(device)
+    buf = _BOIL_BUFS.get(key)
+    if buf is None:
+        buf = torch.zeros(2, dtype=torch.float32, device=device)
+        _BOIL_BUFS[key] = buf
+    return buf
+
+
+def read_boil(device, reset=True):
+    """Returns (aligned_energy, total_energy) accumulated since last reset
+    (one host sync). boil fraction = aligned/total; total == 0 -> no kills."""
+    buf = _BOIL_BUFS.get(str(device))
+    if buf is None:
+        return 0.0, 0.0
+    a, b = float(buf[0]), float(buf[1])
+    if reset:
+        buf.zero_()
+    return a, b
 
 
 def _memgap_buf(device):
@@ -1464,6 +1506,7 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         _ratio_leak_floor_ptr,
         bc_buf,
         _memgap_buf(packed_w.device),
+        _boil_buf(packed_w.device),
         float(gap_inv),
         step_counter,
         consolidate_ptr,

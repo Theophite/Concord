@@ -359,6 +359,26 @@ check("12d pick-through and default ON",
       and make_concord_config(7.5e-5, SimpleNamespace()).dissipation_fill_ramp is True)
 check("12e GUI default exposed", gui_concord_defaults()["dissipation_fill_ramp"] is True)
 
+# ---- 13. boil meter (false-kill audit) ---------------------------------------
+bbuf = ppb._boil_buf("cpu")
+check("13a buffer zero-init and idempotent accessor",
+      float(bbuf.sum()) == 0.0 and ppb._boil_buf("cpu") is bbuf)
+# formula mirror: killed=(2,1) in W units, coh=(0,1) ->
+#   aligned = 4*0 + 1*1 = 1 ; total = 4 + 1 = 5 ; boil = 0.2
+for killed, coh_v in ((2.0, 0.0), (1.0, 1.0)):
+    bbuf[0] += killed * killed * coh_v
+    bbuf[1] += killed * killed
+a, b = ppb.read_boil("cpu")
+check("13b energy decomposition and reset",
+      a == 1.0 and b == 5.0 and float(bbuf.sum()) == 0.0)
+bbuf[0] += 1.0; bbuf[1] += 5.0
+rig13 = SimpleNamespace(layers=[SimpleNamespace(packed_w=torch.zeros(1))])
+check("13c controller boil fraction",
+      abs(ConcordController.read_boil_fraction(rig13) - 0.2) < 1e-12)
+check("13d no kills -> None; no layers -> None",
+      ConcordController.read_boil_fraction(rig13) is None
+      and ConcordController.read_boil_fraction(SimpleNamespace(layers=[])) is None)
+
 print()
 ok = all(results)
 print(f"{'ALL PASS' if ok else 'FAILURES'} ({sum(results)}/{len(results)})")

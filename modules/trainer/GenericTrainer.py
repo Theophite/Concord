@@ -1006,6 +1006,11 @@ class GenericTrainer(BaseTrainer):
                             if _gap is not None:
                                 _msg += (f"  gap={_gap:+.2e}"
                                          f"  deploy_smooth={ema_deploy:.5f}")
+                                _boil = _ctrl.read_boil_fraction()
+                                if _boil is not None:
+                                    self.tensorboard.add_scalar(
+                                        "loss/concord_boil", _boil, train_progress.global_step)
+                                    _msg += f"  boil={_boil:.3f}"
                             step_tqdm.write(_msg)
 
                         accumulated_loss = 0.0
