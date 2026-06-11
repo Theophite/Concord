@@ -1,0 +1,157 @@
+diff --git a/modules/modelSetup/BaseStableDiffusionXLSetup.py b/modules/modelSetup/BaseStableDiffusionXLSetup.py
+index 8258f43..4fa4433 100644
+--- a/modules/modelSetup/BaseStableDiffusionXLSetup.py
++++ b/modules/modelSetup/BaseStableDiffusionXLSetup.py
+@@ -2,6 +2,7 @@ from abc import ABCMeta
+ from random import Random
+ 
+ import modules.util.multi_gpu_util as multi
++import modules.util.spike_log as spike_log
+ from modules.model.StableDiffusionXLModel import StableDiffusionXLModel, StableDiffusionXLModelEmbedding
+ from modules.modelSetup.BaseModelSetup import BaseModelSetup
+ from modules.modelSetup.mixin.ModelSetupDebugMixin import ModelSetupDebugMixin
+@@ -422,13 +423,15 @@ class BaseStableDiffusionXLSetup(
+             data: dict,
+             config: TrainConfig,
+     ) -> Tensor:
+-        return self._diffusion_losses(
++        losses = self._diffusion_losses(
+             batch=batch,
+             data=data,
+             config=config,
+             train_device=self.train_device,
+             betas=model.noise_scheduler.betas,
+-        ).mean()
++        )
++        spike_log.SPIKE_LOG.log(losses, data, batch)   # no-op unless CONCORD_SPIKE_LOG is set
++        return losses.mean()
+ 
+     def prepare_text_caching(self, model: StableDiffusionXLModel, config: TrainConfig):
+         model.to(self.temp_device)
+diff --git a/modules/util/spike_log.py b/modules/util/spike_log.py
+new file mode 100644
+index 0000000..d54146d
+--- /dev/null
++++ b/modules/util/spike_log.py
+@@ -0,0 +1,121 @@
++"""Loss-spike logger: when a training batch's loss spikes, append the
++offending samples (image path, sampled timestep, per-sample loss) to a JSONL
++file, so "the loss bounced" becomes "THESE images at THESE timesteps".
++
++OFF by default — a single `if` per forward. Enable by setting
++CONCORD_SPIKE_LOG to an output path, typically OUTSIDE the training/repo
++tree so it survives workspace cleanup and never lands in a checkpoint dir:
++
++    export CONCORD_SPIKE_LOG=/c/fisher/logs/spikes.jsonl     # Git Bash
++    set CONCORD_SPIKE_LOG=C:\\fisher\\logs\\spikes.jsonl       # cmd
++
++Tuning (env, optional):
++    CONCORD_SPIKE_RATIO    trigger: loss_i > ratio * smooth    (default 2.0)
++    CONCORD_SPIKE_WARMUP   forwards to learn the EMA first     (default 100)
++    CONCORD_SPIKE_PROMPTS  =1 to include the caption in each record
++
++The smooth baseline here is its own EMA over batch means (ramped decay ->
++0.99, same scheme as GenericTrainer's printed `smooth loss`); it will track
++your printed value closely but not bit-exactly under gradient accumulation
++(this hook sees every forward, the trainer prints per update step). Records
++carry a `forward` counter; if you want your trainer's step number in the
++records too, call `spike_log.SPIKE_LOG.set_step(global_step)` from wherever
++you print the [loss] line.
++
++Cost when enabled: one scalar GPU->CPU sync per forward (same order as the
++trainer's existing per-step `.item()`), plus a few JSON lines per spike.
++The hook sits in the eager loss path — nothing here crosses the CUDA-graph
++boundary (the captured region is the UNet backward/step, not the loss).
++
++Output: one JSON object per line, e.g.
++  {"forward": 5191, "step": null, "batch_mean": 0.2587, "smooth": 0.1212,
++   "samples": [{"image": ".../foo.png", "timestep": 941, "loss": 0.4012}]}
++Spikes at HIGH timesteps are the timestep lottery (high-noise t is just
++worth more loss); the interesting ones are repeat offenders at LOW t —
++those are data problems (bad crop/caption), not sampling.
++"""
++
++import json
++import os
++import time
++
++import torch
++
++
++class SpikeLogger:
++    def __init__(self, path, ratio=2.0, warmup=100, include_prompts=False):
++        self.path = path
++        self.enabled = bool(path)
++        self.ratio = float(ratio)
++        self.warmup = int(warmup)
++        self.include_prompts = include_prompts
++        self.ema = None
++        self.count = 0          # forwards seen
++        self.step = None        # optional: trainer's global step, via set_step()
++        self._file = None
++
++    @classmethod
++    def from_env(cls):
++        return cls(
++            path=os.environ.get("CONCORD_SPIKE_LOG", ""),
++            ratio=float(os.environ.get("CONCORD_SPIKE_RATIO", "2.0")),
++            warmup=int(os.environ.get("CONCORD_SPIKE_WARMUP", "100")),
++            include_prompts=os.environ.get("CONCORD_SPIKE_PROMPTS", "") == "1",
++        )
++
++    def set_step(self, step):
++        self.step = int(step)
++
++    def _write(self, record):
++        if self._file is None:
++            d = os.path.dirname(os.path.abspath(self.path))
++            if d:
++                os.makedirs(d, exist_ok=True)
++            self._file = open(self.path, "a", encoding="utf-8")
++        self._file.write(json.dumps(record) + "\n")
++        self._file.flush()      # survive a crash mid-run
++
++    @torch.no_grad()
++    def log(self, losses, data, batch):
++        """Call with the per-sample loss vector BEFORE .mean().
++
++        losses: [B] tensor; data: model_output_data (for 'timestep');
++        batch: the trainer batch (for 'image_path' / 'prompt_1').
++        """
++        if not self.enabled:
++            return
++        self.count += 1
++        ls = losses.detach().float().cpu().tolist()   # the one sync, B scalars
++        m = sum(ls) / len(ls)
++        prev = self.ema if self.ema is not None else m
++        # spike test against the PRE-update smooth, so the spike itself
++        # doesn't inflate its own baseline
++        if self.count > self.warmup:
++            spikers = [i for i, l in enumerate(ls) if l > self.ratio * prev]
++            if spikers:
++                ts = data.get("timestep")
++                ts = ts.detach().cpu().tolist() if ts is not None else [None] * len(ls)
++                paths = batch.get("image_path") or [None] * len(ls)
++                prompts = batch.get("prompt_1") if self.include_prompts else None
++                record = {
++                    "forward": self.count,
++                    "step": self.step,
++                    "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
++                    "batch_mean": round(m, 6),
++                    "smooth": round(prev, 6),
++                    "samples": [
++                        {
++                            "image": paths[i] if i < len(paths) else None,
++                            "timestep": ts[i] if i < len(ts) else None,
++                            "loss": round(ls[i], 6),
++                            **({"prompt": prompts[i]} if prompts else {}),
++                        }
++                        for i in spikers
++                    ],
++                }
++                self._write(record)
++        decay = min(0.99, 1.0 - 1.0 / self.count)     # GenericTrainer's ramp
++        self.ema = prev * decay + m * (1.0 - decay)
++
++
++SPIKE_LOG = SpikeLogger.from_env()

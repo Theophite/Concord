@@ -118,6 +118,47 @@ edit at the controller construction site
   capture — for autotuned runs either set `concord_cuda_graph: false`, or arrange
   capture after the commit. Eager runs need nothing.
 
+## 6b. Optional: the loss-spike logger (patch 0002)
+
+`patches/0002-spike-logger.patch` (independent of 0001; applies on the same
+`d62931b` tip, same `git apply` flow as §3). It answers "which images at which
+timesteps produced those loss spikes": a new `modules/util/spike_log.py` plus a
+one-line hook in `BaseStableDiffusionXLSetup.calculate_loss`, catching the
+per-sample loss vector before the `.mean()`. If your local copy has modified
+`calculate_loss`, the patch will refuse — in that case paste the hook by hand
+(it is three lines; see the patch).
+
+**Off by default** (a single `if` per forward). Enable by pointing the output
+anywhere writable, ideally outside the repo/workspace tree:
+
+```bash
+export CONCORD_SPIKE_LOG=/c/fisher/logs/spikes.jsonl
+# optional: CONCORD_SPIKE_RATIO=2.0  CONCORD_SPIKE_WARMUP=100  CONCORD_SPIKE_PROMPTS=1
+```
+
+Each spike appends one JSON line: forward counter, batch mean, the smooth
+baseline it exceeded, and per offending sample `{image, timestep, loss}`
+(+caption with `CONCORD_SPIKE_PROMPTS=1`). The trigger is per-sample
+(`loss_i > ratio × smooth`), so a 0.26 batch in a 0.12 run gets attributed to
+the one image that caused it, not the whole batch. Reading the output: spikes
+at high `timestep` are the timestep lottery (high-noise t is intrinsically
+expensive) — ignore them; **repeat offenders at low/mid t are data problems**
+(bad crop, wrong caption, duplicate). A quick offender census:
+
+```bash
+python -c "
+import json, collections
+c = collections.Counter()
+for l in open('/c/fisher/logs/spikes.jsonl'):
+    for s in json.loads(l)['samples']:
+        if s['timestep'] is not None and s['timestep'] < 700: c[s['image']] += 1
+print(*c.most_common(20), sep='\n')"
+```
+
+Cost when enabled: one small GPU→CPU sync per forward (same order as the
+trainer's existing per-step `.item()`); the hook is in the eager loss path,
+outside the CUDA-graph capture region, so graph discipline is untouched.
+
 ## 7. Run
 
 GUI: optimizer = **CONCORD**, model SDXL, fine-tune; or load
