@@ -624,3 +624,51 @@ where labels can be wrong.* Predicted next rung (untested): k-NN/local-PCA-direc
 jitter — on-manifold chords — should land between mixup and crop without domain
 knowledge. For label-free domains (diffusion), the mixup analogue is target-space
 mixing, not class interpolation.
+
+## Exp 13 — the telescope window in epoch units (`exp13_telescope_window.py`)
+
+α_v had never been swept (0.001 in every experiment and, per the records, the repo's
+history) — an *absolute* 500-step window meaning 16 epochs on this protocol and a
+quarter-epoch on a 2k-image bs1 SDXL run. Sweep: window = 1/(2·α_v) in epoch units,
+80ep protocol, NS drive, lr 1e-2, κ: clean 0 / 30%-noise 150 (κ not retuned per
+window — caveat), 3 seeds. Boundary cells and a gate-closure control added after the
+grid optimum landed on the edge.
+
+| window (ep) | clean deploy | noisy deploy | noisy memorized | noisy late coh |
+|---|---|---|---|---|
+| 1 | 94.58 | **80.21 ± 0.93** | **72.5%** | 0.296 |
+| 4 | 94.80 | 82.52 | 64.1% | 0.282 |
+| 16 (historical) | 94.85 | 86.68 | 48.2% | 0.246 |
+| 64 | 94.73 | 91.29 | 31.5% | 0.166 |
+| 256 | — | 92.50 | 27.2% | 0.101 |
+| 1024 | — | 92.40 | 25.9% | 0.074 |
+| 4096 | — | 92.56 | 26.0% | 0.063 |
+| **control: gate closed (C\*=0), same F** | — | **92.56 ± 0.36** | **25.8%** | 0 |
+
+1. **The control collapses the mechanism.** The long-window plateau is *exactly* the
+   gateless limit — at 256+ epoch windows the gate is nearly shut (coh 0.06–0.10) and
+   the residual telescope signal adds nothing. The initially attractive
+   "temporal-prior / early-phase-anchoring" interpretation is **not supported**: the
+   monotone improvement from 1 → 64 epochs is progressively *less gate-approval of
+   memorization drift*, and the asymptote is no approval at all.
+2. **Short windows are actively dangerous under noise**: at a 1-epoch window the gate
+   re-anchors on the most recent motion — including the memorization phase — and
+   exempts it from friction: 72.5% memorized at the very same F that achieves 25.8%
+   with the gate shut. **The window is the gate's trust timescale**: short = trusts
+   the present; long = trusts almost nothing.
+3. **Regime conclusion, consistent with exps 10/12**: in the heavy-memorization,
+   no-diversity corner the gate is a liability (its blind spot is the regime's
+   dominant failure), and the optimum is strong *ungated* friction — reachable either
+   by window → ∞ or directly by closing the gate. 92.56/25.8% is the new best no-aug
+   noisy result of the campaign (+5.9 over the historical window, +2.5 over exp 10's
+   v̂ record). In the regimes the product targets (real data diversity), the gated
+   arms have consistently won — the conclusion is not "delete the gate" but "gate
+   trust is a regime knob, and the noisy-static corner wants it at zero."
+4. **Clean regime: window-insensitive** (94.6–94.9 across 64×; mild dip only at 1ep) —
+   one more entry in the cascade's insensitivity ledger.
+5. **Parametrization stands regardless of mechanism**: α_v belongs in epoch units,
+   derived per-run like `total_steps` (the current absolute constant silently spans
+   ¼-epoch to 16-epoch windows across real regimes), and the SDXL fork's ¼-epoch
+   window sits on the *dangerous* short side for memorization-pressured fine-tunes.
+   The telescope amplitude grew sublinearly (|d|max ×30 over a ×64 window range, no
+   int8 pressure at these scales).
