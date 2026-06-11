@@ -659,9 +659,11 @@ grid optimum landed on the edge.
 3. **Regime conclusion, consistent with exps 10/12**: in the heavy-memorization,
    no-diversity corner the gate is a liability (its blind spot is the regime's
    dominant failure), and the optimum is strong *ungated* friction — reachable either
-   by window → ∞ or directly by closing the gate. 92.56/25.8% is the new best no-aug
-   noisy result of the campaign (+5.9 over the historical window, +2.5 over exp 10's
-   v̂ record). In the regimes the product targets (real data diversity), the gated
+   by window → ∞ or directly by closing the gate. 92.56/25.8% **ties** (does not beat —
+   an earlier draft of this entry miscredited it) the standing no-aug record, exp 12's
+   mixup at 92.52/25.8%: two unrelated mechanisms — ungated weight-space friction
+   (= EMA-teacher distillation, per the κ-identity) and data-space target dilution —
+   converging on the same number, both 3.8 below crop-aug + *gated* cascade (96.31). In the regimes the product targets (real data diversity), the gated
    arms have consistently won — the conclusion is not "delete the gate" but "gate
    trust is a regime knob, and the noisy-static corner wants it at zero."
 4. **Clean regime: window-insensitive** (94.6–94.9 across 64×; mild dip only at 1ep) —
@@ -672,3 +674,29 @@ grid optimum landed on the edge.
    window sits on the *dangerous* short side for memorization-pressured fine-tunes.
    The telescope amplitude grew sublinearly (|d|max ×30 over a ×64 window range, no
    int8 pressure at these scales).
+
+
+### Exp 13 addendum — do the two 92.5s stack? (suppression bound)
+
+| arm (30% noise, 80ep, no crop-aug) | deploy | memorized |
+|---|---|---|
+| gateless friction F=1.5 alone | 92.56 ± 0.36 | 25.8% |
+| mixup, gated, F=1.5 | 92.52 ± 0.35 | 25.8% |
+| **gateless F=1.5 + mixup** | **93.15 ± 0.10** | **18.0%** |
+| gateless F=0.5 + mixup | 87.35 ± 0.89 | 74.2% |
+| crop-aug + gated (exp 10 ref) | **96.31 ± 0.22** | 10.6% |
+
+1. **Mostly the same 92.5**: stacking buys only +0.6 accuracy (though memorization
+   composes better, 25.8 → 18.0). Consistent with a **suppression bound**: friction
+   and dilution can stop wrong labels from being fitted but cannot recover the
+   information the corrupted 30% would have carried — while crops *add* information
+   (orbit structure) and raise the ceiling itself. Optimizer-side and loss-side
+   defenses plateau ~92.5–93.2 in this corner; the data-side fix reaches 96.3 — and
+   does so with the gate ON, because augmentation repairs the coherence signal the
+   gate needs.
+2. **Friction is load-bearing, mixup is an adjuvant**: at F=0.5 ungated, mixup alone
+   collapses (74.2% memorized) — dilution *slows* memorization per step but over 80
+   epochs the diluted wrong labels still get fitted unless friction deletes the drift.
+   Exp 12's mixup number was partly riding on its F=1.5.
+3. Standing conclusion for the corner: best-known no-aug = gateless F=1.5 + mixup
+   (93.15); best-known overall = restore data diversity and keep the gate (96.31).
