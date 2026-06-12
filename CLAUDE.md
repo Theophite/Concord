@@ -110,15 +110,21 @@ window; an empty denominator drops the field from the line.
 
 **Expected transients — don't tune on them:**
 
-- **Init consolidation** (first ~2/α optimizer steps): coh reads init residue, so boil
-  climbs and collapses while the fill ramp still holds λ at a few % of target — a high
-  ratio on negligible flow. Receipt (SDXL 2026-06-11, λ=0.5, γ-SNR, epoch window):
-  boil peaked 0.20 at log-step ~95, fell to ≤0.005 by ~115, stayed ≤0.005 with
-  waste ≤0.006 through epoch 2. That trace is the healthy signature.
-- **Anchored TE rows** run coh≡0 (invariant 9), so embedding kills land entirely in
-  the denominators: they dilute boil and put occasional small waste blips on the line
-  that are not UNet churn. Negligible mass at SDXL scale, but expect nonzero waste
-  noise whenever packed embeddings train.
+- **Init consolidation** (first ~2/α optimizer steps): coh reads init residue, so
+  boil climbs steeply while the fill ramp still holds λ at a few % of target — a high
+  ratio on negligible flow. The TRUE UNet trace (measured 2026-06-11 with embeddings
+  frozen by the divot, λ=0.5, γ-SNR, epoch window): peak ~0.31 at the warmup
+  boundary (~log-step 100), then a slow washout (~0.05 by 250, ~0.02 by 670) as the
+  init-residue coherence dies under the rising fill ramp. Waste ≤0.001 throughout.
+- **The denominators are SHARED across every packed group**, and that has burned us:
+  packed-embedding kills carry coh≡0 and kill energy ∝ lr², so a hot embedding group
+  (TI-scale lr 1e-3 = 100× UNet) DOMINATES the denominator — an earlier run's boil
+  "collapsed to ≤0.005 by step ~115" and was documented here as the healthy
+  signature; it was dilution masking the UNet's real ~0.3 peak (the collapse step
+  matched the embedding group's warmup completion exactly, and with embeddings
+  frozen the collapse vanished). At lr_emb ≈ 3e-5 the pollution is ~1000× smaller
+  and boil reads as UNet-only. Before trusting a boil level, ask what else is
+  killing into the shared buffer and how hot its lr is.
 
 (`gap` on the same line is unrelated plumbing: the first-order deploy−live loss
 estimate from the memgap buffer. Positive spikes at init and after backup/restore that
