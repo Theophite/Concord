@@ -546,6 +546,26 @@ class GenericTrainer(BaseTrainer):
             )
 
             self.__save_backup_config(backup_path)
+
+            # Concord controller clock: persist the TRUE update count with the
+            # backup. The resume seed otherwise derives it as global_step //
+            # accum, which breaks when gradient_accumulation_steps changes
+            # between segments (2026-06-12: an accum 4->8 resume seeded 236
+            # instead of 472 -- the divot re-froze for half an epoch and every
+            # controller-clock consumer ran half-rewound).
+            _ctrl = getattr(self.model, "concord_controller", None)
+            if _ctrl is not None:
+                try:
+                    with open(os.path.join(backup_path, "concord_clock.json"),
+                              "w", encoding="utf-8") as f:
+                        json.dump({
+                            "update_steps": int(_ctrl.step_idx),
+                            "global_step": int(train_progress.global_step),
+                            "accum": int(max(1, self.config.gradient_accumulation_steps)),
+                        }, f)
+                except OSError as e:
+                    print(f"[concord] could not write backup clock ({e}); a "
+                          f"resume with a different accum will mis-seed", flush=True)
         except Exception:
             traceback.print_exc()
             print("Could not save backup. Check your disk space!")
@@ -836,9 +856,33 @@ class GenericTrainer(BaseTrainer):
                     # continue, or the restart-on-sample wrapper's per-segment
                     # relaunches) a zeroed clock would re-ramp the friction from
                     # 0 after EVERY sample and re-run the probe each segment.
-                    # Seed it from the resumed global step (update-step units).
-                    _resumed_updates = int(getattr(train_progress, "global_step", 0)
-                                           // max(1, self.config.gradient_accumulation_steps))
+                    # Prefer the clock persisted in the backup (exact update
+                    # count, accum-change-proof); fall back to deriving from
+                    # micro-steps, which silently assumes accum never changed.
+                    _resumed_updates = None
+                    _bk = (self.config.get_last_backup_path()
+                           if hasattr(self.config, "get_last_backup_path") else None)
+                    if _bk:
+                        try:
+                            with open(os.path.join(_bk, "concord_clock.json"),
+                                      encoding="utf-8") as f:
+                                _clk = json.load(f)
+                            if (int(_clk.get("global_step", -1))
+                                    == int(getattr(train_progress, "global_step", 0))):
+                                _resumed_updates = int(_clk["update_steps"])
+                                print(f"[concord] controller clock restored from the "
+                                      f"backup: update-step {_resumed_updates} "
+                                      f"(accum-change-proof)", flush=True)
+                            else:
+                                print(f"[concord] backup clock is for global_step "
+                                      f"{_clk.get('global_step')} but resume is at "
+                                      f"{getattr(train_progress, 'global_step', 0)}; "
+                                      f"falling back to micro-step derivation", flush=True)
+                        except (OSError, ValueError, KeyError, TypeError):
+                            pass
+                    if _resumed_updates is None:
+                        _resumed_updates = int(getattr(train_progress, "global_step", 0)
+                                               // max(1, self.config.gradient_accumulation_steps))
                     if _resumed_updates > self.model.concord_controller.step_idx:
                         self.model.concord_controller.step_idx = _resumed_updates
                         print(f"[concord] controller clock seeded at update-step "
