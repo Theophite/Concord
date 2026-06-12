@@ -147,6 +147,25 @@ class ManualUNetGraph:
         # _warmup_and_capture captures into the SAME pool (self._pool) while
         # the anchor still holds it alive, THEN drops the anchor.
         import gc
+        if keep_pool and self._pool_bytes:
+            # Affordability guard at RELEASE time. Holding the pool through a
+            # backup makes the save's transient run ON TOP of it -- measured
+            # committed 25.76G / free 0.00G at the epoch boundary on the 24G
+            # card, and the WDDM demotion tax lingered for the next epoch
+            # (1.51 s/it vs ~1.1 baseline). The capture-time check fires too
+            # late for that case: the overflow happens DURING the save. If
+            # free cannot cover the held pool + margin now, demote to the full
+            # release -- the save gets the headroom and the recapture pays 1x
+            # from clean address space.
+            try:
+                free, _ = torch.cuda.mem_get_info()
+            except Exception:
+                free = None
+            if free is not None and free < self._pool_bytes + (256 << 20):
+                print(f"[concord_graph] release headroom {free / 2 ** 30:.2f}G < "
+                      f"pool {self._pool_bytes / 2 ** 30:.2f}G + margin -> full "
+                      f"release (pool freed before the boundary work)", flush=True)
+                keep_pool = False
         if keep_pool:
             self._stale_graph = self.graph   # anchor; replay is forbidden
             self.graph = None
