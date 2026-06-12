@@ -160,6 +160,7 @@ class ConcordController:
         self.emb_delay_steps = 0     # resolved at horizon finalize (steps/epoch known)
         self.emb_auto_drive = False  # normalize per-token drive from the divot window
         self.emb_freq_exponent = 0.5  # beta in drive = (med(n)/n)^beta
+        self.emb_calib_path = None   # workspace sidecar (counts = dataset property)
         self._emb_drive_applied = False
         self.steps_per_epoch = 0.0
         self.step_idx = 0
@@ -281,7 +282,8 @@ class ConcordController:
         return step_idx - d, max(1, total_steps - d)
 
     def register_embedding_cores(self, planes, emb_lr, delay_epochs=0.0,
-                                 auto_drive=False, freq_exponent=0.5):
+                                 auto_drive=False, freq_exponent=0.5,
+                                 calib_path=None):
         """Bring the packed-embedding cores under the controller's physics. As
         created they are the LEAST protected, HIGHEST leverage parameters in
         the system: gf_consol = 0 (zero dissipation -- the only trainables
@@ -303,6 +305,7 @@ class ConcordController:
         self.emb_delay_epochs = max(0.0, float(delay_epochs))
         self.emb_auto_drive = bool(auto_drive)
         self.emb_freq_exponent = max(0.0, float(freq_exponent))
+        self.emb_calib_path = calib_path
         if not self.emb_cores:
             return
         lam = (float(self.config.dissipation) if self.config.dissipation is not None
@@ -345,27 +348,59 @@ class ConcordController:
         sqrt(frequency) advantage: styles still win shared features, objects
         keep their own content by coherence. The clamp stays tight: a rare
         token's direction estimate is noisy, and amplifying it more than ~5x
-        just feeds the friction. Unseen tokens (n=0; or the accumulators were
-        lost to a mid-divot restart -- they do NOT round-trip through backups)
-        keep drive 1."""
+        just feeds the friction. Unseen tokens (n=0) keep drive 1.
+
+        PERSISTENCE: the counts are a DATASET property, not a run property --
+        measured once, valid until the captions change. A successful
+        measurement is saved to the workspace sidecar (emb_calib_path, JSON
+        keyed by placeholder, storing n -- the primitive -- so beta stays
+        adjustable at load time). A cold start past the divot (resume or
+        restart-wrapper segment; the accumulators do NOT round-trip through
+        backups) reloads the sidecar instead of re-measuring; uniform drive
+        is the fallback only when there is nothing to load."""
         self._emb_drive_applied = True
         beta = max(0.0, float(self.emb_freq_exponent))
+        loaded = None
+        saved_planes = []
         for plane_idx, tr in enumerate(self.emb_trainables):
+            K = tr._seen.numel()
+            names = (self.emb_row_names if len(self.emb_row_names) == K
+                     else [f"row{i}" for i in range(K)])
             n = tr._seen.float()                         # [K] sightings
             A = tr._accum.float().norm(dim=1)            # [K] justified distance
+            source = "measured this window"
+            if not bool((n > 0).any()):
+                if loaded is None:
+                    loaded = self._load_calibration() or {}
+                planes = loaded.get("planes") or []
+                tok = (planes[plane_idx].get("tokens", {})
+                       if plane_idx < len(planes) else {})
+                if not tok:
+                    print(f"[concord] embedding calibration TE{plane_idx + 1}: empty "
+                          f"accumulator and no saved table -- drive stays uniform")
+                    continue
+                n = torch.tensor([float(tok.get(nm, {}).get("n", 0.0)) for nm in names])
+                A = torch.tensor([float(tok.get(nm, {}).get("A", 0.0)) for nm in names])
+                miss = sorted({nm for nm in names if nm not in tok})
+                if miss:
+                    print(f"[concord] embedding calibration TE{plane_idx + 1}: "
+                          f"{len(miss)} token(s) absent from the saved table keep "
+                          f"drive 1 (dataset changed?): {', '.join(miss[:6])}")
+                source = (f"restored from sidecar, measured at step "
+                          f"{loaded.get('measured_at_step', '?')}")
             live = n > 0
             if not bool(live.any()):
-                print(f"[concord] embedding calibration TE{plane_idx + 1}: empty "
-                      f"accumulator (resumed past the divot?) -- drive stays uniform")
+                print(f"[concord] embedding calibration TE{plane_idx + 1}: no live "
+                      f"counts -- drive stays uniform")
                 continue
             D = A / n.clamp_min(1.0)                     # distance per sighting
-            med_n = n[live].median()
-            drive = torch.where(
-                live, ((med_n / n.clamp_min(1.0)) ** beta).clamp(0.2, 5.0),
-                torch.ones_like(n))
+            drive = self._emb_drive_from_counts(n, beta)
             tr.set_drive(drive)
+            if source == "measured this window":
+                saved_planes.append({"te": plane_idx + 1, "tokens": {
+                    nm: {"n": round(float(n[i]), 2), "A": float(A[i])}
+                    for i, nm in enumerate(names)}})
             w = drive * n                                # per-epoch rate weight
-            names = self.emb_row_names or [f"row{i}" for i in range(A.numel())]
             order = torch.argsort(torch.where(live, D, torch.full_like(D, -1.0)),
                                   descending=True)       # unseen rows sort last
             live_n = int(live.sum())
@@ -375,11 +410,53 @@ class ConcordController:
             near = ", ".join(fmt(int(i)) for i in order[max(0, live_n - 4):live_n].flip(0))
             n_lo = int((drive <= 0.2 + 1e-6).sum())
             n_hi = int((drive >= 5.0 - 1e-6).sum())
-            print(f"[concord] embedding calibration TE{plane_idx + 1}: drive = "
-                  f"(median(n)/n)^{beta:g} over {live_n} live tokens (clamped: "
+            print(f"[concord] embedding calibration TE{plane_idx + 1} [{source}]: "
+                  f"drive = (median(n)/n)^{beta:g} over {live_n} live tokens (clamped: "
                   f"{n_lo} at 0.2x, {n_hi} at 5x); w = drive*n = per-epoch rate weight\n"
                   f"          farthest/sighting {far}\n"
                   f"          nearest/sighting  {near}", flush=True)
+        if saved_planes and len(saved_planes) == len(self.emb_trainables):
+            self._save_calibration(saved_planes)
+
+    @staticmethod
+    def _emb_drive_from_counts(n, beta):
+        """drive = (median(n)/n)^beta over live rows, decade clamp, unseen 1."""
+        live = n > 0
+        med_n = n[live].median()
+        return torch.where(
+            live, ((med_n / n.clamp_min(1.0)) ** beta).clamp(0.2, 5.0),
+            torch.ones_like(n))
+
+    def _save_calibration(self, planes):
+        """Write the measured counts to the workspace sidecar. Counts are a
+        dataset property; saving makes the calibration once-per-DATASET
+        instead of once-per-process (backups don't carry the accumulators,
+        and the restart wrapper cycles processes by design)."""
+        if not self.emb_calib_path:
+            return
+        import json
+        try:
+            with open(self.emb_calib_path, "w", encoding="utf-8") as f:
+                json.dump({"version": 1,
+                           "beta_at_measure": self.emb_freq_exponent,
+                           "window_steps": int(self.emb_delay_steps),
+                           "measured_at_step": int(self.step_idx),
+                           "planes": planes}, f, indent=1)
+            print(f"[concord] embedding calibration saved -> {self.emb_calib_path} "
+                  f"(dataset property: resumes/restarts reload it)", flush=True)
+        except OSError as e:
+            print(f"[concord] embedding calibration save FAILED ({e}); cold "
+                  f"resumes will fall back to uniform drive", flush=True)
+
+    def _load_calibration(self):
+        if not self.emb_calib_path:
+            return None
+        import json
+        try:
+            with open(self.emb_calib_path, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
 
     @torch.no_grad()
     def apply_epoch_window(self, steps_per_epoch):
@@ -765,11 +842,13 @@ def setup_packed_embeddings(model, config):
     # embedding lr, warmup+cosine schedule, deploy-bridge inclusion, divot delay)
     _ctrl = getattr(model, "concord_controller", None)
     if _ctrl is not None:
+        _ws = getattr(config, "workspace_dir", None)
         _ctrl.register_embedding_cores(
             planes, lr,
             delay_epochs=float(getattr(config, "concord_embedding_delay_epochs", 0.0) or 0.0),
             auto_drive=bool(getattr(config, "concord_embedding_auto_drive", False)),
-            freq_exponent=float(getattr(config, "concord_embedding_freq_exponent", 0.5)))
+            freq_exponent=float(getattr(config, "concord_embedding_freq_exponent", 0.5)),
+            calib_path=(str(Path(_ws) / "concord_embedding_calibration.json") if _ws else None))
     # The plain-SGD wrapper path is bypassed; ensure both wrapper refs are None so
     # after_optimizer_step's preserve_embedding_norm guard short-circuits (the model's
     # __init__ leaves embedding_wrapper_2 unset).

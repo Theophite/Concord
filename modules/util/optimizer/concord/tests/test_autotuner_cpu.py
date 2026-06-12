@@ -520,18 +520,33 @@ check("17d delay resolved at finalize even with epoch window off",
 # (median(n)/n, decade clamp); per-sighting distance D stays the data's signal.
 # Regression: a CONVERGED-but-frequent token (small total A, huge n) must be
 # DAMPED, not boosted -- normalizing to total change got this backwards.
+import tempfile
+from pathlib import Path as _P
+
 class _FakeTr(SimpleNamespace):
     def set_drive(self, d):
         self.drive = d.clone()
+
+def calib_rig(**kw):
+    kw.setdefault("emb_calib_path", None)
+    kw.setdefault("emb_delay_steps", 100)
+    kw.setdefault("step_idx", 101)
+    kw.setdefault("_emb_drive_applied", False)
+    rig = SimpleNamespace(**kw)
+    for m in ("_save_calibration", "_load_calibration"):
+        setattr(rig, m, getattr(ConcordController, m).__get__(rig))
+    rig._emb_drive_from_counts = ConcordController._emb_drive_from_counts
+    return rig
+
 acc = torch.zeros(4, 8)
 seen = torch.zeros(4)
 acc[0, 0], seen[0] = 1.0, 100.0   # converged+hot: D=0.01, n=100 -> 10/100 -> clamp 0.2
 acc[1, 0], seen[1] = 1.0, 10.0    # median:        D=0.1,  n=10  -> 1.0
 acc[2, 0], seen[2] = 2.0, 2.0     # rare+far:      D=1.0,  n=2   -> 10/2 = 5.0
                                   # row 3 unseen: n=0 -> stays 1, excluded from median
-rigc = SimpleNamespace(emb_trainables=[_FakeTr(_accum=acc, _seen=seen, drive=None)],
-                       emb_row_names=["hotconv", "mid", "rarefar", "unseen"],
-                       emb_freq_exponent=1.0, _emb_drive_applied=False)
+rigc = calib_rig(emb_trainables=[_FakeTr(_accum=acc, _seen=seen, drive=None)],
+                 emb_row_names=["hotconv", "mid", "rarefar", "unseen"],
+                 emb_freq_exponent=1.0)
 ConcordController._finalize_embedding_calibration(rigc)
 got = rigc.emb_trainables[0].drive
 check("17e calibration beta=1 (flat): frequency-normalized (converged-hot "
@@ -541,10 +556,10 @@ check("17e calibration beta=1 (flat): frequency-normalized (converged-hot "
       f"drive={None if got is None else got.tolist()}")
 # beta=0.5 (default): sqrt tempering -- noise motion equalized, the style
 # token keeps a sqrt(frequency) advantage on shared features (hierarchy)
-righ = SimpleNamespace(emb_trainables=[_FakeTr(_accum=acc.clone(), _seen=seen.clone(),
-                                               drive=None)],
-                       emb_row_names=["hotconv", "mid", "rarefar", "unseen"],
-                       emb_freq_exponent=0.5, _emb_drive_applied=False)
+righ = calib_rig(emb_trainables=[_FakeTr(_accum=acc.clone(), _seen=seen.clone(),
+                                         drive=None)],
+                 emb_row_names=["hotconv", "mid", "rarefar", "unseen"],
+                 emb_freq_exponent=0.5)
 ConcordController._finalize_embedding_calibration(righ)
 goth = righ.emb_trainables[0].drive
 exp_h = torch.tensor([0.1, 1.0, 5.0, 1.0]) ** 0.5   # [0.3162, 1, 2.2361, 1]
@@ -555,13 +570,35 @@ check("17e2 calibration beta=0.5: sqrt drives, style keeps the per-epoch "
       "advantage on shared content",
       torch.allclose(goth, exp_h, atol=1e-4) and w_style > 5 * w_obj,
       f"drive={goth.tolist()} w_style={w_style:.1f} w_obj={w_obj:.1f}")
-rige = SimpleNamespace(emb_trainables=[_FakeTr(_accum=torch.zeros(2, 8),
-                                               _seen=torch.zeros(2), drive=None)],
-                       emb_row_names=["a", "b"], emb_freq_exponent=0.5,
-                       _emb_drive_applied=False)
+rige = calib_rig(emb_trainables=[_FakeTr(_accum=torch.zeros(2, 8),
+                                         _seen=torch.zeros(2), drive=None)],
+                 emb_row_names=["a", "b"], emb_freq_exponent=0.5)
 ConcordController._finalize_embedding_calibration(rige)
-check("17e3 empty accumulator (resumed past divot) -> drive untouched",
+check("17e3 empty accumulator, no sidecar -> drive untouched",
       rige._emb_drive_applied and rige.emb_trainables[0].drive is None)
+# 17e4: persistence roundtrip -- counts are a DATASET property: measured once,
+# saved to the sidecar, reloaded by a cold process (empty accumulators) with
+# beta re-applied at load time (the file stores n, not drives)
+with tempfile.TemporaryDirectory() as td:
+    side = str(_P(td) / "calib.json")
+    rigs = calib_rig(emb_trainables=[_FakeTr(_accum=acc.clone(), _seen=seen.clone(),
+                                             drive=None)],
+                     emb_row_names=["hotconv", "mid", "rarefar", "unseen"],
+                     emb_freq_exponent=0.5, emb_calib_path=side)
+    ConcordController._finalize_embedding_calibration(rigs)
+    saved_ok = _P(side).exists()
+    rigl = calib_rig(emb_trainables=[_FakeTr(_accum=torch.zeros(4, 8),
+                                             _seen=torch.zeros(4), drive=None)],
+                     emb_row_names=["hotconv", "mid", "rarefar", "unseen"],
+                     emb_freq_exponent=1.0,        # different beta at load
+                     emb_calib_path=side)
+    ConcordController._finalize_embedding_calibration(rigl)
+    gotl = rigl.emb_trainables[0].drive
+check("17e4 sidecar roundtrip: cold process restores counts, beta applied "
+      "at load (saved beta ignored)",
+      saved_ok and gotl is not None
+      and torch.allclose(gotl, torch.tensor([0.2, 1.0, 5.0, 1.0])),
+      f"drive={None if gotl is None else gotl.tolist()}")
 
 # 17f: per-token drive buffer + backward ordering (accumulate RAW, apply SCALED)
 ppb.ConcordLinearPackedB._resync_weight_buf = lambda self: None
