@@ -10,9 +10,15 @@ between two well-sampled integrals, and deploy = S+A becomes a Polyak-style
 fraction-of-epoch average of the trajectory.
 
 Constraints this must respect:
-  - rho = alpha_v/alpha < 0.5 or C* = L*2rho/(1-2rho) blows up: the chase
-    window must stay SHORTER than half the anchor window. Sweep tops out at
-    epoch/2.5 (rho = 0.4).
+  - C* = ((1-alpha)/alpha) * 2*alpha_v/(1 - 2*alpha_v), recomputed PER ARM
+    by ConcordRef's constructor from the (alpha, alpha_v) passed in: 0.073
+    (legacy) -> 0.118 -> 0.244 -> 0.496 -> 0.798 (ep/2.5). There is NO pole
+    in alpha_v/alpha (an earlier version of this docstring claimed one at
+    1/2 -- misread notation; the formula's pole is at alpha_v = 1/2, an
+    absurd per-step leak rate). The real structural cap is hierarchy
+    ordering, alpha > alpha_v: the chase must stay strictly faster than the
+    leak or the rungs merge at window = anchor. The ladder tops at epoch/2.5
+    (alpha = 2.5*alpha_v) with ordering intact.
   - Init consolidation: load_weights packs the whole init into u, and at
     slow alpha it would sit friction-exposed with deploy ~ 0 for ~1/alpha
     steps. The telescope's zero-input fixed point is S = A (leak fixed

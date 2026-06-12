@@ -1087,8 +1087,14 @@ The cascade jumps from a ~5-step chase (α=0.1) straight to the epoch anchor,
 so the drift numerator C\*(S−A) compares ~5 steps of commits against the
 epoch integral. Question (user proposal): does a fraction-of-epoch s_slow —
 v_slow at epoch, s_slow at epoch/k — buy better coherence (trend agreement
-between two well-sampled integrals) and a Polyak-averaged deploy? Constraint:
-ρ = α_v/α < ½ or C\* poles, so the ladder tops at epoch/2.5.
+between two well-sampled integrals) and a Polyak-averaged deploy? C\* is
+recomputed per arm by ConcordRef from (α, α_v): 0.073 (legacy) → 0.118 →
+0.244 → 0.496 → 0.798 (ep/2.5) — an 11× meter rescale up the ladder.
+(Correction over the first committed version: there is NO C\* pole at
+α_v/α = ½ — the formula L·2α_v/(1−2α_v) poles at α_v = ½, an absurd leak
+rate. The real cap is hierarchy ordering α > α_v — chase strictly faster
+than leak, rungs merge at window = anchor — so the ladder tops at epoch/2.5
+with ordering intact.)
 
 Protocol: v̂ drive (the fork's), lr 1e-3, σ OFF (the fork's operating
 point), gate + min-leak, pad-2 crop-aug, 4k × 25 ep, **bs 32** (SPE = 125,
