@@ -391,6 +391,7 @@ check("13e lag-tax signature: high waste, boil ~ 0",
 def ew_rig(flag=True, av=0.001):
     return SimpleNamespace(
         config=SimpleNamespace(telescope_epoch_window=flag, alpha_v_fast=av),
+        emb_cores=[], emb_delay_epochs=0.0, emb_delay_steps=0, steps_per_epoch=0.0,
         layers=[SimpleNamespace(alpha=0.1, alpha_v_fast=av, drift_cancel_C=0.0,
                                 mass_preserve_v=True) for _ in range(2)])
 
@@ -491,6 +492,103 @@ check("16e legacy mode unchanged: position in s_slow",
       int(ss2.abs().sum()) > 0 and int(vs2.abs().sum()) == 0)
 ppb.ConcordLinearPackedB._resync_weight_buf = _orig_resync
 ppb.materialize_packed_bf16 = _orig_mat
+
+# ---- 17. embedding release delay (divot), auto-drive calibration, sigma globals
+from concord_embedding_packed import _PackedEmbStep
+from concord_winner import winner_step
+
+# 17a-c: the shifted schedule clock (pure function -> resume-safe)
+check("17a delay 0 is the identity clock",
+      ConcordController._emb_clock(123, 1000, 0) == (123, 1000))
+check("17b frozen during the divot (step < delay)",
+      ConcordController._emb_clock(942, 1000, 943) is None
+      and ConcordController._emb_clock(0, 1000, 943) is None)
+check("17c released on a shifted clock: fresh warmup, cosine ends at horizon",
+      ConcordController._emb_clock(943, 9432, 943) == (0, 8489)
+      and ConcordController._emb_clock(9431, 9432, 943) == (8488, 8489))
+
+# 17d: delay epochs -> steps resolution at horizon finalize (store happens
+# BEFORE the telescope gate, so it works with the epoch window off)
+rig17 = SimpleNamespace(config=SimpleNamespace(telescope_epoch_window=False),
+                        emb_cores=[object()], emb_delay_epochs=1.0,
+                        emb_delay_steps=0, steps_per_epoch=0.0, layers=[])
+ConcordController.apply_epoch_window(rig17, 943)
+check("17d delay resolved at finalize even with epoch window off",
+      rig17.emb_delay_steps == 943 and rig17.steps_per_epoch == 943.0)
+
+# 17e: auto-drive calibration math -- drive = median(A)/A over live rows,
+# clamped to a decade, unseen rows stay 1, applied-flag set
+class _FakeTr(SimpleNamespace):
+    def set_drive(self, d):
+        self.drive = d.clone()
+acc = torch.zeros(4, 8)
+acc[0, 0] = 10.0   # hot:    A=10  -> 1/10  -> clamp 0.2
+acc[1, 0] = 1.0    # median: A=1   -> 1.0
+acc[2, 0] = 0.1    # cold:   A=0.1 -> 10    -> clamp 5
+                   # row 3 unseen: A=0 -> stays 1, excluded from median
+rigc = SimpleNamespace(emb_trainables=[_FakeTr(_accum=acc, drive=None)],
+                       emb_row_names=["hot", "mid", "cold", "unseen"],
+                       _emb_drive_applied=False)
+ConcordController._finalize_embedding_calibration(rigc)
+got = rigc.emb_trainables[0].drive
+check("17e calibration: median-normalized, decade-clamped, unseen stays 1",
+      rigc._emb_drive_applied and got is not None
+      and torch.allclose(got, torch.tensor([0.2, 1.0, 5.0, 1.0])),
+      f"drive={None if got is None else got.tolist()}")
+rige = SimpleNamespace(emb_trainables=[_FakeTr(_accum=torch.zeros(2, 8), drive=None)],
+                       emb_row_names=["a", "b"], _emb_drive_applied=False)
+ConcordController._finalize_embedding_calibration(rige)
+check("17e2 empty accumulator (resumed past divot) -> drive untouched",
+      rige._emb_drive_applied and rige.emb_trainables[0].drive is None)
+
+# 17f: per-token drive buffer + backward ordering (accumulate RAW, apply SCALED)
+ppb.ConcordLinearPackedB._resync_weight_buf = lambda self: None
+ppb.materialize_packed_bf16 = lambda *a, **k: k.get("out")
+try:
+    emb17 = ConcordPackedEmbedding(2, 16, device="cpu", lr=1e-3, target_norm=0.5)
+    ones_ok = bool((emb17._drive == 1.0).all())
+    emb17.set_drive([1.0, 2.0])
+    set_ok = emb17._drive.shape == (2, 1) and float(emb17._drive[1]) == 2.0
+    try:
+        emb17.set_drive([1.0])
+        len_ok = False
+    except ValueError:
+        len_ok = True
+    applied = []
+    emb17.core.apply_grad_step = lambda g: applied.append(g.clone())
+    emb17._anchored = True                      # one-shot pin -> no-op
+    grad = torch.randn(2, 16)
+    ctx = SimpleNamespace(saved_tensors=(torch.tensor([0, 1]),), mod=emb17)
+    _PackedEmbStep.backward(ctx, grad.clone())
+    raw_ok = torch.allclose(emb17._accum, grad)                 # raw, pre-drive
+    scaled_ok = (torch.allclose(applied[0][0], grad[0])
+                 and torch.allclose(applied[0][1], 2.0 * grad[1]))
+finally:
+    ppb.ConcordLinearPackedB._resync_weight_buf = _orig_resync
+    ppb.materialize_packed_bf16 = _orig_mat
+check("17f set_drive: defaults to ones, sets [K,1], rejects wrong length",
+      ones_ok and set_ok and len_ok)
+check("17g backward: accumulator sees RAW grad, kernel sees drive-scaled grad",
+      raw_ok and scaled_ok)
+
+# 17h: schedule-only winner_step leaves the module globals alone (the sigma
+# clobber: emb group's noise=False used to zero sigma for the whole model)
+cfg17 = SimpleNamespace(lr=1e-3, warmup=5, sigmag_peak=0.6, lr_min_frac=0.05,
+                        noise=True, ratio_chase_floor=0.9, ratio_chase_floor_min=0.9,
+                        ratio_leak_floor=0.98, ratio_leak_floor_min=0.98)
+_sig_before = ppb._SIGMAG_SIGMA
+try:
+    ppb.set_sigmag_sigma(0.42)
+    lr_only = winner_step(10, 100, [], peak_lr=0.0, noise=False, config=cfg17,
+                          update_globals=False)
+    untouched = abs(ppb._SIGMAG_SIGMA - 0.42) < 1e-12
+    winner_step(10, 100, [], peak_lr=0.0, noise=False, config=cfg17)
+    clobbered = ppb._SIGMAG_SIGMA == 0.0
+finally:
+    ppb.set_sigmag_sigma(_sig_before)
+check("17h update_globals=False is schedule-only (sigma survives a noise=False "
+      "secondary group); default still writes", untouched and clobbered
+      and lr_only == 0.0)
 
 print()
 ok = all(results)

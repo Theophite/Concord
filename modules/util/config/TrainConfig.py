@@ -498,6 +498,8 @@ class TrainConfig(BaseConfig):
     concord_epoch_cache_release: bool
     concord_sample_deploy: bool
     concord_embedding_anchor: bool
+    concord_embedding_delay_epochs: float  # "divot": freeze packed embeddings for the first N epochs so the UNet digs its basin against the pristine anchors; tokens then release on a fresh warmup (cosine still ends at the horizon). Counters fast-variable slaving (measured: 1 epoch @ lr 1e-3 slewed tokens ~50 deg off init). Doubles as the auto-drive calibration window.
+    concord_embedding_auto_drive: bool  # at divot release, set per-token drive = median(A)/A_i from the coherent gradient sum accumulated over the frozen window, so embedding_learning_rate means ONE isotropic scalar rate of change for every token (frequency and gradient scale divided out). Scales the DRIVE only -- evap_frac = lr*kappa*(1-coh) is a fraction of the buffer, so per-token lambda semantics are preserved. Requires delay_epochs > 0 for a calibration window.
     concord_antithetic_timesteps: bool
     concord_antithetic_noise: bool
     concord_antithetic_same_example: bool
@@ -1099,6 +1101,8 @@ class TrainConfig(BaseConfig):
         data.append(("concord_epoch_cache_release", True, bool, False))
         data.append(("concord_sample_deploy", True, bool, False))
         data.append(("concord_embedding_anchor", True, bool, False))
+        data.append(("concord_embedding_delay_epochs", 1.0, float, False))
+        data.append(("concord_embedding_auto_drive", True, bool, False))
         data.append(("concord_antithetic_timesteps", False, bool, False))
         data.append(("concord_antithetic_noise", False, bool, False))
         data.append(("concord_antithetic_same_example", False, bool, False))

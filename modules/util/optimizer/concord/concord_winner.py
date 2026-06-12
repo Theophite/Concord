@@ -288,7 +288,8 @@ def swap_text_encoder_to_anchor(te, device, lr, wd_anchor, verbose=True):
 
 
 def winner_step(it, total_iters, layers, peak_lr=None, warmup=None, floor_horizon=None,
-                sigmag_peak=None, lr_min_frac=None, noise=None, config=None):
+                sigmag_peak=None, lr_min_frac=None, noise=None, config=None,
+                update_globals=True):
     """Advance the per-step winner schedule (call BEFORE backward each step):
       - lr: warmup * cosine(1 -> lr_min_frac)        -> m.lr on every layer
       - sigma: rising-late sigmag_peak * (1 - f)      (f = cosine factor)
@@ -296,6 +297,14 @@ def winner_step(it, total_iters, layers, peak_lr=None, warmup=None, floor_horizo
     Config-driven (pass a ConcordConfig); explicit args still override it, and the
     old lr-based call signature keeps working. All three are device tensors
     (CUDA-graph-safe). Returns the lr.
+
+    update_globals=False makes the call SCHEDULE-ONLY (per-layer lr; sigma and the
+    ratio floors untouched). Required for secondary groups: sigma/floors are
+    MODULE-GLOBAL, all winner_step calls run before any kernel launch, so the last
+    writer wins for the whole model -- the embedding group's noise=False used to
+    silently zero sigma for the UNet too (latent: every run so far had noise off
+    in config; apply_grad_step never injects sigma into the embedding cores
+    anyway). Exactly one group per step should write the globals.
     """
     cfg = config if config is not None else WINNER_CONFIG
     peak_lr = cfg.lr if peak_lr is None else peak_lr
@@ -313,15 +322,16 @@ def winner_step(it, total_iters, layers, peak_lr=None, warmup=None, floor_horizo
     for m in layers:
         m.lr = lr
 
-    set_sigmag_sigma(sigmag_peak * (1.0 - f) if noise else 0.0)   # rising-late noise
+    if update_globals:
+        set_sigmag_sigma(sigmag_peak * (1.0 - f) if noise else 0.0)   # rising-late noise
 
-    def cos_floor(start, end):
-        if it >= floor_horizon:
-            return end
-        return end + (start - end) * 0.5 * (1.0 + math.cos(math.pi * it / floor_horizon))
-    set_ratio_coh_floors(
-        cos_floor(cfg.ratio_chase_floor, cfg.ratio_chase_floor_min),
-        cos_floor(cfg.ratio_leak_floor, cfg.ratio_leak_floor_min))
+        def cos_floor(start, end):
+            if it >= floor_horizon:
+                return end
+            return end + (start - end) * 0.5 * (1.0 + math.cos(math.pi * it / floor_horizon))
+        set_ratio_coh_floors(
+            cos_floor(cfg.ratio_chase_floor, cfg.ratio_chase_floor_min),
+            cos_floor(cfg.ratio_leak_floor, cfg.ratio_leak_floor_min))
     return lr
 
 

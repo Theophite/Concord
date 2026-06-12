@@ -153,7 +153,14 @@ class ConcordController:
         self._snr_mod_announced = False
         self._current_fill_ramp = 1.0
         self.emb_cores = []         # packed-embedding cores (register_embedding_cores)
+        self.emb_trainables = []    # the ConcordPackedEmbedding modules (drive/accum)
+        self.emb_row_names = []     # row -> placeholder (calibration report)
         self.emb_lr = 0.0
+        self.emb_delay_epochs = 0.0  # "divot" (register_embedding_cores sets it)
+        self.emb_delay_steps = 0     # resolved at horizon finalize (steps/epoch known)
+        self.emb_auto_drive = False  # normalize per-token drive from the divot window
+        self._emb_drive_applied = False
+        self.steps_per_epoch = 0.0
         self.step_idx = 0
         print(f"[concord] swapped {len(self.layers)} UNet layers | lr={self.config.lr} "
               f"gf_consol={self.config.gf_consol} noise={self.config.noise} "
@@ -258,7 +265,22 @@ class ConcordController:
         import math
         return 1.0 - math.exp(-2.0 * alpha_v_fast * t)
 
-    def register_embedding_cores(self, planes, emb_lr):
+    @staticmethod
+    def _emb_clock(step_idx, total_steps, delay_steps):
+        """Embedding-group schedule clock under the release delay ("divot").
+        Returns None while frozen, else (effective_step, effective_total): a
+        shifted clock so the released group gets a fresh warmup and its cosine
+        still ends at the run horizon. Pure function of step_idx -> resume-safe
+        (step_idx is seeded from global_step at horizon finalize)."""
+        d = max(0, int(delay_steps))
+        if d == 0:
+            return step_idx, total_steps
+        if step_idx < d:
+            return None
+        return step_idx - d, max(1, total_steps - d)
+
+    def register_embedding_cores(self, planes, emb_lr, delay_epochs=0.0,
+                                 auto_drive=False):
         """Bring the packed-embedding cores under the controller's physics. As
         created they are the LEAST protected, HIGHEST leverage parameters in
         the system: gf_consol = 0 (zero dissipation -- the only trainables
@@ -270,9 +292,15 @@ class ConcordController:
         friction at THEIR lr (kappa_emb = lam/lr_emb), their own winner_step
         schedule group (warmup + cosine, sigma OFF -- the fluctuation never
         earned its keep on embeddings), and inclusion in the deploy bridge."""
-        self.emb_cores = [p["cp"].trainable.core for p in planes
-                          if p.get("cp") is not None and p["cp"].trainable is not None]
+        self.emb_trainables = [p["cp"].trainable for p in planes
+                               if p.get("cp") is not None and p["cp"].trainable is not None]
+        self.emb_cores = [t.core for t in self.emb_trainables]
+        self.emb_row_names = next((
+            [emb.placeholder for emb, _k in p["row_map"]]
+            for p in planes if p.get("row_map")), [])
         self.emb_lr = float(emb_lr)
+        self.emb_delay_epochs = max(0.0, float(delay_epochs))
+        self.emb_auto_drive = bool(auto_drive)
         if not self.emb_cores:
             return
         lam = (float(self.config.dissipation) if self.config.dissipation is not None
@@ -284,6 +312,47 @@ class ConcordController:
               f"under the controller -- lam={lam:g} @ lr_emb={self.emb_lr:g} -> "
               f"kappa_emb={kappa_emb:.0f}; warmup+cosine schedule, sigma off; "
               f"deploy bridge now masks embedding s_fast during sampling")
+
+    @torch.no_grad()
+    def _finalize_embedding_calibration(self):
+        """Divot calibration -> one isotropic scalar rate of change for all
+        embeddings. During the frozen first epoch the raw per-token gradients
+        accumulate coherently (_accum); A_i = ||sum||  is the change the data
+        JUSTIFIES for token i over one full pass -- caption frequency and
+        gradient scale included. Setting drive_i = median(A)/A_i (clamped to a
+        decade) makes embedding_learning_rate mean the SAME capability-rate for
+        every token: hot style tokens stop frying, rare concept tokens stop
+        straggling, and the data still allocates the realized travel (a token
+        whose residual dies stops drawing gradient). The clamp is deliberately
+        tight -- a rare token's direction estimate is noisy, and amplifying it
+        more than ~5x just feeds the friction. Tokens with A_i = 0 (never seen;
+        or the accumulator was lost to a mid-divot restart, which does NOT
+        round-trip through backups) keep drive 1."""
+        self._emb_drive_applied = True
+        for plane_idx, tr in enumerate(self.emb_trainables):
+            A = tr._accum.float().norm(dim=1)            # [K]
+            live = A > 0
+            if not bool(live.any()):
+                print(f"[concord] embedding calibration TE{plane_idx + 1}: empty "
+                      f"accumulator (resumed past the divot?) -- drive stays uniform")
+                continue
+            med = A[live].median()
+            drive = torch.where(live, (med / A.clamp_min(1e-30)).clamp(0.2, 5.0),
+                                torch.ones_like(A))
+            tr.set_drive(drive)
+            names = self.emb_row_names or [f"row{i}" for i in range(A.numel())]
+            order = torch.argsort(A, descending=True)   # zero rows sort last
+            live_n = int(live.sum())
+            fmt = lambda i: f"{names[i]}(A={float(A[i]):.3g},d={float(drive[i]):.2f})"
+            top = ", ".join(fmt(int(i)) for i in order[:4])
+            bot = ", ".join(fmt(int(i)) for i in order[max(0, live_n - 4):live_n].flip(0))
+            n_lo = int((drive <= 0.2 + 1e-6).sum())
+            n_hi = int((drive >= 5.0 - 1e-6).sum())
+            print(f"[concord] embedding calibration TE{plane_idx + 1}: drive = "
+                  f"median(A)/A over {int(live.sum())} live tokens "
+                  f"(clamped: {n_lo} at 0.2x, {n_hi} at 5x)\n"
+                  f"          hottest {top}\n"
+                  f"          coldest {bot}", flush=True)
 
     @torch.no_grad()
     def apply_epoch_window(self, steps_per_epoch):
@@ -298,6 +367,16 @@ class ConcordController:
         (alpha_v_fast and C* are launch-time scalars baked at capture).
         Idempotent across resumes."""
         from prototype_packed_b import compute_drift_cancel_C
+        # Stored UNCONDITIONALLY (the divot delay needs steps/epoch even when the
+        # telescope window flag is off); the telescope gate is below.
+        if steps_per_epoch > 0:
+            self.steps_per_epoch = float(steps_per_epoch)
+            self.emb_delay_steps = int(round(self.emb_delay_epochs * self.steps_per_epoch))
+            if self.emb_cores and self.emb_delay_steps > 0:
+                print(f"[concord] embedding release delay: {self.emb_delay_epochs:g} epoch(s) "
+                      f"= {self.emb_delay_steps} steps (divot: UNet digs first against the "
+                      f"pristine anchors; fresh warmup at release, cosine ends at horizon)",
+                      flush=True)
         if not self.config.telescope_epoch_window or steps_per_epoch <= 0:
             return
         new_av = 1.0 / (2.0 * float(steps_per_epoch))
@@ -427,14 +506,32 @@ class ConcordController:
             self._current_fill_ramp = self._fill_ramp(self.step_idx, self.config.alpha_v_fast)
             for m in self.layers:
                 m._gf_consol_buf.fill_(m._gf_consol_value * self._current_fill_ramp)
+        # Secondary groups are SCHEDULE-ONLY (update_globals=False): sigma and the
+        # ratio floors are module-global and the last winner_step writer wins for
+        # the whole model -- the emb group's noise=False used to zero sigma for
+        # the UNet too. The self.layers call above is the single global writer.
         if self.te_layers:
             winner_step(self.step_idx, self.total_steps, self.te_layers,
-                        peak_lr=self.te_lr, config=self.config)
+                        peak_lr=self.te_lr, config=self.config, update_globals=False)
         if self.emb_cores:
             # embeddings get their OWN schedule group: warmup + cosine at the
-            # embedding lr, fluctuation off (see register_embedding_cores)
-            winner_step(self.step_idx, self.total_steps, self.emb_cores,
-                        peak_lr=self.emb_lr, noise=False, config=self.config)
+            # embedding lr, fluctuation off (see register_embedding_cores), and
+            # the release delay ("divot"): epoch 1 the UNet digs its basin
+            # against the pristine anchors (lr=0 -> tick/evap/wd all zero; the
+            # kernel still consolidates the packing residual); at release the
+            # group gets a FRESH warmup on a shifted clock, cosine still ending
+            # at the horizon, so the tokens take off gently into the prepared
+            # basin instead of slaving to an untrained UNet's residual.
+            clk = self._emb_clock(self.step_idx, self.total_steps, self.emb_delay_steps)
+            if (clk is not None and self.emb_delay_steps > 0
+                    and self.emb_auto_drive and not self._emb_drive_applied):
+                self._finalize_embedding_calibration()   # first released step
+            if clk is None:
+                winner_step(0, max(1, self.total_steps), self.emb_cores, peak_lr=0.0,
+                            noise=False, config=self.config, update_globals=False)
+            else:
+                winner_step(clk[0], clk[1], self.emb_cores, peak_lr=self.emb_lr,
+                            noise=False, config=self.config, update_globals=False)
 
     @torch.no_grad()
     def after_step(self):
@@ -638,10 +735,13 @@ def setup_packed_embeddings(model, config):
         planes.append({"te_idx": te_idx, "te": te, "cp": cp, "base": base, "row_map": row_map})
     model.concord_control_planes = planes
     # bring the packed cores under the controller's physics (friction at the
-    # embedding lr, warmup+cosine schedule, deploy-bridge inclusion)
+    # embedding lr, warmup+cosine schedule, deploy-bridge inclusion, divot delay)
     _ctrl = getattr(model, "concord_controller", None)
     if _ctrl is not None:
-        _ctrl.register_embedding_cores(planes, lr)
+        _ctrl.register_embedding_cores(
+            planes, lr,
+            delay_epochs=float(getattr(config, "concord_embedding_delay_epochs", 0.0) or 0.0),
+            auto_drive=bool(getattr(config, "concord_embedding_auto_drive", False)))
     # The plain-SGD wrapper path is bypassed; ensure both wrapper refs are None so
     # after_optimizer_step's preserve_embedding_norm guard short-circuits (the model's
     # __init__ leaves embedding_wrapper_2 unset).
@@ -649,9 +749,17 @@ def setup_packed_embeddings(model, config):
     model.embedding_wrapper_2 = None
     rows = len(planes[0]["row_map"]) if planes else 0
     anchored = bool(getattr(config, "concord_embedding_anchor", True))
+    auto = bool(getattr(config, "concord_embedding_auto_drive", False))
+    delay = float(getattr(config, "concord_embedding_delay_epochs", 0.0) or 0.0)
+    extra = ""
+    if delay > 0:
+        extra = (f";  divot: frozen {delay:g} epoch(s)"
+                 + (", auto-drive calibration armed" if auto else ""))
+    elif auto:
+        extra = ";  auto-drive requested but delay=0 -> NO calibration window (uniform drive)"
     print(f"[concord] packed embeddings ON: {rows} trainable token row(s)/TE, lr={lr}; "
           f"{'ANCHORED (init frozen in v_slow, deploy = init + gated delta)' if anchored else 'deploy-norm pinned to vocab median'}; "
-          f"plain-SGD embedding path bypassed")
+          f"plain-SGD embedding path bypassed{extra}")
 
 
 def reenable_packed_embedding_grad(model):

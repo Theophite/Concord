@@ -37,6 +37,15 @@ class _PackedEmbStep(torch.autograd.Function):
         # scatter per-position grad into a per-token grad_W [K, dim].
         G = torch.zeros(mod.K, mod.dim, device=grad_emb.device)
         G.index_add_(0, ids.reshape(-1), grad_emb.reshape(-1, mod.dim).float())
+        # Calibration accumulator reads the RAW gradient (before drive), so the
+        # measurement stays in data units even after a drive is applied.
+        mod._accum.add_(G)
+        # Per-token drive scaling, NOT per-row lr: evap_frac = lr*kappa*(1-coh)
+        # is a FRACTION of the buffer, so scaling the drive preserves each
+        # token's lambda semantics (per-row lr would push the evap fraction of
+        # boosted tokens into the min_leak clamp). Device [K,1] buffer, updated
+        # by .copy_() from outside the graph -> propagates into replays.
+        G.mul_(mod._drive)
         # Drive packed_b's fused cascade DIRECTLY with grad_W = G -- one kernel launch, no
         # re-entrant autograd. The old trick (core(x); y.backward(G.t())) ran a nested
         # torch.autograd.backward(), which is ILLEGAL inside a CUDA-graph capture: it touches
@@ -61,6 +70,17 @@ class ConcordPackedEmbedding(nn.Module):
                                          device=device, alpha=alpha, lr=lr)
         self.register_buffer("target", torch.tensor(float(target_norm), device=device))
         self.register_buffer("_I", torch.eye(dim, device=device, dtype=torch.bfloat16))
+        # per-token gradient-drive multipliers (default 1), written by the
+        # controller's divot calibration so every token moves at ONE isotropic
+        # scalar rate (see ConcordController._finalize_embedding_calibration).
+        self.register_buffer("_drive", torch.ones(num_tokens, 1, device=device))
+        # coherent gradient accumulator: sum of RAW per-step grads. Over the
+        # divot epoch this is "the change the data justifies" per token (noise
+        # cancels ~sqrt(N), justified displacement adds ~N). Accumulated
+        # UNCONDITIONALLY -- a python branch would bake into a captured CUDA
+        # graph; after the calibration reads it nobody looks again (~[K,dim]
+        # fp32, a few hundred KB).
+        self.register_buffer("_accum", torch.zeros(num_tokens, dim, device=device))
         self._grad_anchor = nn.Parameter(torch.zeros(1, device=device))
 
     @staticmethod
@@ -69,6 +89,16 @@ class ConcordPackedEmbedding(nn.Module):
 
     def set_target_norm(self, v):
         self.target.fill_(float(v))
+
+    @torch.no_grad()
+    def set_drive(self, mults):
+        """Per-token gradient-drive multipliers, list/tensor of length K (row
+        order = the attach order). Drive only -- friction kappa stays global, so
+        every token keeps lambda = lr*kappa per step on its own buffer."""
+        t = torch.as_tensor(mults, dtype=torch.float32, device=self._drive.device)
+        if t.numel() != self.K:
+            raise ValueError(f"set_drive: {t.numel()} multipliers for K={self.K} tokens")
+        self._drive.copy_(t.reshape(-1, 1))
 
     @torch.no_grad()
     def init_tokens(self, init=None, scale=0.05, anchor=False):
