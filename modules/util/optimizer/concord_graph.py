@@ -110,6 +110,8 @@ class ManualUNetGraph:
         self.static = None
         self.graph = None
         self.cap_loss = None
+        self._pool = None               # persistent graph-pool handle: every capture reuses it
+        self._stale_graph = None        # pool ANCHOR across a keep_pool release (never replayed)
         self.unet = None
         self.model = None               # set in _alloc; needed for encode_text in TE-graph mode
         self._shape_key = None          # latent geometry the static buffers + graph are bound to
@@ -124,12 +126,32 @@ class ManualUNetGraph:
         self._alphas_cumprod = None
         _ckpt.checkpoint = _capturable_checkpoint
 
-    def release(self):
-        # Drop the captured graph and free its private memory pool. Call this before any
-        # external empty_cache (e.g. sampling's torch_gc) that would otherwise invalidate the
-        # recorded graph -> "coming back from a sample" replay crash. step() transparently
-        # recaptures on the next training step (static buffers are reused).
+    def release(self, keep_pool: bool = False):
+        # Drop the captured graph. step() transparently recaptures on the next
+        # training step (static buffers are reused).
+        #
+        # keep_pool=False (sampling): also free the private memory pool -- the
+        # sampler needs the VRAM. Call before any external empty_cache that
+        # would otherwise invalidate the recorded graph -> replay crash.
+        #
+        # keep_pool=True (backup/shape-change): keep the dead graph object as a
+        # POOL ANCHOR. The graph must be released because the save moves
+        # weights (recorded pointers go stale), but its pool segments should
+        # survive: graph-pool segments are PRIVATE (ordinary allocations can
+        # never use them), so freeing them just forces the recapture to commit
+        # a fresh pool into a save-churned address space -- measured +0.5G
+        # committed per epoch boundary (free fell 1.16 -> 1.04 -> 0.58G and
+        # the boundary recapture froze). While the anchor lives, the saver's
+        # internal torch_gc()s cannot decommit the segments; the next
+        # _warmup_and_capture drops the anchor and captures into the SAME pool
+        # (self._pool), reusing them in place.
         import gc
+        if keep_pool:
+            self._stale_graph = self.graph   # anchor; replay is forbidden
+            self.graph = None
+            self.cap_loss = None
+            return
+        self._stale_graph = None
         self.graph = None
         self.cap_loss = None
         gc.collect()
@@ -322,7 +344,10 @@ class ManualUNetGraph:
         # before the recapture warms up. No-op while the shape is constant (single bucket).
         shape_key = tuple(prep["latent_input"].shape)
         if self.static is not None and shape_key != self._shape_key:
-            self.release()                       # graph=None, cap_loss=None, gc, empty_cache
+            # keep_pool: bucket alternation recaptures constantly; reusing the
+            # pool (it grows once to the max-shape footprint) beats committing
+            # a fresh one per flip. No external consumer needs the VRAM here.
+            self.release(keep_pool=True)
             self.static = None                   # force _alloc to rebuild for the new geometry
         if self.static is None:
             self._alloc(prep, model)
@@ -393,9 +418,38 @@ class ManualUNetGraph:
         self._zero_warmup_grads(model)               # discard warmup-accumulated grads
         if not self.graph_te:
             self._zero_input_grads()                 # fresh static-input grads for capture
+        import gc
+        had_anchor = self._stale_graph is not None
+        if had_anchor:
+            # The anchor kept the pool segments committed through the boundary
+            # (save/restore); its job is done. gc WITHOUT empty_cache: the dead
+            # graph's blocks return to the pool but the segments stay committed,
+            # so the capture below reuses them in place instead of committing a
+            # fresh pool next to them.
+            self._stale_graph = None
+            gc.collect()
+        if self._pool is None:
+            self._pool = torch.cuda.graph_pool_handle()
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
+        with torch.cuda.graph(self.graph, pool=self._pool):
             self.cap_loss = self._step_fn()
+        if had_anchor:
+            # The one cleanup the boundary was missing: every torch_gc in the
+            # backup path runs BEFORE this recapture, so the boundary
+            # transient's ordinary segments were never decommitted -- the
+            # +0.5G/epoch ratchet. The new graph's pool blocks are live and
+            # untouched by empty_cache.
+            gc.collect()
+            torch.cuda.empty_cache()
+            try:
+                free, _ = torch.cuda.mem_get_info()
+                a = torch.cuda.memory_allocated() / 2 ** 30
+                r = torch.cuda.memory_reserved() / 2 ** 30
+                print(f"[concord_graph] post-recapture: torch_alloc={a:.2f}G "
+                      f"torch_reserved={r:.2f}G device_free={free / 2 ** 30:.2f}G",
+                      flush=True)
+            except Exception:
+                pass
 
     def _zero_warmup_grads(self, model):
         # Discard grads accumulated during warmup so the captured backward writes exactly this

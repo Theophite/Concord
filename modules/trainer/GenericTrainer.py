@@ -526,9 +526,12 @@ class GenericTrainer(BaseTrainer):
         # Concord v2: release the captured CUDA graph before the backup. The save moves the model
         # to CPU and torch_gc()s, invalidating the graph's private pool -> the next replay would
         # segfault coming back from the backup. Recaptured transparently on the next step.
+        # keep_pool: hold the pool segments through the save (anchor object) so the recapture
+        # reuses them in place -- a fresh pool per boundary committed +0.5G/epoch (fragmentation
+        # ratchet) until the epoch-2/3 boundary froze at device_free=0.58G.
         _v2 = getattr(self.model, "concord_graph_v2", None)
         if _v2 is not None:
-            _v2.release()
+            _v2.release(keep_pool=True)
 
         try:
             if print_msg:
