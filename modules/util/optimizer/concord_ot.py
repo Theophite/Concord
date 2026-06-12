@@ -159,6 +159,7 @@ class ConcordController:
         self.emb_delay_epochs = 0.0  # "divot" (register_embedding_cores sets it)
         self.emb_delay_steps = 0     # resolved at horizon finalize (steps/epoch known)
         self.emb_auto_drive = False  # normalize per-token drive from the divot window
+        self.emb_freq_exponent = 0.5  # beta in drive = (med(n)/n)^beta
         self._emb_drive_applied = False
         self.steps_per_epoch = 0.0
         self.step_idx = 0
@@ -280,7 +281,7 @@ class ConcordController:
         return step_idx - d, max(1, total_steps - d)
 
     def register_embedding_cores(self, planes, emb_lr, delay_epochs=0.0,
-                                 auto_drive=False):
+                                 auto_drive=False, freq_exponent=0.5):
         """Bring the packed-embedding cores under the controller's physics. As
         created they are the LEAST protected, HIGHEST leverage parameters in
         the system: gf_consol = 0 (zero dissipation -- the only trainables
@@ -301,6 +302,7 @@ class ConcordController:
         self.emb_lr = float(emb_lr)
         self.emb_delay_epochs = max(0.0, float(delay_epochs))
         self.emb_auto_drive = bool(auto_drive)
+        self.emb_freq_exponent = max(0.0, float(freq_exponent))
         if not self.emb_cores:
             return
         lam = (float(self.config.dissipation) if self.config.dissipation is not None
@@ -323,18 +325,31 @@ class ConcordController:
         place (coherent displacement adds ~n, noise cancels to ~sqrt(n), so a
         converged token reads a small D no matter how often it is seen).
 
-        The drive corrects FREQUENCY ONLY: drive_i = median(n)/n_i, clamped to
-        a decade. Per-epoch motion then = drive*n*step ~ median(n) * D_i for
-        every token -- proportional to its per-sighting evidence, with the
-        caption-frequency multiplier removed. A converged-but-frequent token
-        moves slowly BECAUSE its D is small (it is NOT boosted for having a
-        small total -- the failure mode of normalizing to total change); a
-        rare-but-far token gets the full frequency boost and its large D
-        carries it. The clamp stays tight: a rare token's direction estimate
-        is noisy, and amplifying it more than ~5x just feeds the friction.
-        Unseen tokens (n=0; or the accumulators were lost to a mid-divot
-        restart -- they do NOT round-trip through backups) keep drive 1."""
+        The drive corrects FREQUENCY ONLY, tempered by the hierarchy exponent:
+        drive_i = (median(n)/n_i)^beta, clamped to a decade. A converged-but-
+        frequent token moves slowly BECAUSE its D is small (it is NOT boosted
+        for having a small total -- the failure mode of normalizing to total
+        change); a rare-but-far token gets a frequency boost and its large D
+        carries it.
+
+        beta exists because these tokens are HIERARCHICAL (style tokens
+        containing object tokens) and frequency is the attribution mechanism:
+        in a caption holding both, the shared style residual lands in both
+        tokens' gradients, and credit goes to whoever integrates it faster.
+        Raw dynamics (beta=0) give the style its rightful n_style/n_obj
+        advantage on shared content -- correct attribution, but hot tokens
+        fry. Full flattening (beta=1) equalizes per-epoch rates -- attribution
+        parity, shared features split by noise (style/object clobbering).
+        beta=0.5 equalizes the NOISE motion (D_noise ~ 1/sqrt(n), so
+        sqrt(n)*D_noise is constant per token) while justified motion keeps a
+        sqrt(frequency) advantage: styles still win shared features, objects
+        keep their own content by coherence. The clamp stays tight: a rare
+        token's direction estimate is noisy, and amplifying it more than ~5x
+        just feeds the friction. Unseen tokens (n=0; or the accumulators were
+        lost to a mid-divot restart -- they do NOT round-trip through backups)
+        keep drive 1."""
         self._emb_drive_applied = True
+        beta = max(0.0, float(self.emb_freq_exponent))
         for plane_idx, tr in enumerate(self.emb_trainables):
             n = tr._seen.float()                         # [K] sightings
             A = tr._accum.float().norm(dim=1)            # [K] justified distance
@@ -345,22 +360,24 @@ class ConcordController:
                 continue
             D = A / n.clamp_min(1.0)                     # distance per sighting
             med_n = n[live].median()
-            drive = torch.where(live, (med_n / n.clamp_min(1.0)).clamp(0.2, 5.0),
-                                torch.ones_like(n))
+            drive = torch.where(
+                live, ((med_n / n.clamp_min(1.0)) ** beta).clamp(0.2, 5.0),
+                torch.ones_like(n))
             tr.set_drive(drive)
+            w = drive * n                                # per-epoch rate weight
             names = self.emb_row_names or [f"row{i}" for i in range(A.numel())]
             order = torch.argsort(torch.where(live, D, torch.full_like(D, -1.0)),
                                   descending=True)       # unseen rows sort last
             live_n = int(live.sum())
             fmt = lambda i: (f"{names[i]}(D={float(D[i]):.3g},n={int(n[i])},"
-                             f"d={float(drive[i]):.2f})")
+                             f"d={float(drive[i]):.2f},w={float(w[i]):.0f})")
             far = ", ".join(fmt(int(i)) for i in order[:4])
             near = ", ".join(fmt(int(i)) for i in order[max(0, live_n - 4):live_n].flip(0))
             n_lo = int((drive <= 0.2 + 1e-6).sum())
             n_hi = int((drive >= 5.0 - 1e-6).sum())
             print(f"[concord] embedding calibration TE{plane_idx + 1}: drive = "
-                  f"median(n)/n over {live_n} live tokens (clamped: {n_lo} at 0.2x, "
-                  f"{n_hi} at 5x); per-epoch rate now ~ distance-per-sighting\n"
+                  f"(median(n)/n)^{beta:g} over {live_n} live tokens (clamped: "
+                  f"{n_lo} at 0.2x, {n_hi} at 5x); w = drive*n = per-epoch rate weight\n"
                   f"          farthest/sighting {far}\n"
                   f"          nearest/sighting  {near}", flush=True)
 
@@ -751,7 +768,8 @@ def setup_packed_embeddings(model, config):
         _ctrl.register_embedding_cores(
             planes, lr,
             delay_epochs=float(getattr(config, "concord_embedding_delay_epochs", 0.0) or 0.0),
-            auto_drive=bool(getattr(config, "concord_embedding_auto_drive", False)))
+            auto_drive=bool(getattr(config, "concord_embedding_auto_drive", False)),
+            freq_exponent=float(getattr(config, "concord_embedding_freq_exponent", 0.5)))
     # The plain-SGD wrapper path is bypassed; ensure both wrapper refs are None so
     # after_optimizer_step's preserve_embedding_norm guard short-circuits (the model's
     # __init__ leaves embedding_wrapper_2 unset).
@@ -763,8 +781,9 @@ def setup_packed_embeddings(model, config):
     delay = float(getattr(config, "concord_embedding_delay_epochs", 0.0) or 0.0)
     extra = ""
     if delay > 0:
+        beta = float(getattr(config, "concord_embedding_freq_exponent", 0.5))
         extra = (f";  divot: frozen {delay:g} epoch(s)"
-                 + (", auto-drive calibration armed" if auto else ""))
+                 + (f", auto-drive calibration armed (beta={beta:g})" if auto else ""))
     elif auto:
         extra = ";  auto-drive requested but delay=0 -> NO calibration window (uniform drive)"
     print(f"[concord] packed embeddings ON: {rows} trainable token row(s)/TE, lr={lr}; "

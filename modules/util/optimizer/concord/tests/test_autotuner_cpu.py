@@ -531,19 +531,36 @@ acc[2, 0], seen[2] = 2.0, 2.0     # rare+far:      D=1.0,  n=2   -> 10/2 = 5.0
                                   # row 3 unseen: n=0 -> stays 1, excluded from median
 rigc = SimpleNamespace(emb_trainables=[_FakeTr(_accum=acc, _seen=seen, drive=None)],
                        emb_row_names=["hotconv", "mid", "rarefar", "unseen"],
-                       _emb_drive_applied=False)
+                       emb_freq_exponent=1.0, _emb_drive_applied=False)
 ConcordController._finalize_embedding_calibration(rigc)
 got = rigc.emb_trainables[0].drive
-check("17e calibration: frequency-normalized (converged-hot damped, rare-far "
-      "boosted), unseen stays 1",
+check("17e calibration beta=1 (flat): frequency-normalized (converged-hot "
+      "damped, rare-far boosted), unseen stays 1",
       rigc._emb_drive_applied and got is not None
       and torch.allclose(got, torch.tensor([0.2, 1.0, 5.0, 1.0])),
       f"drive={None if got is None else got.tolist()}")
+# beta=0.5 (default): sqrt tempering -- noise motion equalized, the style
+# token keeps a sqrt(frequency) advantage on shared features (hierarchy)
+righ = SimpleNamespace(emb_trainables=[_FakeTr(_accum=acc.clone(), _seen=seen.clone(),
+                                               drive=None)],
+                       emb_row_names=["hotconv", "mid", "rarefar", "unseen"],
+                       emb_freq_exponent=0.5, _emb_drive_applied=False)
+ConcordController._finalize_embedding_calibration(righ)
+goth = righ.emb_trainables[0].drive
+exp_h = torch.tensor([0.1, 1.0, 5.0, 1.0]) ** 0.5   # [0.3162, 1, 2.2361, 1]
+exp_h[3] = 1.0
+w_style = float(goth[0]) * 100.0                     # per-epoch weight, style
+w_obj = float(goth[2]) * 2.0                         # per-epoch weight, rare object
+check("17e2 calibration beta=0.5: sqrt drives, style keeps the per-epoch "
+      "advantage on shared content",
+      torch.allclose(goth, exp_h, atol=1e-4) and w_style > 5 * w_obj,
+      f"drive={goth.tolist()} w_style={w_style:.1f} w_obj={w_obj:.1f}")
 rige = SimpleNamespace(emb_trainables=[_FakeTr(_accum=torch.zeros(2, 8),
                                                _seen=torch.zeros(2), drive=None)],
-                       emb_row_names=["a", "b"], _emb_drive_applied=False)
+                       emb_row_names=["a", "b"], emb_freq_exponent=0.5,
+                       _emb_drive_applied=False)
 ConcordController._finalize_embedding_calibration(rige)
-check("17e2 empty accumulator (resumed past divot) -> drive untouched",
+check("17e3 empty accumulator (resumed past divot) -> drive untouched",
       rige._emb_drive_applied and rige.emb_trainables[0].drive is None)
 
 # 17f: per-token drive buffer + backward ordering (accumulate RAW, apply SCALED)
