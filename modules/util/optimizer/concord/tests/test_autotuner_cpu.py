@@ -579,8 +579,12 @@ try:
     applied = []
     emb17.core.apply_grad_step = lambda g: applied.append(g.clone())
     emb17._anchored = True                      # one-shot pin -> no-op
-    grad = torch.randn(3, 16)                   # token 1 appears TWICE this batch
-    ctx = SimpleNamespace(saved_tensors=(torch.tensor([0, 1, 1]),), mod=emb17)
+    # token 1 appears twice; the LAST position is a control-plane passthrough:
+    # routed to row 0 with an exact-zero grad row (torch.where mask) -- it must
+    # NOT count as a sighting (row 0's n was inflated 75.7/caption before).
+    grad = torch.randn(4, 16)
+    grad[3].zero_()
+    ctx = SimpleNamespace(saved_tensors=(torch.tensor([0, 1, 1, 0]),), mod=emb17)
     _PackedEmbStep.backward(ctx, grad.clone())
     G_raw = torch.stack([grad[0], grad[1] + grad[2]])
     raw_ok = (torch.allclose(emb17._accum, G_raw)               # raw, pre-drive
@@ -592,7 +596,8 @@ finally:
     ppb.materialize_packed_bf16 = _orig_mat
 check("17f set_drive: defaults to ones, sets [K,1], rejects wrong length",
       ones_ok and set_ok and len_ok)
-check("17g backward: accumulator sees RAW grad, kernel sees drive-scaled grad",
+check("17g backward: accumulator sees RAW grad, kernel sees drive-scaled grad, "
+      "zero-grad passthrough positions don't count as sightings",
       raw_ok and scaled_ok)
 
 # 17h: schedule-only winner_step leaves the module globals alone (the sigma

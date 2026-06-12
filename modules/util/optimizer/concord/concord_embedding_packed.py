@@ -39,10 +39,16 @@ class _PackedEmbStep(torch.autograd.Function):
         G.index_add_(0, ids.reshape(-1), grad_emb.reshape(-1, mod.dim).float())
         # Calibration accumulators read the RAW gradient (before drive), so the
         # measurement stays in data units even after a drive is applied.
+        # Sightings count GRADIENT-BEARING occurrences only: the control plane's
+        # branch-free forward routes EVERY position through this module (clamped
+        # to row 0) and masks with torch.where afterward, so non-trainable
+        # positions arrive here as row-0 ids with exact-zero grad rows --
+        # measured 75.7/caption (the CLIP context minus content), which inflated
+        # row 0's count ~140x before this mask. Zero-grad rows also correctly
+        # exclude real tokens in dropped/masked captions from the normalizer.
         mod._accum.add_(G)
-        mod._seen.index_add_(0, ids.reshape(-1),
-                             torch.ones(ids.numel(), dtype=torch.float32,
-                                        device=ids.device))
+        contrib = (grad_emb.reshape(-1, mod.dim).abs().amax(dim=1) > 0).to(torch.float32)
+        mod._seen.index_add_(0, ids.reshape(-1), contrib)
         # Per-token drive scaling, NOT per-row lr: evap_frac = lr*kappa*(1-coh)
         # is a FRACTION of the buffer, so scaling the drive preserves each
         # token's lambda semantics (per-row lr would push the evap fraction of
@@ -84,8 +90,9 @@ class ConcordPackedEmbedding(nn.Module):
         # graph; after the calibration reads it nobody looks again (~[K,dim]
         # fp32, a few hundred KB).
         self.register_buffer("_accum", torch.zeros(num_tokens, dim, device=device))
-        # sighting counter: occurrences of each token row in the batches (one
-        # per position per caption). _accum/_seen = justified distance PER
+        # sighting counter: GRADIENT-BEARING occurrences of each token row (the
+        # control plane routes every position through row 0 with zero grad;
+        # those must not count). _accum/_seen = justified distance PER
         # SIGHTING -- the calibration's normalizer.
         self.register_buffer("_seen", torch.zeros(num_tokens, device=device))
         self._grad_anchor = nn.Parameter(torch.zeros(1, device=device))
