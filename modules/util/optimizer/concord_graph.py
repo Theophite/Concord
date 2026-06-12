@@ -112,6 +112,7 @@ class ManualUNetGraph:
         self.cap_loss = None
         self._pool = None               # persistent graph-pool handle: every capture reuses it
         self._stale_graph = None        # pool ANCHOR across a keep_pool release (never replayed)
+        self._pool_bytes = 0            # measured pool footprint (boundary headroom check)
         self.unet = None
         self.model = None               # set in _alloc; needed for encode_text in TE-graph mode
         self._shape_key = None          # latent geometry the static buffers + graph are bound to
@@ -430,6 +431,28 @@ class ManualUNetGraph:
             self._zero_input_grads()                 # fresh static-input grads for capture
         import gc
         had_anchor = self._stale_graph is not None
+        if had_anchor and self._pool_bytes:
+            # Headroom check. Capturing while the anchor holds the old pool
+            # peaks at ~2x the pool (old + new blocks coexist until the anchor
+            # drops). On a card without that slack, WDDM does not OOM -- it
+            # silently demotes to shared memory (observed: slight overflow at
+            # the first epoch boundary), so the OOM-retry never fires. If free
+            # memory cannot cover another pool plus margin, degrade up front
+            # to the full-release path: fresh pool at 1x peak; the post-capture
+            # cleanup below prevents the old ratchet on this path too.
+            try:
+                free, _ = torch.cuda.mem_get_info()
+            except Exception:
+                free = None
+            need = self._pool_bytes + (256 << 20)
+            if free is not None and free < need:
+                print(f"[concord_graph] boundary headroom {free / 2 ** 30:.2f}G < "
+                      f"pool {self._pool_bytes / 2 ** 30:.2f}G + margin -> releasing "
+                      f"pool before recapture (1x peak)", flush=True)
+                self._stale_graph = None
+                self._pool = None
+                gc.collect()
+                torch.cuda.empty_cache()
         if self._pool is None:
             self._pool = torch.cuda.graph_pool_handle()
         self.graph = torch.cuda.CUDAGraph()
@@ -466,6 +489,15 @@ class ManualUNetGraph:
                       flush=True)
             except Exception:
                 pass
+        # Record the pool footprint for the boundary headroom check: right
+        # after a capture (+cleanup), reserved-minus-allocated is dominated by
+        # the live pool blocks. Keep the high-water mark.
+        try:
+            self._pool_bytes = max(
+                self._pool_bytes,
+                int(torch.cuda.memory_reserved() - torch.cuda.memory_allocated()))
+        except Exception:
+            pass
 
     def _zero_warmup_grads(self, model):
         # Discard grads accumulated during warmup so the captured backward writes exactly this
