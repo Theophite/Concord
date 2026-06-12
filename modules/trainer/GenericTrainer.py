@@ -808,15 +808,20 @@ class GenericTrainer(BaseTrainer):
                     global_step=train_progress.global_step
                 )
 
-                # give the Concord controller the same total-update horizon the scheduler uses
+                # give the Concord controller the same total-update horizon the scheduler
+                # uses. approximate_length() is already BATCHES, not samples (it scales
+                # inversely with batch_size: len~1885 @ bs4 vs len~3773 @ bs2, same
+                # dataset; the per-epoch step bar equals it), so divide by accumulation
+                # ONLY -- dividing by batch_size too halved the horizon on every run
+                # before 2026-06-11: cosine ended mid-run, divot released mid-epoch-1.
                 if getattr(self.model, "concord_controller", None) is not None:
                     self.model.concord_controller.total_steps = max(1, int(
                         self.config.epochs * self.data_loader.get_data_set().approximate_length()
-                        / (self.config.batch_size * max(1, self.config.gradient_accumulation_steps))))
+                        / max(1, self.config.gradient_accumulation_steps)))
                     print(f"[concord] schedule horizon = {self.model.concord_controller.total_steps} "
                           f"steps ({self.config.epochs} epochs, "
-                          f"len~{self.data_loader.get_data_set().approximate_length()}, "
-                          f"bs={self.config.batch_size}, accum={self.config.gradient_accumulation_steps})")
+                          f"len~{self.data_loader.get_data_set().approximate_length()} batches, "
+                          f"accum={self.config.gradient_accumulation_steps})")
                     # Telescope epoch window (exp-20 freshness law): pin the
                     # anchor's integration window to the dataset revisit period
                     # now that the horizon (and so steps-per-epoch) is known.
