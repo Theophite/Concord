@@ -143,8 +143,8 @@ class ManualUNetGraph:
         # committed per epoch boundary (free fell 1.16 -> 1.04 -> 0.58G and
         # the boundary recapture froze). While the anchor lives, the saver's
         # internal torch_gc()s cannot decommit the segments; the next
-        # _warmup_and_capture drops the anchor and captures into the SAME pool
-        # (self._pool), reusing them in place.
+        # _warmup_and_capture captures into the SAME pool (self._pool) while
+        # the anchor still holds it alive, THEN drops the anchor.
         import gc
         if keep_pool:
             self._stale_graph = self.graph   # anchor; replay is forbidden
@@ -154,6 +154,10 @@ class ManualUNetGraph:
         self._stale_graph = None
         self.graph = None
         self.cap_loss = None
+        # The pool dies with its last graph; the handle would dangle (capturing
+        # into it trips the use_count internal assert). Mint a fresh pool on
+        # the next capture.
+        self._pool = None
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -363,7 +367,13 @@ class ManualUNetGraph:
         if self.graph is None:
             try:
                 self._warmup_and_capture(model)
-            except torch.cuda.OutOfMemoryError:
+            except RuntimeError as e:
+                # OOM, or the allocator's pool-state internal assert (a stale/
+                # dangling shared pool). Both degrade to the same recovery:
+                # full release (fresh pool handle) + one retry from headroom.
+                if (not isinstance(e, torch.cuda.OutOfMemoryError)
+                        and "use_count" not in str(e)):
+                    raise
                 # Recapture on a heavily-exercised allocator (post-sample,
                 # post-cache) can OOM on fragmentation where the train-start
                 # capture succeeded. Retry ONCE from maximum headroom: drop the
@@ -420,25 +430,31 @@ class ManualUNetGraph:
             self._zero_input_grads()                 # fresh static-input grads for capture
         import gc
         had_anchor = self._stale_graph is not None
-        if had_anchor:
-            # The anchor kept the pool segments committed through the boundary
-            # (save/restore); its job is done. gc WITHOUT empty_cache: the dead
-            # graph's blocks return to the pool but the segments stay committed,
-            # so the capture below reuses them in place instead of committing a
-            # fresh pool next to them.
-            self._stale_graph = None
-            gc.collect()
         if self._pool is None:
             self._pool = torch.cuda.graph_pool_handle()
         self.graph = torch.cuda.CUDAGraph()
+        # ORDER IS LOAD-BEARING: the anchor (old graph) must stay alive THROUGH
+        # capture_begin -- a pool handle alone does not keep the pool alive;
+        # dropping the last graph zombifies it and capturing into the dangling
+        # handle trips the allocator's use_count>0 internal assert (crashed
+        # 2026-06-12 at the first aspect-bucket flip). Capturing while the old
+        # graph holds the pool is the make_graphed_callables pattern; the old
+        # graph is never replayed again, so capture-order replay constraints
+        # don't bind. Peak = old+new blocks (~2x one step's transient) during
+        # this capture only; on a too-tight card that OOMs into step()'s
+        # full-release retry, which degrades gracefully to a fresh pool.
         with torch.cuda.graph(self.graph, pool=self._pool):
             self.cap_loss = self._step_fn()
         if had_anchor:
-            # The one cleanup the boundary was missing: every torch_gc in the
+            # Anchor served its purpose (kept the pool committed through the
+            # boundary; kept it ALIVE through capture_begin). Drop it, then the
+            # one cleanup the boundary was missing: every torch_gc in the
             # backup path runs BEFORE this recapture, so the boundary
             # transient's ordinary segments were never decommitted -- the
             # +0.5G/epoch ratchet. The new graph's pool blocks are live and
-            # untouched by empty_cache.
+            # untouched by empty_cache; the old graph's blocks return to the
+            # pool for the next recapture.
+            self._stale_graph = None
             gc.collect()
             torch.cuda.empty_cache()
             try:
