@@ -516,26 +516,31 @@ ConcordController.apply_epoch_window(rig17, 943)
 check("17d delay resolved at finalize even with epoch window off",
       rig17.emb_delay_steps == 943 and rig17.steps_per_epoch == 943.0)
 
-# 17e: auto-drive calibration math -- drive = median(A)/A over live rows,
-# clamped to a decade, unseen rows stay 1, applied-flag set
+# 17e: auto-drive calibration math -- drive corrects FREQUENCY ONLY
+# (median(n)/n, decade clamp); per-sighting distance D stays the data's signal.
+# Regression: a CONVERGED-but-frequent token (small total A, huge n) must be
+# DAMPED, not boosted -- normalizing to total change got this backwards.
 class _FakeTr(SimpleNamespace):
     def set_drive(self, d):
         self.drive = d.clone()
 acc = torch.zeros(4, 8)
-acc[0, 0] = 10.0   # hot:    A=10  -> 1/10  -> clamp 0.2
-acc[1, 0] = 1.0    # median: A=1   -> 1.0
-acc[2, 0] = 0.1    # cold:   A=0.1 -> 10    -> clamp 5
-                   # row 3 unseen: A=0 -> stays 1, excluded from median
-rigc = SimpleNamespace(emb_trainables=[_FakeTr(_accum=acc, drive=None)],
-                       emb_row_names=["hot", "mid", "cold", "unseen"],
+seen = torch.zeros(4)
+acc[0, 0], seen[0] = 1.0, 100.0   # converged+hot: D=0.01, n=100 -> 10/100 -> clamp 0.2
+acc[1, 0], seen[1] = 1.0, 10.0    # median:        D=0.1,  n=10  -> 1.0
+acc[2, 0], seen[2] = 2.0, 2.0     # rare+far:      D=1.0,  n=2   -> 10/2 = 5.0
+                                  # row 3 unseen: n=0 -> stays 1, excluded from median
+rigc = SimpleNamespace(emb_trainables=[_FakeTr(_accum=acc, _seen=seen, drive=None)],
+                       emb_row_names=["hotconv", "mid", "rarefar", "unseen"],
                        _emb_drive_applied=False)
 ConcordController._finalize_embedding_calibration(rigc)
 got = rigc.emb_trainables[0].drive
-check("17e calibration: median-normalized, decade-clamped, unseen stays 1",
+check("17e calibration: frequency-normalized (converged-hot damped, rare-far "
+      "boosted), unseen stays 1",
       rigc._emb_drive_applied and got is not None
       and torch.allclose(got, torch.tensor([0.2, 1.0, 5.0, 1.0])),
       f"drive={None if got is None else got.tolist()}")
-rige = SimpleNamespace(emb_trainables=[_FakeTr(_accum=torch.zeros(2, 8), drive=None)],
+rige = SimpleNamespace(emb_trainables=[_FakeTr(_accum=torch.zeros(2, 8),
+                                               _seen=torch.zeros(2), drive=None)],
                        emb_row_names=["a", "b"], _emb_drive_applied=False)
 ConcordController._finalize_embedding_calibration(rige)
 check("17e2 empty accumulator (resumed past divot) -> drive untouched",
@@ -557,12 +562,14 @@ try:
     applied = []
     emb17.core.apply_grad_step = lambda g: applied.append(g.clone())
     emb17._anchored = True                      # one-shot pin -> no-op
-    grad = torch.randn(2, 16)
-    ctx = SimpleNamespace(saved_tensors=(torch.tensor([0, 1]),), mod=emb17)
+    grad = torch.randn(3, 16)                   # token 1 appears TWICE this batch
+    ctx = SimpleNamespace(saved_tensors=(torch.tensor([0, 1, 1]),), mod=emb17)
     _PackedEmbStep.backward(ctx, grad.clone())
-    raw_ok = torch.allclose(emb17._accum, grad)                 # raw, pre-drive
-    scaled_ok = (torch.allclose(applied[0][0], grad[0])
-                 and torch.allclose(applied[0][1], 2.0 * grad[1]))
+    G_raw = torch.stack([grad[0], grad[1] + grad[2]])
+    raw_ok = (torch.allclose(emb17._accum, G_raw)               # raw, pre-drive
+              and torch.allclose(emb17._seen, torch.tensor([1.0, 2.0])))
+    scaled_ok = (torch.allclose(applied[0][0], G_raw[0])
+                 and torch.allclose(applied[0][1], 2.0 * G_raw[1]))
 finally:
     ppb.ConcordLinearPackedB._resync_weight_buf = _orig_resync
     ppb.materialize_packed_bf16 = _orig_mat

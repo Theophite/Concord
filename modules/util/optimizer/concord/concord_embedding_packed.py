@@ -37,9 +37,12 @@ class _PackedEmbStep(torch.autograd.Function):
         # scatter per-position grad into a per-token grad_W [K, dim].
         G = torch.zeros(mod.K, mod.dim, device=grad_emb.device)
         G.index_add_(0, ids.reshape(-1), grad_emb.reshape(-1, mod.dim).float())
-        # Calibration accumulator reads the RAW gradient (before drive), so the
+        # Calibration accumulators read the RAW gradient (before drive), so the
         # measurement stays in data units even after a drive is applied.
         mod._accum.add_(G)
+        mod._seen.index_add_(0, ids.reshape(-1),
+                             torch.ones(ids.numel(), dtype=torch.float32,
+                                        device=ids.device))
         # Per-token drive scaling, NOT per-row lr: evap_frac = lr*kappa*(1-coh)
         # is a FRACTION of the buffer, so scaling the drive preserves each
         # token's lambda semantics (per-row lr would push the evap fraction of
@@ -81,6 +84,10 @@ class ConcordPackedEmbedding(nn.Module):
         # graph; after the calibration reads it nobody looks again (~[K,dim]
         # fp32, a few hundred KB).
         self.register_buffer("_accum", torch.zeros(num_tokens, dim, device=device))
+        # sighting counter: occurrences of each token row in the batches (one
+        # per position per caption). _accum/_seen = justified distance PER
+        # SIGHTING -- the calibration's normalizer.
+        self.register_buffer("_seen", torch.zeros(num_tokens, device=device))
         self._grad_anchor = nn.Parameter(torch.zeros(1, device=device))
 
     @staticmethod

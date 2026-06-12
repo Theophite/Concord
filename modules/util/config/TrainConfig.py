@@ -499,7 +499,7 @@ class TrainConfig(BaseConfig):
     concord_sample_deploy: bool
     concord_embedding_anchor: bool
     concord_embedding_delay_epochs: float  # "divot": freeze packed embeddings for the first N epochs so the UNet digs its basin against the pristine anchors; tokens then release on a fresh warmup (cosine still ends at the horizon). Counters fast-variable slaving (measured: 1 epoch @ lr 1e-3 slewed tokens ~50 deg off init). Doubles as the auto-drive calibration window.
-    concord_embedding_auto_drive: bool  # at divot release, set per-token drive = median(A)/A_i from the coherent gradient sum accumulated over the frozen window, so embedding_learning_rate means ONE isotropic scalar rate of change for every token (frequency and gradient scale divided out). Scales the DRIVE only -- evap_frac = lr*kappa*(1-coh) is a fraction of the buffer, so per-token lambda semantics are preserved. Requires delay_epochs > 0 for a calibration window.
+    concord_embedding_auto_drive: bool  # at divot release, normalize each token's rate to its DISTANCE MOVED PER SIGHTING: drive_i = median(n)/n_i (frequency correction only, decade clamp), so per-epoch motion ∝ D_i = ||coherent grad sum||/n_i -- the data's own per-appearance evidence. Converged-but-frequent tokens slow down because D is small (not boosted for a small total); rare-but-far tokens get the full frequency boost. Drive scaling preserves per-token lambda (evap_frac is a fraction of the buffer). Requires delay_epochs > 0 for a calibration window.
     concord_antithetic_timesteps: bool
     concord_antithetic_noise: bool
     concord_antithetic_same_example: bool

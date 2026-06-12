@@ -315,44 +315,54 @@ class ConcordController:
 
     @torch.no_grad()
     def _finalize_embedding_calibration(self):
-        """Divot calibration -> one isotropic scalar rate of change for all
-        embeddings. During the frozen first epoch the raw per-token gradients
-        accumulate coherently (_accum); A_i = ||sum||  is the change the data
-        JUSTIFIES for token i over one full pass -- caption frequency and
-        gradient scale included. Setting drive_i = median(A)/A_i (clamped to a
-        decade) makes embedding_learning_rate mean the SAME capability-rate for
-        every token: hot style tokens stop frying, rare concept tokens stop
-        straggling, and the data still allocates the realized travel (a token
-        whose residual dies stops drawing gradient). The clamp is deliberately
-        tight -- a rare token's direction estimate is noisy, and amplifying it
-        more than ~5x just feeds the friction. Tokens with A_i = 0 (never seen;
-        or the accumulator was lost to a mid-divot restart, which does NOT
-        round-trip through backups) keep drive 1."""
+        """Divot calibration: normalize the per-token rate to DISTANCE MOVED
+        PER SIGHTING. Over the frozen first epoch the raw gradients accumulate
+        coherently (_accum) and each token's batch occurrences are counted
+        (_seen); D_i = ||sum||/n_i is the change the data justifies per
+        appearance -- the token's own report of how far it still is from its
+        place (coherent displacement adds ~n, noise cancels to ~sqrt(n), so a
+        converged token reads a small D no matter how often it is seen).
+
+        The drive corrects FREQUENCY ONLY: drive_i = median(n)/n_i, clamped to
+        a decade. Per-epoch motion then = drive*n*step ~ median(n) * D_i for
+        every token -- proportional to its per-sighting evidence, with the
+        caption-frequency multiplier removed. A converged-but-frequent token
+        moves slowly BECAUSE its D is small (it is NOT boosted for having a
+        small total -- the failure mode of normalizing to total change); a
+        rare-but-far token gets the full frequency boost and its large D
+        carries it. The clamp stays tight: a rare token's direction estimate
+        is noisy, and amplifying it more than ~5x just feeds the friction.
+        Unseen tokens (n=0; or the accumulators were lost to a mid-divot
+        restart -- they do NOT round-trip through backups) keep drive 1."""
         self._emb_drive_applied = True
         for plane_idx, tr in enumerate(self.emb_trainables):
-            A = tr._accum.float().norm(dim=1)            # [K]
-            live = A > 0
+            n = tr._seen.float()                         # [K] sightings
+            A = tr._accum.float().norm(dim=1)            # [K] justified distance
+            live = n > 0
             if not bool(live.any()):
                 print(f"[concord] embedding calibration TE{plane_idx + 1}: empty "
                       f"accumulator (resumed past the divot?) -- drive stays uniform")
                 continue
-            med = A[live].median()
-            drive = torch.where(live, (med / A.clamp_min(1e-30)).clamp(0.2, 5.0),
-                                torch.ones_like(A))
+            D = A / n.clamp_min(1.0)                     # distance per sighting
+            med_n = n[live].median()
+            drive = torch.where(live, (med_n / n.clamp_min(1.0)).clamp(0.2, 5.0),
+                                torch.ones_like(n))
             tr.set_drive(drive)
             names = self.emb_row_names or [f"row{i}" for i in range(A.numel())]
-            order = torch.argsort(A, descending=True)   # zero rows sort last
+            order = torch.argsort(torch.where(live, D, torch.full_like(D, -1.0)),
+                                  descending=True)       # unseen rows sort last
             live_n = int(live.sum())
-            fmt = lambda i: f"{names[i]}(A={float(A[i]):.3g},d={float(drive[i]):.2f})"
-            top = ", ".join(fmt(int(i)) for i in order[:4])
-            bot = ", ".join(fmt(int(i)) for i in order[max(0, live_n - 4):live_n].flip(0))
+            fmt = lambda i: (f"{names[i]}(D={float(D[i]):.3g},n={int(n[i])},"
+                             f"d={float(drive[i]):.2f})")
+            far = ", ".join(fmt(int(i)) for i in order[:4])
+            near = ", ".join(fmt(int(i)) for i in order[max(0, live_n - 4):live_n].flip(0))
             n_lo = int((drive <= 0.2 + 1e-6).sum())
             n_hi = int((drive >= 5.0 - 1e-6).sum())
             print(f"[concord] embedding calibration TE{plane_idx + 1}: drive = "
-                  f"median(A)/A over {int(live.sum())} live tokens "
-                  f"(clamped: {n_lo} at 0.2x, {n_hi} at 5x)\n"
-                  f"          hottest {top}\n"
-                  f"          coldest {bot}", flush=True)
+                  f"median(n)/n over {live_n} live tokens (clamped: {n_lo} at 0.2x, "
+                  f"{n_hi} at 5x); per-epoch rate now ~ distance-per-sighting\n"
+                  f"          farthest/sighting {far}\n"
+                  f"          nearest/sighting  {near}", flush=True)
 
     @torch.no_grad()
     def apply_epoch_window(self, steps_per_epoch):
