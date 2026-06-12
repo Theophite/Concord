@@ -681,6 +681,8 @@ def _apply_packed_adamw_kernel(
     USE_RATIO_COH: tl.constexpr,  # True -> gate chase+leak by live coh, no coh_pre
     USE_GAP_FEEDBACK: tl.constexpr,  # True -> conserved gap-magnitude pass/evap split (strips floor)
     USE_LAZY_GATE: tl.constexpr,  # True -> freeze gf_consol evap + leak on idle coords (no accumulated signal)
+    USE_GRAD_ACTIVITY: tl.constexpr,  # True -> activity = gradient PRESENT this launch (sighting-clocked
+                          # dissipation for embedding rows; overrides the lazy buffer-vs-v_hat test)
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -831,7 +833,21 @@ def _apply_packed_adamw_kernel(
     # per-coord typical g² (W² units); the window amplifies real signal far above it, so τ is not
     # sensitive. g_active = 1.0 everywhere when the flag is off -> bit-exact no-op.
     g_active = 1.0
-    if USE_LAZY_GATE:
+    if USE_GRAD_ACTIVITY:
+        # Sighting-clocked dissipation (embedding rows). Evidence arrives per
+        # SIGHTING, not per step: a token row absent from this batch reaches
+        # the kernel with an EXACTLY-zero grad tile (the control plane's
+        # where-mask), and taxing its resident buffer between sightings makes
+        # the effective lambda per unit evidence ~ lambda * gap_steps --
+        # survival (1-0.5)^19 ~ 2e-6 across the gaps of an n~49/epoch token:
+        # rare tokens could never accumulate (measured 2026-06-12: styles
+        # learned, characters did not). Activity = gradient present THIS
+        # launch, so evap (and leak) tick only on evidence steps and lambda
+        # means the same per-sighting fraction at every token frequency.
+        # Replaces the buffer-vs-v_hat lazy test, whose tau is calibrated for
+        # dense UNet signals and is a coin flip for sparse rows.
+        g_active = (grad_W != 0.0).to(tl.float32)
+    elif USE_LAZY_GATE:
         g_active = (s_fast_in_w * s_fast_in_w > lazy_thresh * v_hat).to(tl.float32)
     if USE_GAP_FEEDBACK:
         evap_mantissa = (1.0 - c_pass) * alpha * d_fs * g_active   # conserved: non-passed velocity evaporates
@@ -1441,7 +1457,8 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
                          track_rebalance=True,
                          v_row=None, v_col=None, sum_v_inv=None,
                          gf_trust_delta_sq=0.0, coh_pre=None,
-                         gf_consol_buf=None, beta1_buf=None):
+                         gf_consol_buf=None, beta1_buf=None,
+                         grad_activity=False):
     """Wrapper for the AdamW three-accumulator packed apply kernel.
     weight_buf is updated with the new live weight (materialize-merge),
     so the next forward can read directly without a separate materialize
@@ -1539,6 +1556,7 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         USE_RATIO_COH=bool(_RATIO_COH),
         USE_GAP_FEEDBACK=bool(_GAP_FEEDBACK),
         USE_LAZY_GATE=bool(_LAZY_GATE),
+        USE_GRAD_ACTIVITY=bool(grad_activity),
     )
 
 
@@ -2084,6 +2102,10 @@ class ConcordLinearPackedB(nn.Module):
         # — replaces the hard step_cap clamp with a smooth SNR gate.
         # δ²=1/step_cap² matches the legacy asymptotic max step.
         self.gf_trust_delta_sq = 1.0   # validated: 1 => v_hat IS the denom (rank-1 Adam)
+        # Sighting-clocked dissipation: activity = gradient present this launch
+        # (embedding rows; overrides the lazy buffer-vs-v_hat test). Set by
+        # register_embedding_cores; False = UNet behavior, bit-exact legacy.
+        self.grad_activity = False
         # Bidirectional rebalance tick-down (reclaim exponent precision). OFF by
         # default: it hurt the packed v-hat (oscillates with the chase). Set True
         # to experiment (e.g. a settled-phase-only schedule).
@@ -2507,7 +2529,7 @@ class ConcordLinearPackedB(nn.Module):
         return y.to(in_dtype)
 
     @torch.no_grad()
-    def apply_grad_step(self, grad_W):
+    def apply_grad_step(self, grad_W, v_stats_from=None):
         """Apply ONE fused self-step for an EXTERNALLY-supplied weight gradient
         grad_W [out_features, in_features], WITHOUT autograd -- a direct kernel launch.
 
@@ -2519,7 +2541,15 @@ class ConcordLinearPackedB(nn.Module):
         with cudaErrorStreamCaptureImplicit. The experimental Sigma_g gradient noise is NOT
         applied here -- it is keyed to the forward's grad_y/x decomposition, which a directly
         supplied grad_W does not have (noise is default-off and irrelevant for the few
-        textual-inversion rows)."""
+        textual-inversion rows).
+
+        `v_stats_from`: optional tensor to feed the Adafactor v-hat EMA instead
+        of grad_W. Required when grad_W carries per-row drive scaling: rank-1
+        Adam is invariant to per-row gradient rescaling ((d*g)/sqrt(d^2*v_hat)
+        = g/sqrt(v_hat)), so a drive baked into both the tick and the stats
+        cancels EXACTLY -- the per-token calibration was a no-op until v-hat
+        was fed the raw gradient (found 2026-06-12: styles learned, characters
+        did not). With raw stats the tick becomes d*(g/sqrt(v_hat))."""
         wbuf, rmbuf, cmbuf = self._ensure_buffers()
         if grad_W.dtype != torch.bfloat16:
             grad_W = grad_W.to(torch.bfloat16)
@@ -2529,7 +2559,7 @@ class ConcordLinearPackedB(nn.Module):
             rmbuf.zero_()
             cmbuf.zero_()
         if self.track_adafactor_v and self.v_row is not None:
-            g2 = grad_W.float() ** 2
+            g2 = (grad_W if v_stats_from is None else v_stats_from).float() ** 2
             if _COH_WEIGHTED_V and self._coh_pre is not None:
                 w = self._coh_pre / self._coh_pre.mean().clamp(min=1e-12)
                 g2 = g2 * w
@@ -2559,6 +2589,7 @@ class ConcordLinearPackedB(nn.Module):
                 sum_v_inv=self._sum_v_inv,
                 gf_trust_delta_sq=self.gf_trust_delta_sq,
                 coh_pre=self._coh_pre,
+                grad_activity=self.grad_activity,
             )
         else:
             apply_packed_sgd(

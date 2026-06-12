@@ -313,10 +313,16 @@ class ConcordController:
         kappa_emb = lam / max(self.emb_lr, 1e-12)
         for c in self.emb_cores:
             c.gf_consol = kappa_emb
+            # Sighting-clocked dissipation: evidence arrives per SIGHTING for
+            # token rows, so evap must tick on evidence steps only -- per-step
+            # evap made the effective lambda per unit evidence ~ lambda *
+            # sighting_gap (annihilated rare tokens; styles learned, characters
+            # did not, 2026-06-12).
+            c.grad_activity = True
         print(f"[concord] embedding cores registered: {len(self.emb_cores)} TE plane(s) "
               f"under the controller -- lam={lam:g} @ lr_emb={self.emb_lr:g} -> "
-              f"kappa_emb={kappa_emb:.0f}; warmup+cosine schedule, sigma off; "
-              f"deploy bridge now masks embedding s_fast during sampling")
+              f"kappa_emb={kappa_emb:.0f} (sighting-clocked); warmup+cosine schedule, "
+              f"sigma off; deploy bridge now masks embedding s_fast during sampling")
 
     @torch.no_grad()
     def _finalize_embedding_calibration(self):

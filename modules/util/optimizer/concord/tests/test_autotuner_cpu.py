@@ -614,8 +614,12 @@ try:
     except ValueError:
         len_ok = True
     applied = []
-    emb17.core.apply_grad_step = lambda g: applied.append(g.clone())
+    _orig_launch = ppb.apply_packed_adamw
+    ppb.apply_packed_adamw = (lambda packed_w, grad_W, *a, **k:
+                              applied.append((grad_W.float().clone(),
+                                              bool(k.get("grad_activity", False)))))
     emb17._anchored = True                      # one-shot pin -> no-op
+    emb17.core.grad_activity = True             # sighting-clocked dissipation
     # token 1 appears twice; the LAST position is a control-plane passthrough:
     # routed to row 0 with an exact-zero grad row (torch.where mask) -- it must
     # NOT count as a sighting (row 0's n was inflated 75.7/caption before).
@@ -623,19 +627,27 @@ try:
     grad[3].zero_()
     ctx = SimpleNamespace(saved_tensors=(torch.tensor([0, 1, 1, 0]),), mod=emb17)
     _PackedEmbStep.backward(ctx, grad.clone())
+    ppb.apply_packed_adamw = _orig_launch
     G_raw = torch.stack([grad[0], grad[1] + grad[2]])
     raw_ok = (torch.allclose(emb17._accum, G_raw)               # raw, pre-drive
               and torch.allclose(emb17._seen, torch.tensor([1.0, 2.0])))
-    scaled_ok = (torch.allclose(applied[0][0], G_raw[0])
-                 and torch.allclose(applied[0][1], 2.0 * G_raw[1]))
+    kg, factive = applied[0]
+    scaled_ok = (torch.allclose(kg[0], G_raw[0], rtol=0.02, atol=1e-3)
+                 and torch.allclose(kg[1], 2.0 * G_raw[1], rtol=0.02, atol=1e-3)
+                 and factive)
+    # the drive must NOT cancel through rank-1 Adam: v-hat fed the RAW grad
+    vr_exp = 0.001 * (G_raw ** 2).sum(1)
+    vhat_ok = torch.allclose(emb17.core.v_row, vr_exp, rtol=1e-2)
 finally:
     ppb.ConcordLinearPackedB._resync_weight_buf = _orig_resync
     ppb.materialize_packed_bf16 = _orig_mat
+    ppb.apply_packed_adamw = _orig_launch
 check("17f set_drive: defaults to ones, sets [K,1], rejects wrong length",
       ones_ok and set_ok and len_ok)
-check("17g backward: accumulator sees RAW grad, kernel sees drive-scaled grad, "
-      "zero-grad passthrough positions don't count as sightings",
-      raw_ok and scaled_ok)
+check("17g backward: kernel gets drive-SCALED grad + grad_activity flag; "
+      "v-hat gets RAW grad (no Adam cancellation); passthroughs don't count",
+      raw_ok and scaled_ok and vhat_ok,
+      f"v_row={emb17.core.v_row.tolist()} exp={vr_exp.tolist()}")
 
 # 17h: schedule-only winner_step leaves the module globals alone (the sigma
 # clobber: emb group's noise=False used to zero sigma for the whole model)

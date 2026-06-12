@@ -54,14 +54,18 @@ class _PackedEmbStep(torch.autograd.Function):
         # token's lambda semantics (per-row lr would push the evap fraction of
         # boosted tokens into the min_leak clamp). Device [K,1] buffer, updated
         # by .copy_() from outside the graph -> propagates into replays.
-        G.mul_(mod._drive)
-        # Drive packed_b's fused cascade DIRECTLY with grad_W = G -- one kernel launch, no
+        # ORDER IS LOAD-BEARING: the v-hat EMA must see the RAW gradient and
+        # the kernel the SCALED one -- rank-1 Adam is invariant to per-row
+        # rescaling ((d*g)/sqrt(d^2*v_hat) = g/sqrt(v_hat)), so scaling before
+        # the stats canceled the drive EXACTLY (the calibration was a no-op;
+        # found 2026-06-12). Out-of-place multiply keeps G raw for the stats.
+        # Drive packed_b's fused cascade DIRECTLY -- one kernel launch, no
         # re-entrant autograd. The old trick (core(x); y.backward(G.t())) ran a nested
         # torch.autograd.backward(), which is ILLEGAL inside a CUDA-graph capture: it touches
         # the legacy stream and aborts the capture (cudaErrorStreamCaptureImplicit) -- crashing
         # specifically on the post-backup graph RE-capture. apply_grad_step is the identical
         # apply path with no autograd engine, so capture (and re-capture) is safe.
-        core.apply_grad_step(G)
+        core.apply_grad_step(G * mod._drive, v_stats_from=G)
         core._resync_weight_buf()
         # Pin ALL K rows (static shape -> CUDA-graph capturable). torch.unique would be
         # dynamic-shaped AND sync. K is tiny and untouched rows are already at target,
