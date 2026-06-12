@@ -1080,3 +1080,66 @@ deploy-sample metric) may still peak elsewhere, but this predicts it HAS a
 peak, plausibly at lam below where the sweep was heading. The fork's
 λ ∈ {0.25, 0.5, 1.0} bracket at the epoch window is the decisive next GPU
 run.
+
+## Exp 22 — the s_slow chase window: the telescope's missing middle rung (`exp22_chase_window.py`)
+
+The cascade jumps from a ~5-step chase (α=0.1) straight to the epoch anchor,
+so the drift numerator C\*(S−A) compares ~5 steps of commits against the
+epoch integral. Question (user proposal): does a fraction-of-epoch s_slow —
+v_slow at epoch, s_slow at epoch/k — buy better coherence (trend agreement
+between two well-sampled integrals) and a Polyak-averaged deploy? Constraint:
+ρ = α_v/α < ½ or C\* poles, so the ladder tops at epoch/2.5.
+
+Protocol: v̂ drive (the fork's), lr 1e-3, σ OFF (the fork's operating
+point), gate + min-leak, pad-2 crop-aug, 4k × 25 ep, **bs 32** (SPE = 125,
+so the ladder spans 10×; exp-20/21 anchors at bs 128 do NOT transfer — the
+α=0.1 arms are the internal baseline), anchor = 1 epoch, 3 seeds. Slow arms
+use SPLIT-INIT packing (S = A = W₀/2, u = 0 — the telescope's zero-input
+fixed point, so drift starts exactly 0; the α=0.1 packing pair is the
+neutrality control).
+
+    chase window      ep/25(legacy) ep/16   ep/8    ep/4    ep/2.5
+    clean   deploy    95.07         94.30   93.16   91.81   91.00
+    30%     deploy    93.40         92.47   90.77   88.98   87.77
+    mean coh (cl/no)  .25/.19       .29/.22 .36/.28 .41/.33 .45/.37
+
+1. **Monotone-down, both regimes — the middle rung is refuted at fixed
+   budget.** And the diagnostics show *why* cleanly: coherence does exactly
+   what the proposal predicted — it nearly doubles up the ladder (the
+   trend-agreement signal is real and better-sampled) — but the better meter
+   never pays for the slower consolidation. Commit speed is the binding
+   constraint, not measurement quality.
+2. **The Polyak hope is flat**: deploy−live ≈ +0.3 at every window (noisy);
+   the averaging benefit does not grow with the window.
+3. **Split-init is neutral** (95.07 vs 94.96 clean, 93.40 vs 93.45 noisy —
+   within spread). Adopt it for its own reasons: it starts the system at the
+   telescope's static fixed point, killing the init-residue artifact family
+   (probe floor, early coh inflation, the boil washout) at the source — a
+   fine-tune benefit MNIST-from-scratch cannot exhibit.
+4. **Incidental headline — F is monotone-DOWN on this protocol** (phase 2,
+   legacy window, v̂):
+
+       F           0      0.25   0.5    1.0
+       clean       96.63  95.89  95.07  93.19
+       30% noise   94.86  94.43  93.40  91.26
+       (memorized) 10.9   10.1   10.0    9.8
+
+   λ\*(v̂ | aug + 1-ep anchor + σ-off + floor) = 0. Contrast exp 21 (NS
+   drive, bs128: interior F\* ≈ 0.5–1.0) and the exp-5-era v̂ λ\* ≈ 0.4–0.5
+   (stale 16-ep window, no aug). Pattern across the campaign: every repair
+   that adds regularization or freshens the trust reference (floor, epoch
+   window, aug) shrinks friction's constituency; on this fully-repaired v̂
+   protocol it reaches zero. Memorization falls only ~1 point over the whole
+   F range — the scrub buys almost nothing the aug didn't already buy.
+
+Caveats: fixed 25-ep budget (slow arms are rate-limited, not given longer —
+but fixed budget is the operationally relevant comparison); single protocol;
+bs 32; one task.
+
+SDXL implication: CPU no longer offers independent support for λ > 0 on the
+v̂ fork — the SDXL monotone-λ quality observation now stands as a pure
+domain property (fine-tune on real data, deploy-sample metric, conditioning
+noise with different character). That makes the GPU λ bracket the decisive
+arbiter, and the running λ=0.5 + γ-SNR job is effectively one of its arms.
+Do not spend GPU on the chase window; consider porting split-init packing to
+the fork for the artifact kill alone.
