@@ -47,8 +47,18 @@ class _PackedEmbStep(torch.autograd.Function):
         # row 0's count ~140x before this mask. Zero-grad rows also correctly
         # exclude real tokens in dropped/masked captions from the normalizer.
         mod._accum.add_(G)
-        contrib = (grad_emb.reshape(-1, mod.dim).abs().amax(dim=1) > 0).to(torch.float32)
+        ge = grad_emb.reshape(-1, mod.dim).float()
+        contrib = (ge.abs().amax(dim=1) > 0).to(torch.float32)
         mod._seen.index_add_(0, ids.reshape(-1), contrib)
+        if mod._track_window:
+            # Incoherent power Sigma||g||^2 at SIGHTING (position) granularity:
+            # the noise term of the per-token Wiener posterior (the "window
+            # around init"). Position-level, NOT ||G||^2 -- a token seen twice
+            # in a batch contributes ||g1||^2+||g2||^2; the COHERENT sum g1+g2
+            # is what lands in _accum. Flag-gated (diagnostic, default off);
+            # passive like _accum, never touches the update. Zero-grad
+            # passthrough rows add 0, consistent with the _seen mask.
+            mod._power.index_add_(0, ids.reshape(-1), ge.pow(2).sum(-1))
         # Per-token drive scaling, NOT per-row lr: evap_frac = lr*kappa*(1-coh)
         # is a FRACTION of the buffer, so scaling the drive preserves each
         # token's lambda semantics (per-row lr would push the evap fraction of
@@ -99,6 +109,10 @@ class ConcordPackedEmbedding(nn.Module):
         # those must not count). _accum/_seen = justified distance PER
         # SIGHTING -- the calibration's normalizer.
         self.register_buffer("_seen", torch.zeros(num_tokens, device=device))
+        # incoherent power Sigma||g||^2 (window estimator's noise term); only
+        # accumulated when _track_window is set (flag-gated diagnostic).
+        self.register_buffer("_power", torch.zeros(num_tokens, device=device))
+        self._track_window = False
         self._grad_anchor = nn.Parameter(torch.zeros(1, device=device))
 
     @staticmethod

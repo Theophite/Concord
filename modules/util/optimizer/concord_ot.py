@@ -161,6 +161,7 @@ class ConcordController:
         self.emb_auto_drive = False  # normalize per-token drive from the divot window
         self.emb_freq_exponent = 0.5  # beta in drive = (med(n)/n)^beta
         self.emb_calib_path = None   # workspace sidecar (counts = dataset property)
+        self.emb_window_report = False  # per-token Wiener posterior around init (diagnostic)
         self._emb_drive_applied = False
         self.steps_per_epoch = 0.0
         self.step_idx = 0
@@ -283,7 +284,7 @@ class ConcordController:
 
     def register_embedding_cores(self, planes, emb_lr, delay_epochs=0.0,
                                  auto_drive=False, freq_exponent=0.5,
-                                 calib_path=None):
+                                 calib_path=None, window_report=False):
         """Bring the packed-embedding cores under the controller's physics. As
         created they are the LEAST protected, HIGHEST leverage parameters in
         the system: gf_consol = 0 (zero dissipation -- the only trainables
@@ -306,6 +307,9 @@ class ConcordController:
         self.emb_auto_drive = bool(auto_drive)
         self.emb_freq_exponent = max(0.0, float(freq_exponent))
         self.emb_calib_path = calib_path
+        self.emb_window_report = bool(window_report)
+        for tr in self.emb_trainables:
+            tr._track_window = self.emb_window_report   # gate the Sigma||g||^2 accumulator
         if not self.emb_cores:
             return
         lam = (float(self.config.dissipation) if self.config.dissipation is not None
@@ -374,6 +378,7 @@ class ConcordController:
                      else [f"row{i}" for i in range(K)])
             n = tr._seen.float()                         # [K] sightings
             A = tr._accum.float().norm(dim=1)            # [K] justified distance
+            P = tr._power.float()                        # [K] incoherent power (window)
             source = "measured this window"
             if not bool((n > 0).any()):
                 if loaded is None:
@@ -387,6 +392,7 @@ class ConcordController:
                     continue
                 n = torch.tensor([float(tok.get(nm, {}).get("n", 0.0)) for nm in names])
                 A = torch.tensor([float(tok.get(nm, {}).get("A", 0.0)) for nm in names])
+                P = torch.tensor([float(tok.get(nm, {}).get("P", 0.0)) for nm in names])
                 miss = sorted({nm for nm in names if nm not in tok})
                 if miss:
                     print(f"[concord] embedding calibration TE{plane_idx + 1}: "
@@ -404,7 +410,8 @@ class ConcordController:
             tr.set_drive(drive)
             if source == "measured this window":
                 saved_planes.append({"te": plane_idx + 1, "tokens": {
-                    nm: {"n": round(float(n[i]), 2), "A": float(A[i])}
+                    nm: {"n": round(float(n[i]), 2), "A": float(A[i]),
+                         "P": float(P[i])}
                     for i, nm in enumerate(names)}})
             w = drive * n                                # per-epoch rate weight
             order = torch.argsort(torch.where(live, D, torch.full_like(D, -1.0)),
@@ -421,8 +428,58 @@ class ConcordController:
                   f"{n_lo} at 0.2x, {n_hi} at 5x); w = drive*n = per-epoch rate weight\n"
                   f"          farthest/sighting {far}\n"
                   f"          nearest/sighting  {near}", flush=True)
+            if self.emb_window_report:
+                self._print_window_report(plane_idx, names, A, P, n)
         if saved_planes and len(saved_planes) == len(self.emb_trainables):
             self._save_calibration(saved_planes)
+
+    @staticmethod
+    def _emb_window_stats(C2, P, n):
+        """Per-token Wiener posterior around the anchor (init), from the
+        coherent-sum power C2 = ||Sigma g||^2, the incoherent power
+        P = Sigma ||g||^2, and sighting count n. Model g_i = mu + eps:
+            E||Sigma g||^2 = n^2||mu||^2 + n*nu,  E[Sigma||g||^2] = n(||mu||^2 + nu)
+        -> ||mu||^2 = (C2 - P)/(n(n-1)),  nu = (P - C2/n)/(n-1).
+        Returns (rho, w):
+          rho = signal-power fraction ||mu||^2/(||mu||^2+nu) in [0,1] -- the
+                Kalman posterior tightness (1 = the data has pinned the
+                token's direction; 0 = pure noise, true value could be
+                anywhere in the init neighborhood).
+          w   = relative window half-width sqrt((1-rho)/(n*rho)) -- the
+                fractional uncertainty in the displacement, shrinking as
+                1/sqrt(n) (more sightings) and as rho rises (UNet sharpening
+                the attractor). Small w = converged."""
+        nn = n.clamp_min(2.0)
+        mu2 = ((C2 - P) / (nn * (nn - 1.0))).clamp_min(0.0)
+        nu = ((P - C2 / nn) / (nn - 1.0)).clamp_min(0.0)
+        rho = mu2 / (mu2 + nu + 1e-30)
+        w = torch.sqrt((1.0 - rho) / (n.clamp_min(1.0) * rho.clamp_min(1e-6))).clamp_max(99.0)
+        seen2 = n >= 2
+        rho = torch.where(seen2, rho, torch.zeros_like(rho))
+        w = torch.where(seen2, w, torch.full_like(w, 99.0))
+        return rho, w
+
+    def _print_window_report(self, plane_idx, names, A, P, n):
+        """Surface the per-token posterior: which tokens the divot has
+        localized (small w) vs. which are still wandering (wide w)."""
+        rho, w = self._emb_window_stats(A * A, P, n)
+        live = n >= 2
+        if not bool(live.any()):
+            print(f"[concord] embedding window TE{plane_idx + 1}: no token seen "
+                  f">=2x -- posterior undefined")
+            return
+        order = torch.argsort(torch.where(live, w, torch.full_like(w, -1.0)),
+                              descending=True)            # widest (least sure) first
+        live_n = int(live.sum())
+        fmt = lambda i: (f"{names[i]}(rho={float(rho[i]):.2f},w={float(w[i]):.2f},"
+                         f"n={int(n[i])})")
+        wide = ", ".join(fmt(int(i)) for i in order[:4])
+        tight = ", ".join(fmt(int(i)) for i in order[max(0, live_n - 4):live_n].flip(0))
+        print(f"[concord] embedding window TE{plane_idx + 1}: posterior around init "
+              f"(rho=signal fraction, w=relative half-width; small w = data has "
+              f"pinned the token)\n"
+              f"          least localized {wide}\n"
+              f"          most localized  {tight}", flush=True)
 
     @staticmethod
     def _emb_drive_from_counts(n, beta):
@@ -854,7 +911,8 @@ def setup_packed_embeddings(model, config):
             delay_epochs=float(getattr(config, "concord_embedding_delay_epochs", 0.0) or 0.0),
             auto_drive=bool(getattr(config, "concord_embedding_auto_drive", False)),
             freq_exponent=float(getattr(config, "concord_embedding_freq_exponent", 0.5)),
-            calib_path=(str(Path(_ws) / "concord_embedding_calibration.json") if _ws else None))
+            calib_path=(str(Path(_ws) / "concord_embedding_calibration.json") if _ws else None),
+            window_report=bool(getattr(config, "concord_embedding_window_report", False)))
     # The plain-SGD wrapper path is bypassed; ensure both wrapper refs are None so
     # after_optimizer_step's preserve_embedding_norm guard short-circuits (the model's
     # __init__ leaves embedding_wrapper_2 unset).

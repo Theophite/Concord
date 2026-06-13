@@ -531,11 +531,16 @@ def calib_rig(**kw):
     kw.setdefault("emb_calib_path", None)
     kw.setdefault("emb_delay_steps", 100)
     kw.setdefault("step_idx", 101)
+    kw.setdefault("emb_window_report", False)
     kw.setdefault("_emb_drive_applied", False)
+    for tr in kw.get("emb_trainables", []):     # window reads _power unconditionally
+        if not hasattr(tr, "_power"):
+            tr._power = torch.zeros_like(tr._seen)
     rig = SimpleNamespace(**kw)
-    for m in ("_save_calibration", "_load_calibration"):
+    for m in ("_save_calibration", "_load_calibration", "_print_window_report"):
         setattr(rig, m, getattr(ConcordController, m).__get__(rig))
     rig._emb_drive_from_counts = ConcordController._emb_drive_from_counts
+    rig._emb_window_stats = ConcordController._emb_window_stats
     return rig
 
 acc = torch.zeros(4, 8)
@@ -620,6 +625,7 @@ try:
                                               bool(k.get("grad_activity", False)))))
     emb17._anchored = True                      # one-shot pin -> no-op
     emb17.core.grad_activity = True             # sighting-clocked dissipation
+    emb17._track_window = True                   # accumulate Sigma||g||^2
     # token 1 appears twice; the LAST position is a control-plane passthrough:
     # routed to row 0 with an exact-zero grad row (torch.where mask) -- it must
     # NOT count as a sighting (row 0's n was inflated 75.7/caption before).
@@ -631,6 +637,11 @@ try:
     G_raw = torch.stack([grad[0], grad[1] + grad[2]])
     raw_ok = (torch.allclose(emb17._accum, G_raw)               # raw, pre-drive
               and torch.allclose(emb17._seen, torch.tensor([1.0, 2.0])))
+    # _power = Sigma||g||^2 at POSITION granularity (token1 = ||g1||^2+||g2||^2,
+    # NOT ||g1+g2||^2); the zero passthrough adds 0.
+    P_exp = torch.tensor([float((grad[0] ** 2).sum()),
+                          float((grad[1] ** 2).sum() + (grad[2] ** 2).sum())])
+    power_ok = torch.allclose(emb17._power, P_exp, rtol=1e-4)
     kg, factive = applied[0]
     scaled_ok = (torch.allclose(kg[0], G_raw[0], rtol=0.02, atol=1e-3)
                  and torch.allclose(kg[1], 2.0 * G_raw[1], rtol=0.02, atol=1e-3)
@@ -648,6 +659,24 @@ check("17g backward: kernel gets drive-SCALED grad + grad_activity flag; "
       "v-hat gets RAW grad (no Adam cancellation); passthroughs don't count",
       raw_ok and scaled_ok and vhat_ok,
       f"v_row={emb17.core.v_row.tolist()} exp={vr_exp.tolist()}")
+check("17g2 window: _power accumulates Sigma||g||^2 at position granularity "
+      "(incoherent, != ||coherent sum||^2)", power_ok,
+      f"power={emb17._power.tolist()} exp={P_exp.tolist()}")
+
+# 17i: window posterior math -- coherent power C2=||Sigma g||^2, incoherent
+# P=Sigma||g||^2, n sightings -> (rho signal fraction, w relative half-width)
+C2 = torch.tensor([16.0, 4.0, 10.0, 5.0])
+Pw = torch.tensor([4.0,  4.0, 4.0,  5.0])
+nw = torch.tensor([4.0,  4.0, 4.0,  1.0])
+rho, ww = ConcordController._emb_window_stats(C2, Pw, nw)
+#  pure signal (4 copies of v): rho=1, w=0
+#  pure noise (4 orthonormal):  rho=0, w=clamp 99
+#  half/half:                   rho=0.5, w=0.5
+#  n<2:                         undefined -> rho=0, w=99
+check("17i window stats: signal->rho1/w0, noise->rho0, mix->rho.5/w.5, n<2->wide",
+      torch.allclose(rho, torch.tensor([1.0, 0.0, 0.5, 0.0]), atol=1e-4)
+      and torch.allclose(ww, torch.tensor([0.0, 99.0, 0.5, 99.0]), atol=1e-3),
+      f"rho={rho.tolist()} w={ww.tolist()}")
 
 # 17h: schedule-only winner_step leaves the module globals alone (the sigma
 # clobber: emb group's noise=False used to zero sigma for the whole model)
