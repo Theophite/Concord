@@ -567,6 +567,41 @@ class TrainingTab:
                          tooltip="Rescales each trained embedding to the median embedding norm")
         components.switch(frame, 1, 1, self.ui_state, "preserve_embedding_norm")
 
+        # ---- Concord packed-embedding controls (read only when the CONCORD
+        # optimizer is active; inert otherwise) ----
+        components.label(frame, 2, 0, "Concord: Anchor Embeddings",
+                         tooltip="Freeze each embedding's init vector in v_slow; deploy = init + "
+                                 "gated delta, so off-manifold drift is structurally impossible. "
+                                 "Default on.")
+        components.switch(frame, 2, 1, self.ui_state, "concord_embedding_anchor")
+
+        components.label(frame, 3, 0, "Concord: Calibration / Divot Epochs",
+                         tooltip="Freeze the embeddings for this many epochs while the UNet digs "
+                                 "its basin against the pristine inits. Doubles as the per-token "
+                                 "drive-calibration window (and warms v-hat). Float; 0 disables the "
+                                 "divot (embeddings train from step 0, uncalibrated).")
+        components.entry(frame, 3, 1, self.ui_state, "concord_embedding_delay_epochs")
+
+        components.label(frame, 4, 0, "Concord: Auto Drive",
+                         tooltip="At divot release, set each token's drive from its sighting count "
+                                 "so the embedding learning rate means ONE isotropic rate of change "
+                                 "for every token (frequency divided out). Requires Divot Epochs > 0.")
+        components.switch(frame, 4, 1, self.ui_state, "concord_embedding_auto_drive")
+
+        components.label(frame, 5, 0, "Concord: Freq Exponent (beta)",
+                         tooltip="beta in drive = (median(n)/n)^beta. 0.5 (default) equalizes the "
+                                 "noise motion while style tokens keep a sqrt-frequency advantage on "
+                                 "shared content; 1 flattens per-epoch rates (attribution parity); "
+                                 "0 is raw dynamics (hot tokens fry).")
+        components.entry(frame, 5, 1, self.ui_state, "concord_embedding_freq_exponent")
+
+        components.label(frame, 6, 0, "Concord: Window Report",
+                         tooltip="Diagnostic (default off): accumulate the incoherent power over the "
+                                 "divot and print a per-token Wiener posterior (rho = signal fraction, "
+                                 "w = relative window half-width) around each init at calibration -- "
+                                 "which tokens the data has localized vs. which are still wandering.")
+        components.switch(frame, 6, 1, self.ui_state, "concord_embedding_window_report")
+
     def __create_unet_frame(self, master, row):
         frame = ctk.CTkFrame(master=master, corner_radius=5)
         frame.grid(row=row, column=0, padx=5, pady=5, sticky="nsew")
