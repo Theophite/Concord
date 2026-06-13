@@ -188,6 +188,50 @@ class BaseStableDiffusionXLSetup(
                 and not self.stop_embedding_training_elapsed(embedding_config, model.train_progress)
             embedding.requires_grad_(train_embedding_2)
 
+    @staticmethod
+    def _concord_token_only_dropout(model, config, batch, generator):
+        """With probability p (config.concord_token_only_dropout), rewrite an
+        eligible example's caption to ONLY its trainable tokens. Gated to fire
+        only AFTER the embedding divot releases (controller.step_idx past the
+        delay) and only for examples that actually contain a trainable token
+        (else token-only = empty caption, which is not the intent). The
+        trainable id set is read per-TE from the control plane's routing
+        (kind == 2). No-op unless Concord packed embeddings are active."""
+        p = float(getattr(config, "concord_token_only_dropout", 0.0) or 0.0)
+        if p <= 0.0:
+            return batch
+        ctrl = getattr(model, "concord_controller", None)
+        planes = getattr(model, "concord_control_planes", None)
+        if ctrl is None or not getattr(ctrl, "emb_cores", None) or not planes:
+            return batch
+        if int(getattr(ctrl, "step_idx", 0)) < int(getattr(ctrl, "emb_delay_steps", 0)):
+            return batch                              # still in the divot; tokens frozen
+        t1, t2 = batch.get("tokens_1"), batch.get("tokens_2")
+        if t1 is None or t2 is None:
+            return batch
+        from modules.util.optimizer.concord.token_dropout import token_only_keep
+
+        def _train_ids(te_idx):
+            for pl in planes:
+                if pl.get("te_idx") == te_idx and pl.get("cp") is not None:
+                    return (pl["cp"].kind == 2).nonzero(as_tuple=True)[0]
+            return None
+        ti1, ti2 = _train_ids(1), _train_ids(2)
+        elig = torch.zeros(t1.shape[0], dtype=torch.bool, device=t1.device)
+        if ti1 is not None and ti1.numel():
+            elig |= torch.isin(t1, ti1.to(t1.device)).any(dim=1)
+        if ti2 is not None and ti2.numel():
+            elig |= torch.isin(t2, ti2.to(t2.device)).any(dim=1)
+        r = torch.rand(t1.shape[0], generator=generator, device=generator.device).to(t1.device)
+        drop = (r < p) & elig
+        if not bool(drop.any()):
+            return batch
+        b1, e1 = model.tokenizer_1.bos_token_id, model.tokenizer_1.eos_token_id
+        b2, e2 = model.tokenizer_2.bos_token_id, model.tokenizer_2.eos_token_id
+        batch["tokens_1"] = token_only_keep(t1, ti1, b1, e1, drop)
+        batch["tokens_2"] = token_only_keep(t2, ti2, b2, e2, drop)
+        return batch
+
     def predict(
             self,
             model: StableDiffusionXLModel,
@@ -214,6 +258,15 @@ class BaseStableDiffusionXLSetup(
             if config.concord_antithetic_same_example and config.concord_antithetic_timesteps \
                     and not deterministic:
                 batch = self._concord_duplicate_first_half(batch)
+
+            # Concord token-only caption dropout: after the embedding divot releases, with
+            # probability p replace an eligible example's caption with ONLY its trainable tokens
+            # (drop the context words) so the token must carry the concept. Mutates batch
+            # tokens_1/tokens_2 BEFORE either the eager TE (below) or the graphed TE
+            # (return_raw_inputs) reads them; shape is preserved (graph-safe). Never on
+            # validation/sampling (deterministic).
+            if not deterministic:
+                batch = self._concord_token_only_dropout(model, config, batch, generator)
 
             # Stage 3 v2 TE-graph (return_raw_inputs): the text encoder is captured INSIDE
             # the CUDA graph from the raw tokens, so skip the eager TE forward here.

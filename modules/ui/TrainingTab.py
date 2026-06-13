@@ -602,6 +602,14 @@ class TrainingTab:
                                  "which tokens the data has localized vs. which are still wandering.")
         components.switch(frame, 6, 1, self.ui_state, "concord_embedding_window_report")
 
+        components.label(frame, 7, 0, "Concord: Token-Only Dropout",
+                         tooltip="Probability (0..1) that an example's caption is replaced with ONLY "
+                                 "its trainable tokens -- all context words dropped -- so the token "
+                                 "must carry the concept itself instead of leaning on the caption. "
+                                 "Active only AFTER the divot releases, only on examples that contain "
+                                 "a trainable token, never on validation/sampling. 0 = off.")
+        components.entry(frame, 7, 1, self.ui_state, "concord_token_only_dropout")
+
     def __create_unet_frame(self, master, row):
         frame = ctk.CTkFrame(master=master, corner_radius=5)
         frame.grid(row=row, column=0, padx=5, pady=5, sticky="nsew")

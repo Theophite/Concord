@@ -502,6 +502,7 @@ class TrainConfig(BaseConfig):
     concord_embedding_auto_drive: bool  # at divot release, normalize each token's rate by sighting count: drive_i = (median(n)/n_i)^freq_exponent (decade clamp), so per-epoch motion tracks D_i = ||coherent grad sum||/n_i -- the data's own per-appearance evidence. Converged-but-frequent tokens slow down because D is small (not boosted for a small total); rare-but-far tokens get a frequency boost. Drive scaling preserves per-token lambda (evap_frac is a fraction of the buffer). Requires delay_epochs > 0 for a calibration window.
     concord_embedding_freq_exponent: float  # beta in drive = (median(n)/n)^beta. Hierarchical tokens (style tokens containing object tokens) assign shared features BY frequency: the style rightfully wins shared content because it integrates it n_style/n_obj times faster; coherence keeps object content with the object. beta=1 flattens per-epoch rates -- attribution parity, shared features split by noise (style/object clobbering); beta=0 is raw dynamics (correct attribution, but hot tokens fry). beta=0.5 equalizes the NOISE motion across tokens (D_noise ~ 1/sqrt(n), so sqrt(n)*D_noise is constant) while justified motion keeps a sqrt(frequency) advantage -- styles still win shared features, fry suppressed.
     concord_embedding_window_report: bool  # diagnostic (default off): accumulate the incoherent power Sigma||g||^2 over the divot alongside the coherent sum, and print a per-token Wiener posterior around the init at calibration -- rho (signal fraction / how pinned-down the token's true value is) and w (relative window half-width, shrinking as 1/sqrt(n) and as the UNet sharpens). Surfaces which tokens the data has localized vs. which are still wandering. Passive (never touches the update); requires delay_epochs > 0 for a measurement window.
+    concord_token_only_dropout: float  # probability (0..1) that an example's caption is replaced with ONLY its trainable tokens (all context words dropped), forcing the token to carry the concept itself rather than leaning on the caption (counters the decorative/address-shared token). Comes into effect only AFTER the embedding divot releases (tokens are training); applies only to examples that contain a trainable token; never applied to validation/sampling. 0 = off.
     concord_antithetic_timesteps: bool
     concord_antithetic_noise: bool
     concord_antithetic_same_example: bool
@@ -1107,6 +1108,7 @@ class TrainConfig(BaseConfig):
         data.append(("concord_embedding_auto_drive", True, bool, False))
         data.append(("concord_embedding_freq_exponent", 0.5, float, False))
         data.append(("concord_embedding_window_report", False, bool, False))
+        data.append(("concord_token_only_dropout", 0.0, float, False))
         data.append(("concord_antithetic_timesteps", False, bool, False))
         data.append(("concord_antithetic_noise", False, bool, False))
         data.append(("concord_antithetic_same_example", False, bool, False))

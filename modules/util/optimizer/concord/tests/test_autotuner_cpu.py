@@ -678,6 +678,29 @@ check("17i window stats: signal->rho1/w0, noise->rho0, mix->rho.5/w.5, n<2->wide
       and torch.allclose(ww, torch.tensor([0.0, 99.0, 0.5, 99.0]), atol=1e-3),
       f"rho={rho.tolist()} w={ww.tolist()}")
 
+# 17j: token-only caption dropout -- compact a dropped row to [bos, trainable
+# ids in order, eos, eos-pad]; leave un-dropped rows untouched.
+from token_dropout import token_only_keep
+BOS, EOS = 49406, 49407
+TR = torch.tensor([100, 101])                       # trainable placeholder ids
+#  row0 DROPPED: BOS, w, T100, w, T101, w, EOS, pad...  -> BOS,T100,T101,EOS,pad
+#  row1 KEPT:    unchanged
+toks = torch.tensor([[BOS, 5, 100, 7, 101, 9, EOS, EOS],
+                     [BOS, 5, 100, 7, 101, 9, EOS, EOS]])
+drop = torch.tensor([True, False])
+out = token_only_keep(toks, TR, BOS, EOS, drop)
+row0_exp = torch.tensor([BOS, 100, 101, EOS, EOS, EOS, EOS, EOS])
+check("17j token-only dropout: dropped row compacts to bos+trainable+eos, "
+      "kept row unchanged, input not mutated",
+      torch.equal(out[0], row0_exp) and torch.equal(out[1], toks[1])
+      and torch.equal(toks[0], torch.tensor([BOS, 5, 100, 7, 101, 9, EOS, EOS])),
+      f"out0={out[0].tolist()}")
+# no trainable ids in a row -> dropped row becomes just [bos, eos, pad] (empty);
+# and empty train_ids set -> whole tensor returned unchanged (no-op guard)
+check("17j2 token-only dropout: empty train_ids is a no-op",
+      torch.equal(token_only_keep(toks, torch.tensor([], dtype=torch.long),
+                                  BOS, EOS, drop), toks))
+
 # 17h: schedule-only winner_step leaves the module globals alone (the sigma
 # clobber: emb group's noise=False used to zero sigma for the whole model)
 cfg17 = SimpleNamespace(lr=1e-3, warmup=5, sigmag_peak=0.6, lr_min_frac=0.05,
