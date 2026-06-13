@@ -510,7 +510,8 @@ class GenericTrainer(BaseTrainer):
         if os.path.isfile(self.config.sample_definition_file_name):
             shutil.copy2(self.config.sample_definition_file_name, samples_path)
 
-    def __backup(self, train_progress: TrainProgress, print_msg: bool = True, print_cb: Callable[[str], None] = print):
+    def __backup(self, train_progress: TrainProgress, print_msg: bool = True, print_cb: Callable[[str], None] = print,
+                 restart_after: bool = False):
         torch_gc()
 
         self.callbacks.on_update_status("Creating backup")
@@ -582,6 +583,27 @@ class GenericTrainer(BaseTrainer):
         finally:
             if self.config.rolling_backup:
                 self.__prune_backups(self.config.rolling_backup_count)
+
+        # Restart-per-segment (concord_train_restart wrapper): the backup is
+        # written WITH the controller clock; skip the in-process recommit +
+        # graph recapture below and exit(42) instead. On a near-full card that
+        # recommit is exactly where the boundary overflows and WDDM-demotes --
+        # sticky and compounding (1.08 -> 2.60 s/it observed), because no
+        # in-process release reclaims fragmented-but-committed VRAM. The wrapper
+        # relaunches a FRESH process (clean allocator) that resumes from this
+        # backup; the clock file (exact update-step) + drive sidecar make the
+        # resume bit-faithful and the latent cache is reused (CONCORD_RESUMING),
+        # so the cost is ~1-2 min of model reload per segment. Exit BEFORE the
+        # recommit (the model is already on temp_device here) -- a coincident
+        # mid-run save is deferred to the next segment (the backup holds full
+        # state); saves are end-of-run in the standard config.
+        if restart_after:
+            import sys
+            print("[concord-restart] backup written -> exit(42) for fresh-process "
+                  "relaunch (skipping the in-process recommit)", flush=True)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            sys.exit(42)
 
         # [main patch 0003] Same recommit-ordering discipline as the sample
         # path: empty the heap before setup_train_device recommits the UNet, or
@@ -953,7 +975,15 @@ class GenericTrainer(BaseTrainer):
                     if multi.is_master() and (backup or save):
                         self.model.to(self.temp_device)
                         if backup:
-                            self.__backup(train_progress, True, step_tqdm.write)
+                            # restart-per-segment: when the wrapper set
+                            # CONCORD_RESTART_ON_BACKUP, this backup exits(42)
+                            # before its in-process recommit (samples are off in
+                            # the standard config, so the epoch backup is the
+                            # only boundary -- the sample trigger never fires).
+                            _rob = bool(getattr(self.model, "concord_graph_v2", None)
+                                        and os.environ.get("CONCORD_RESTART_ON_BACKUP"))
+                            self.__backup(train_progress, True, step_tqdm.write,
+                                          restart_after=_rob)
                         if save:
                             self.__save(train_progress, True, step_tqdm.write)
                         self.model_setup.setup_train_device(self.model, self.config)
