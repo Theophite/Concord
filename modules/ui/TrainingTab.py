@@ -610,6 +610,30 @@ class TrainingTab:
                                  "a trainable token, never on validation/sampling. 0 = off.")
         components.entry(frame, 7, 1, self.ui_state, "concord_token_only_dropout")
 
+        components.label(frame, 8, 0, "Concord: Quality-Tag Shield",
+                         tooltip="Mark some trainable embeddings as low-quality 'tags' (below). They "
+                                 "train freely and absorb the defect from the bad images they caption "
+                                 "(a droppable / negative-promptable knob), while every OTHER trainable "
+                                 "embedding's gradient is projected off the tags' learned direction so "
+                                 "it learns the subject from a bad image but not its badness. Overlap "
+                                 "is fine -- subjects just can't be pushed toward the tags. Mean-"
+                                 "centered; basis rebuilt each step as the tags learn. Default off.")
+        components.switch(frame, 8, 1, self.ui_state, "concord_embedding_quality_orthogonal")
+
+        components.label(frame, 9, 0, "Concord: Quality-Tag Embeddings",
+                         tooltip="Comma/newline-separated PLACEHOLDERS of the trainable embeddings to "
+                                 "treat as low-quality tags (the sinks). Everything trainable that is "
+                                 "NOT listed is a shielded subject. Needs at least one tag and at least "
+                                 "one non-tag subject. Empty = shield off.")
+        components.entry(frame, 9, 1, self.ui_state, "concord_embedding_quality_tags")
+
+        components.label(frame, 10, 0, "Concord: Quality Mode",
+                         tooltip="hard = subject steps fully orthogonal to the tag subspace (no motion "
+                                 "along it). one_sided = block only motion TOWARD a tag direction, "
+                                 "leaving a subject free to move away (toward good). Default hard.")
+        components.options(frame, 10, 1, ["hard", "one_sided"], self.ui_state,
+                           "concord_embedding_quality_mode")
+
     def __create_unet_frame(self, master, row):
         frame = ctk.CTkFrame(master=master, corner_radius=5)
         frame.grid(row=row, column=0, padx=5, pady=5, sticky="nsew")

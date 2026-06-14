@@ -46,6 +46,17 @@ class _PackedEmbStep(torch.autograd.Function):
         # measured 75.7/caption (the CLIP context minus content), which inflated
         # row 0's count ~140x before this mask. Zero-grad rows also correctly
         # exclude real tokens in dropped/masked captions from the normalizer.
+        # Quality-tag shield: project the SUBJECT rows' step off the subspace the
+        # quality-TAG rows span (mask zeroes the correction on tag rows -> they
+        # train free as the sink). Q is the eagerly-refreshed tag basis; mu drops
+        # out of a delta. Fixed-shape buffers, elementwise mask -> capture-safe.
+        # The calibration accumulators below then measure the ALLOWED motion. No-op
+        # unless setup wired a shield. See quality_orthogonal.py.
+        if mod._quality_Q is not None:
+            C = G @ mod._quality_Q                       # [K, n_tags]
+            if mod._quality_one_sided:
+                C = torch.clamp(C, min=0.0)
+            G = G - mod._quality_subject_mask * (C @ mod._quality_Q.T)
         mod._accum.add_(G)
         ge = grad_emb.reshape(-1, mod.dim).float()
         contrib = (ge.abs().amax(dim=1) > 0).to(torch.float32)
@@ -114,6 +125,19 @@ class ConcordPackedEmbedding(nn.Module):
         self.register_buffer("_power", torch.zeros(num_tokens, device=device))
         self._track_window = False
         self._grad_anchor = nn.Parameter(torch.zeros(1, device=device))
+        # Quality-tag shield (optional): protect SUBJECT rows from the subspace the
+        # designated quality-TAG rows span, so a subject learns content from a bad
+        # image but not its badness. _quality_Q [dim, n_tags] is rebuilt EAGERLY
+        # each step from the tags' current deploy vectors (the captured backward
+        # reads this fixed-shape buffer); _quality_subject_mask [K,1] is 1 on rows
+        # to shield (subjects), 0 on tag rows (they train free -- they are the
+        # sink). None unless setup wires it via set_quality_shield. See
+        # quality_orthogonal.py.
+        self._quality_Q = None
+        self._quality_subject_mask = None
+        self._quality_mu = None
+        self._quality_tag_idx = None
+        self._quality_one_sided = False
 
     @staticmethod
     def vocab_median_norm(vocab_weight):
@@ -131,6 +155,39 @@ class ConcordPackedEmbedding(nn.Module):
         if t.numel() != self.K:
             raise ValueError(f"set_drive: {t.numel()} multipliers for K={self.K} tokens")
         self._drive.copy_(t.reshape(-1, 1))
+
+    @torch.no_grad()
+    def set_quality_shield(self, tag_idx, subject_mask, mu, one_sided=False):
+        """Designate quality-tag rows and the subject rows to shield from them.
+
+        tag_idx [n_tags] long, subject_mask [K] (1=shield, 0=free), mu [dim] vocab
+        mean. Registers a static-shape Q buffer [dim, n_tags] (zeros until the
+        controller's first eager update) so the captured backward has stable
+        memory to read."""
+        dev = self.target.device
+        self._quality_tag_idx = tag_idx.to(dev).long()
+        self._quality_subject_mask = subject_mask.to(dev).float().reshape(self.K, 1)
+        self._quality_mu = mu.to(dev).float()
+        self._quality_one_sided = bool(one_sided)
+        self._quality_Q = torch.zeros(self.dim, int(tag_idx.numel()), device=dev)
+
+    @torch.no_grad()
+    def update_quality_basis(self):
+        """Rebuild Q from the tags' CURRENT deploy vectors (mean-centered). Eager,
+        called from the controller's before_step -> the captured backward replays
+        against the refreshed buffer. No-op unless a shield is wired.
+
+        Device-robust: deploy_weight() can land on CPU at save time (the saver
+        materializes there) while the shield buffers live on the training device,
+        so align the index/mean to deploy's device; copy_ bridges Q back into the
+        (training-device) buffer."""
+        if self._quality_tag_idx is None:
+            return
+        from quality_orthogonal import orthonormal_basis
+        deploy = self.deploy_weight()
+        dev = deploy.device
+        dirs = deploy[self._quality_tag_idx.to(dev)].float() - self._quality_mu.to(dev)
+        self._quality_Q.copy_(orthonormal_basis(dirs, ncols=self._quality_Q.shape[1]))
 
     @torch.no_grad()
     def init_tokens(self, init=None, scale=0.05, anchor=False):

@@ -680,6 +680,11 @@ class ConcordController:
         if self.te_layers:
             winner_step(self.step_idx, self.total_steps, self.te_layers,
                         peak_lr=self.te_lr, config=self.config, update_globals=False)
+        # Quality-tag shield: refresh each plane's tag basis from the tags' current
+        # deploy vectors (eager; the captured backward replays against the buffer).
+        # No-op on planes without a shield wired.
+        for tr in getattr(self, "emb_trainables", []):
+            tr.update_quality_basis()
         if self.emb_cores:
             # embeddings get their OWN schedule group: warmup + cosine at the
             # embedding lr, fluctuation off (see register_embedding_cores), and
@@ -878,6 +883,17 @@ def setup_packed_embeddings(model, config):
         (1, model.text_encoder_1, model.tokenizer_1, model.all_text_encoder_1_embeddings()),
         (2, model.text_encoder_2, model.tokenizer_2, model.all_text_encoder_2_embeddings()),
     ]
+    # Quality-tag shield (optional): mark some trainable embeddings as low-quality
+    # "tags" (by placeholder). They train FREELY as the defect sink (a droppable
+    # knob); every OTHER trainable embedding's gradient is projected off the tags'
+    # subspace so it learns subject content from a bad image but not its badness.
+    # Resolve the config once; partition rows per plane inside the loop.
+    q_tags_csv = (getattr(config, "concord_embedding_quality_tags", "") or "")
+    q_on = (bool(getattr(config, "concord_embedding_quality_orthogonal", False))
+            and bool(q_tags_csv.strip()))
+    q_one_sided = (str(getattr(config, "concord_embedding_quality_mode", "hard"))
+                   .strip().lower() == "one_sided")
+    q_tag_set = {s.strip() for s in q_tags_csv.replace("\n", ",").split(",") if s.strip()}
     planes = []
     for te_idx, te, tokenizer, embeddings in specs:
         base = te.text_model.embeddings.token_embedding
@@ -898,6 +914,23 @@ def setup_packed_embeddings(model, config):
         if tids:
             cp.attach_trainable(tids, torch.stack(inits).to(base.weight.device), lr, median,
                                 anchor=bool(getattr(config, "concord_embedding_anchor", True)))
+            if q_on:
+                is_tag = torch.tensor([(emb.placeholder in q_tag_set) for (emb, _k) in row_map],
+                                      dtype=torch.bool)
+                if bool(is_tag.any()) and bool((~is_tag).any()):
+                    tag_idx = torch.nonzero(is_tag, as_tuple=False).reshape(-1)
+                    cp.trainable.set_quality_shield(tag_idx, (~is_tag).float(),
+                                                    base.weight.float().mean(0), q_one_sided)
+                    cp.trainable.update_quality_basis()           # seed Q from the init vectors
+                    print(f"[concord] quality-tag shield: TE{te_idx} {int(is_tag.sum())} tag row(s), "
+                          f"{int((~is_tag).sum())} subject row(s) shielded "
+                          f"({'one-sided (block toward bad)' if q_one_sided else 'hard (orthogonal)'})")
+                elif bool(is_tag.all()):
+                    print(f"[concord] quality-tag shield: TE{te_idx} ALL rows are tags -> nothing to "
+                          f"shield (need a non-tag subject embedding); skipped")
+                else:
+                    print(f"[concord] quality-tag shield: TE{te_idx} no rows matched tag list "
+                          f"{sorted(q_tag_set)}; skipped")
         te.text_model.embeddings.token_embedding = cp
         planes.append({"te_idx": te_idx, "te": te, "cp": cp, "base": base, "row_map": row_map})
     model.concord_control_planes = planes
@@ -960,6 +993,32 @@ def materialize_packed_embeddings_to_vectors(model):
         if cp.trainable is None:
             continue
         deploy = cp.trainable.deploy_weight().detach()           # [K, dim]
+        # Quality-tag shield, HARD guarantee on the SAVED artifact: project the
+        # SUBJECT rows off the final tag subspace before they become the portable
+        # safetensors; tag rows save AS LEARNED (they are the quality knob). The
+        # gradient shield already kept subjects clean along the trajectory, so this
+        # is near-no-op; the printed residual is what the dynamics left (~0).
+        q_Q = getattr(cp.trainable, "_quality_Q", None)
+        if q_Q is not None and q_Q.numel() > 0:
+            # An OPTIONAL polish must never block a checkpoint: if anything here
+            # fails, warn and save the unprojected deploy (the per-step gradient
+            # shield already kept subjects clean during training).
+            try:
+                from quality_orthogonal import QualityProjector
+                dev = deploy.device                              # saver may materialize on CPU
+                proj = QualityProjector(q_Q.to(dev), cp.trainable._quality_mu.to(dev))
+                mask = cp.trainable._quality_subject_mask.to(dev).bool()   # [K,1]
+                sub = mask.reshape(-1)
+                before = proj.overlap(deploy[sub])
+                cleaned = proj.project_positions(
+                    deploy, getattr(cp.trainable, "_quality_one_sided", False))
+                deploy = torch.where(mask, cleaned, deploy)      # subjects cleaned, tags as-is
+                print(f"[concord] quality-tag shield: TE{plane['te_idx']} subject deploy cleaned for "
+                      f"save, max tag-overlap {before:.2e} -> {proj.overlap(deploy[sub]):.2e}")
+            except Exception as e:
+                print(f"[concord] quality-tag shield: save projection skipped for TE{plane['te_idx']} "
+                      f"({type(e).__name__}: {e}); saving unprojected deploy "
+                      f"(training-time gradient shield still applied)")
         with torch.no_grad():
             for row, (emb, k) in enumerate(plane["row_map"]):
                 emb.vector[k].copy_(deploy[row].to(dtype=emb.vector.dtype, device=emb.vector.device))
