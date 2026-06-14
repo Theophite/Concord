@@ -96,6 +96,49 @@ def phase1(grad_activity):
     return (d1 / d0).tolist()
 
 
+def rate_calibration(lr, lam=0.01, epochs_measured=2.0, spe=470):
+    """Production-physics motion calibration: how far does a token's DEPLOY
+    row travel per epoch at this lr, by sighting frequency and drive? Anchors
+    are KNOWN exactly (we pack them) -- no reconstruction ambiguity. Tokens
+    train toward FAR targets (0.5*norm) so the measurement stays in the
+    linear capability-rate regime; production residuals are less coherent, so
+    these are upper bounds on realized travel."""
+    global LR
+    LR = lr                       # train() re-applies the module LR at release
+    periods = (1, 20, 80)         # style / mid / rare (update steps per sighting)
+    drives = (0.2, 1.0, 2.3)      # calibration-table range: clamped style .. boosted rare
+    K = len(periods) * len(drives)
+    emb = ConcordPackedEmbedding(K, DIM, device=DEV, lr=lr, target_norm=NORM)
+    init = torch.randn(K, DIM, device=DEV) * (NORM / DIM ** 0.5)
+    emb.init_tokens(init=init, anchor=True)
+    emb.core.gf_consol = lam / lr           # production lam, per sighting
+    emb.core.lr = lr
+    emb.core.grad_activity = True
+    dr = [drives[k % len(drives)] for k in range(K)]
+    pr = [periods[k // len(drives)] for k in range(K)]
+    emb.set_drive(dr)
+    anchor = emb.deploy_weight().float().clone()
+    delta = torch.randn(K, DIM, device=DEV)
+    delta = delta / delta.norm(dim=1, keepdim=True) * (0.5 * NORM)
+    targets = anchor + delta
+    dep = train(emb, targets, pr, int(epochs_measured * spe), warmup=1500)
+    moved = (dep - anchor).norm(dim=1) / anchor.norm(dim=1).clamp_min(1e-12)
+    print(f"  lr={lr:g} lam={lam} ({epochs_measured:g} epochs @ {spe} update-steps/ep): "
+          f"motion/epoch, ||delta||/||anchor||")
+    for i, p in enumerate(periods):
+        row = ",  ".join(
+            f"d={drives[j]:g}: {float(moved[i * len(drives) + j]) / epochs_measured:.4f}"
+            for j in range(len(drives)))
+        print(f"    period {p:3d} (n~{spe // p}/ep):  {row}", flush=True)
+
+
+if "--rate" in sys.argv:
+    print("rate calibration: production physics (anchored, lam=0.01/sighting, "
+          "lazy gate, real drives, divot-warmed v-hat), far targets")
+    for _lr in (3e-5, 1e-4):
+        rate_calibration(_lr)
+    sys.exit(0)
+
 print(f"phase 1: frequency-ladder overfit (periods 1/25/100, lam={LAM}, lr={LR})")
 fixed = phase1(grad_activity=True)
 print(f"  fixed   final/initial distance: "
