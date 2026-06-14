@@ -19,6 +19,68 @@ from PIL import Image
 PAD = 10
 
 
+class LazyOptionMenu(ctk.CTkOptionMenu):
+    """A CTkOptionMenu that allocates its tkinter.Menu (the dropdown) only on the
+    FIRST open, instead of eagerly in __init__.
+
+    Tk has a hard cap on menu handles; once a ConfigList (additional embeddings /
+    concepts) grows past ~100 rows, the eager per-row dropdown exhausts the pool and
+    the next row dies with `_tkinter.TclError: No more menus can be allocated`. A
+    list of these costs ~0 menus until a row is actually interacted with. Behaviour
+    is otherwise identical to CTkOptionMenu, and it degrades to the stock eager menu
+    if this customtkinter version doesn't match (never worse than before)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # super() already built one DropdownMenu (1 Tk menu). Capture how to rebuild
+        # it (class taken from the live instance to avoid hard-coding ctk's internal
+        # import path), then free it and recreate on demand.
+        try:
+            cls = type(self._dropdown_menu)
+            rebuild = dict(
+                values=self._values,
+                command=self._dropdown_callback,
+                fg_color=self._dropdown_menu.cget("fg_color"),
+                hover_color=self._dropdown_menu.cget("hover_color"),
+                text_color=self._dropdown_menu.cget("text_color"),
+                font=self._dropdown_menu.cget("font"),
+            )
+        except Exception:
+            self._lazy_menu_cls = None            # capture failed -> keep eager menu
+            return
+        self._lazy_menu_cls = cls
+        self._lazy_menu_kwargs = rebuild
+        with contextlib.suppress(Exception):
+            self._dropdown_menu.destroy()
+        self._dropdown_menu = None
+
+    def _ensure_dropdown(self):
+        if self._dropdown_menu is None and getattr(self, "_lazy_menu_cls", None) is not None:
+            kw = dict(self._lazy_menu_kwargs)
+            kw["values"] = self._values           # stay in sync with configure(values=...)
+            self._dropdown_menu = self._lazy_menu_cls(master=self, **kw)
+
+    def _open_dropdown_menu(self):
+        self._ensure_dropdown()
+        super()._open_dropdown_menu()
+
+    def configure(self, require_redraw=False, **kwargs):
+        # Any dropdown-touching key needs the live menu; materialize it first (rare).
+        if self._dropdown_menu is None and any(
+                k in kwargs for k in ("dropdown_fg_color", "dropdown_hover_color",
+                                      "dropdown_text_color", "dropdown_font", "values")):
+            self._ensure_dropdown()
+        super().configure(require_redraw=require_redraw, **kwargs)
+
+    def cget(self, attribute_name: str):
+        if self._dropdown_menu is None:
+            mapped = {"dropdown_fg_color": "fg_color", "dropdown_hover_color": "hover_color",
+                      "dropdown_text_color": "text_color", "dropdown_font": "font"}
+            if attribute_name in mapped:
+                return self._lazy_menu_kwargs.get(mapped[attribute_name])
+        return super().cget(attribute_name)
+
+
 def app_title(master, row, column):
     frame = ctk.CTkFrame(master)
     frame.grid(row=row, column=column, padx=5, pady=5, sticky="nsew")
@@ -229,7 +291,11 @@ def time_entry(master, row, column, ui_state: UIState, var_name: str, unit_var_n
     if not supports_time_units:
         values = [str(x) for x in list(TimeUnit) if not x.is_time_unit()]
 
-    unit_component = ctk.CTkOptionMenu(
+    # LazyOptionMenu, not CTkOptionMenu: each ConfigList row (additional embeddings /
+    # concepts) carries one of these, and the eager dropdown menu exhausts Tk's menu
+    # handles past ~100 rows ("No more menus can be allocated"). Lazy = ~0 menus until
+    # a row's unit is actually clicked.
+    unit_component = LazyOptionMenu(
         frame,
         values=values,
         variable=ui_state.get_var(unit_var_name),
