@@ -63,6 +63,14 @@ def should_graph_te(config) -> bool:
     # output embeddings (_apply_output_embeddings uses a data-dependent .nonzero()).
     if not should_graph(config):
         return False
+    # Opt-out (concord_graph_te=False): route the text encoders through the EAGER bridge --
+    # only the UNet is graphed (the original, proven pattern), and _bridge() backprops the TE
+    # gradient each step. Capturing encode_text INSIDE the graph pins the encoders in the
+    # captured graph, so they can't offload for sampling (hard crash) and it complicates resume;
+    # the bridge keeps them as ordinary eager modules the sampler offloads like the UNet path.
+    # The TE fwd/bwd run eager but on the FUSED kernel, so it's far cheaper than the unfused 5x.
+    if not getattr(config, "concord_graph_te", True):
+        return False
     if not (config.train_text_encoder_or_embedding() or config.train_text_encoder_2_or_embedding()):
         return False
     if (config.text_encoder.dropout_probability or 0.0) > 0.0 \
@@ -368,9 +376,16 @@ class ManualUNetGraph:
         # before the recapture warms up. No-op while the shape is constant (single bucket).
         shape_key = tuple(prep["latent_input"].shape)
         if self.static is not None and shape_key != self._shape_key:
-            # keep_pool: bucket alternation recaptures constantly; reusing the
-            # pool (it grows once to the max-shape footprint) beats committing
-            # a fresh one per flip. No external consumer needs the VRAM here.
+            # keep_pool: bucket alternation recaptures constantly; reusing the pool (it
+            # grows once to the max-shape footprint) beats committing a fresh one per flip.
+            # NOTE (2026-06-15, measured via the overfit census): this reuse FRAGMENTS the
+            # graph pool under multi-shape recapture -- torch_reserved ratchets ~0.2G/flip
+            # while live tensors stay flat. The fragmented-but-committed reserved is NOT
+            # reclaimable in-process: a full release(keep_pool=False) at a flip both fails to
+            # reclaim it AND reintroduces the dangling-pool segfault the anchor was added to
+            # prevent. This is the WDDM/allocator limit the checkpoint-restart wrapper exists
+            # for (fresh process = clean allocator). Bound the per-segment fragmentation by
+            # restarting often enough (concord_train_restart) + maximizing bucket contiguity.
             self.release(keep_pool=True)
             self.static = None                   # force _alloc to rebuild for the new geometry
         if self.static is None:

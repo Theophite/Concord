@@ -426,6 +426,7 @@ class TrainConfig(BaseConfig):
     concept_file_name: str
     concord_sanitize_tokens: str          # comma-separated single-token words to zero (sanitize)
     concord_cuda_graph: bool              # EXPERIMENTAL opt-in: graph the UNet step (default off)
+    concord_graph_te: bool                # default-on: capture the TEXT ENCODERS inside the UNet graph (encode_text->UNet in one capture) so they train in the captured backward. Set False to route the TEs through the EAGER bridge instead -- only the UNet is graphed (the proven pattern), the TEs stay eager (on the fused kernel) so the sampler can offload them. Use False if in-graph TE capture breaks sampling/resume (the captured graph pins the encoders).
     concord_fused_matmul: bool           # default-on: dequant packed_w inside the matmul, drops the bf16 weight cache (~5 GB); works WITH gradient accumulation (accum is driven by the apply kernel's consolidate gate, orthogonal to fused vs cached)
     concord_packed_embeddings: bool       # default-on: train new-token embeddings via the norm-preserving packed self-stepping core (ConcordPackedEmbedding) instead of plain SGD -- pins the deploy norm to the vocab median (anti-overfit). Concord optimizer only.
     concord_bucket_contiguous: bool       # default-on: order aspect-ratio buckets as contiguous blocks (random block order per epoch) instead of globally shuffling batches across shapes -- avoids CUDA-graph recapture churn + allocator fragmentation when bucketing under the graph. latent_caching path only; no-op with a single bucket.
@@ -1044,6 +1045,7 @@ class TrainConfig(BaseConfig):
         data.append(("concept_file_name", "training_concepts/concepts.json", str, False))
         data.append(("concord_sanitize_tokens", "", str, False))
         data.append(("concord_cuda_graph", False, bool, False))
+        data.append(("concord_graph_te", True, bool, False))
         data.append(("concord_fused_matmul", True, bool, False))
         data.append(("concord_packed_embeddings", True, bool, False))
         data.append(("concord_bucket_contiguous", True, bool, False))

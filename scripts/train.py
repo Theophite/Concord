@@ -13,6 +13,17 @@ from modules.util.config.TrainConfig import TrainConfig
 
 
 def main():
+    # The GUI / restart wrapper deliver CTRL_BREAK (SIGBREAK) to stop us. Python catches Ctrl+C
+    # (SIGINT) by default but NOT Ctrl+Break, so without this the OS hard-terminates the process
+    # (STATUS_CONTROL_C_EXIT) and the graceful-save path below never runs. Turn SIGBREAK into a
+    # KeyboardInterrupt so trainer.end() (final save / backup_before_save) gets to run.
+    import signal as _signal
+
+    if hasattr(_signal, "SIGBREAK"):
+        def _on_break(_sig, _frame):
+            raise KeyboardInterrupt()
+        _signal.signal(_signal.SIGBREAK, _on_break)
+
     args = TrainArgs.parse_args()
     callbacks = TrainCallbacks()
     commands = TrainCommands()

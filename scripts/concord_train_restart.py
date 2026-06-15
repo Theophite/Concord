@@ -32,6 +32,14 @@ RESTART_EXIT_CODE = 42
 
 
 def main():
+    # CTRL_BREAK (GUI Stop) reaches this whole process group. Let the train.py CHILD handle it
+    # (it turns SIGBREAK into a graceful KeyboardInterrupt + final save); IGNORE it here so the
+    # wrapper isn't hard-terminated mid-wait -- subprocess.run() then blocks until the child
+    # finishes saving and we exit with the child's (clean, non-42) code.
+    import signal as _signal
+    if hasattr(_signal, "SIGBREAK"):
+        _signal.signal(_signal.SIGBREAK, _signal.SIG_IGN)
+
     here = os.path.dirname(os.path.abspath(__file__))
     train_py = os.path.join(here, "train.py")
     train_args = sys.argv[1:]
@@ -67,4 +75,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # GUI Stop / Ctrl+C delivers CTRL_BREAK to the whole process group: the train.py child
+        # already caught its own KeyboardInterrupt and saved gracefully, and subprocess.run
+        # re-raises it here. Exit cleanly -- no relaunch, no scary traceback.
+        print("[concord-restart] interrupted -> stopping (child saved on its own KeyboardInterrupt)",
+              flush=True)
+        sys.exit(0)

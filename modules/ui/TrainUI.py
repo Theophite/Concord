@@ -131,6 +131,8 @@ class TrainUI(ctk.CTk):
         self.training_thread = None
         self.training_callbacks = None
         self.training_commands = None
+        self.training_subprocess = None          # restart-wrapper subprocess (Concord+graph runs)
+        self._subprocess_stop_requested = False  # graceful stop sent; second Stop = force-kill
 
         self.start_time = None
         self.start_total_steps = None
@@ -733,29 +735,41 @@ class TrainUI(ctk.CTk):
             on_update_status=self.on_update_status,
         )
 
-        trainer = create.create_trainer(self.train_config, self.training_callbacks, self.training_commands, reattach=self.cloud_tab.reattach)
-        try:
-            trainer.start()
-            if self.train_config.cloud.enabled:
-                self.ui_state.get_var("secrets.cloud").update(self.train_config.secrets.cloud)
+        # Concord CUDA-graph runs: in-process GUI training (one process for the whole run)
+        # fragments the graph pool irreversibly -> sampling thrash / OOM crash, because WDDM
+        # cannot reclaim graph-pool reserved memory in-process. Launch through the checkpoint-
+        # restart wrapper as a subprocess instead -- a fresh process per sample/backup boundary
+        # resets the allocator. Output goes to the launching console; Start/Stop manage the
+        # subprocess. Cloud and non-graph (eager) runs keep the in-process trainer.
+        from modules.util.optimizer.concord_graph import should_graph
+        if (not self.train_config.cloud.enabled) and should_graph(self.train_config):
+            error_caught = self.__run_restart_subprocess()
+        else:
+            trainer = create.create_trainer(self.train_config, self.training_callbacks, self.training_commands, reattach=self.cloud_tab.reattach)
+            try:
+                trainer.start()
+                if self.train_config.cloud.enabled:
+                    self.ui_state.get_var("secrets.cloud").update(self.train_config.secrets.cloud)
 
-            # Reset session tracking - actual values captured on first progress callback
-            self.start_total_steps = None
-            self.start_time = time.monotonic()
-            trainer.train()
-        except Exception:
-            if self.train_config.cloud.enabled:
-                self.ui_state.get_var("secrets.cloud").update(self.train_config.secrets.cloud)
-            error_caught = True
-            traceback.print_exc()
+                # Reset session tracking - actual values captured on first progress callback
+                self.start_total_steps = None
+                self.start_time = time.monotonic()
+                trainer.train()
+            except Exception:
+                if self.train_config.cloud.enabled:
+                    self.ui_state.get_var("secrets.cloud").update(self.train_config.secrets.cloud)
+                error_caught = True
+                traceback.print_exc()
 
-        trainer.end()
+            trainer.end()
 
-        # clear gpu memory
-        del trainer
+            # clear gpu memory
+            del trainer
 
         self.training_thread = None
         self.training_commands = None
+        self.training_subprocess = None
+        self._subprocess_stop_requested = False
         torch.clear_autocast_cache()
         torch_gc()
 
@@ -770,6 +784,67 @@ class TrainUI(ctk.CTk):
 
         if self.train_config.tensorboard_always_on and not self.always_on_tensorboard_subprocess:
             self.after(0, self._start_always_on_tensorboard)
+
+    def __run_restart_subprocess(self) -> bool:
+        """Run training through scripts/concord_train_restart.py as a subprocess. Each
+        sample/backup boundary relaunches a fresh process (clean CUDA allocator) -- the only way
+        to reclaim the Concord graph-pool fragmentation that one long in-process run cannot.
+        The current GUI config is serialized to a temp file and passed through; output streams
+        to the launching console. Returns True only on an unexpected (non-stop) failure."""
+        import os
+        import sys
+        import tempfile
+
+        cfg_path = os.path.join(tempfile.gettempdir(), "onetrainer_gui_restart_config.json")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(self.train_config.to_pack_dict(secrets=False), f, indent=2)
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        wrapper = os.path.join(root, "scripts", "concord_train_restart.py")
+
+        self.start_total_steps = None
+        self.start_time = time.monotonic()
+        self.on_update_status("Training via restart wrapper -- progress in the launching console")
+        # New process group so Stop can deliver CTRL_BREAK (graceful) before force-killing.
+        spawn_kwargs = {}
+        if os.name == "nt":
+            spawn_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            spawn_kwargs["start_new_session"] = True
+        try:
+            self.training_subprocess = subprocess.Popen(
+                [sys.executable, "-X", "utf8", wrapper, "--config-path", cfg_path], **spawn_kwargs)
+            ret = self.training_subprocess.wait()
+        except Exception:
+            traceback.print_exc()
+            return True
+        # A graceful stop makes the child exit non-42 cleanly; only flag a genuine crash.
+        return ret != 0 and not self._subprocess_stop_requested
+
+    def __stop_training_subprocess(self):
+        """Stop the restart-wrapper subprocess. First Stop: graceful (CTRL_BREAK -> the child's
+        KeyboardInterrupt -> final save + clean wrapper exit). Second Stop (or if graceful
+        fails): force-kill the whole process tree."""
+        import os
+        import signal
+        p = self.training_subprocess
+        if p is None or p.poll() is not None:
+            return
+        if not self._subprocess_stop_requested:
+            self._subprocess_stop_requested = True
+            self.on_update_status("Stopping (graceful: finishing the step + saving) -- click Stop again to force")
+            try:
+                p.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
+                return
+            except Exception:
+                traceback.print_exc()
+        self.on_update_status("Force-stopping ...")
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True)
+            else:
+                p.kill()
+        except Exception:
+            traceback.print_exc()
 
     def start_training(self):
         if self.training_thread is None:
@@ -798,8 +873,11 @@ class TrainUI(ctk.CTk):
             self.training_thread.start()
         else:
             self._set_training_button_stopping()
-            self.on_update_status("Stopping ...")
-            self.training_commands.stop()
+            if self.training_subprocess is not None:
+                self.__stop_training_subprocess()
+            else:
+                self.on_update_status("Stopping ...")
+                self.training_commands.stop()
 
     def save_default(self):
         self.top_bar_component.save_default()
