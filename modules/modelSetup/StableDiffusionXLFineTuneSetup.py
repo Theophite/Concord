@@ -156,13 +156,17 @@ class StableDiffusionXLFineTuneSetup(
             # opts out. lr comes from the text_encoder LR field (controller falls back to the
             # UNet lr if it's unset).
             te_anchor = config.text_encoder.train and getattr(config, "concord_te_anchor", True)
+            te2_anchor = config.text_encoder_2.train and getattr(config, "concord_te2_anchor", False)
             te_lr = config.text_encoder.learning_rate if te_anchor else None
+            te2_lr = config.text_encoder_2.learning_rate if te2_anchor else None
             model.concord_controller = ConcordController(
                 model.unet, self.train_device, config.learning_rate, total_steps=1,
                 optimizer_config=config.optimizer,
                 module_filters=ModuleFilter.create(config),
                 text_encoder=(model.text_encoder_1 if te_anchor else None),
-                te_lr=te_lr, te_wd_anchor=getattr(config, "concord_te_wd_anchor", 0.5))
+                text_encoder_2=(model.text_encoder_2 if te2_anchor else None),
+                te_lr=te_lr, te2_lr=te2_lr,
+                te_wd_anchor=getattr(config, "concord_te_wd_anchor", 0.5))
             # RESUME: __load_internal rebuilt a STANDARD UNet, so the saved packed_w buffers were
             # dropped and the swap above just packed RANDOM weights. Re-load the backup's packed
             # UNet state into the now-swapped layers to restore the exact Concord state (packed_w

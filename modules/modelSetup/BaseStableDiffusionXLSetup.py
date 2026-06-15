@@ -145,8 +145,29 @@ class BaseStableDiffusionXLSetup(
 
         model.additional_embeddings = additional_embeddings
 
-        self._add_embeddings_to_tokenizer(model.tokenizer_1, model.all_text_encoder_1_embeddings())
-        self._add_embeddings_to_tokenizer(model.tokenizer_2, model.all_text_encoder_2_embeddings())
+        # Under Concord, a NON-trainable input embedding is deliberately not wired into
+        # the control plane, so don't register its placeholder as a tokenizer token: the
+        # placeholder then tokenizes to its raw subwords (raw CLIP) instead of becoming a
+        # dead custom id that clamps to a base row. Same tokenizer drives training AND the
+        # sampler, so this is consistent across both by construction. Stock OneTrainer
+        # still uses train=False embeddings (frozen, via the wrapper), so the skip is
+        # Concord-only; output embeddings inject at the TE output and always keep theirs.
+        from modules.util.enum.Optimizer import Optimizer
+        _concord = config.optimizer.optimizer == Optimizer.CONCORD
+
+        def _tokenizer_embeddings(encoder_embeddings):
+            kept = []
+            for emb, ec in zip(encoder_embeddings, config.all_embedding_configs(), strict=True):
+                if _concord and not getattr(ec, "train", False) \
+                        and not getattr(ec, "is_output_embedding", False):
+                    continue            # disabled under Concord -> falls back to raw CLIP
+                kept.append(emb)
+            return kept
+
+        self._add_embeddings_to_tokenizer(
+            model.tokenizer_1, _tokenizer_embeddings(model.all_text_encoder_1_embeddings()))
+        self._add_embeddings_to_tokenizer(
+            model.tokenizer_2, _tokenizer_embeddings(model.all_text_encoder_2_embeddings()))
 
     def _setup_embedding_wrapper(
             self,

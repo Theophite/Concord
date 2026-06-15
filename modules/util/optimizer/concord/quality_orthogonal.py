@@ -89,7 +89,19 @@ class QualityProjector:
         return (Gf - C @ self.Q.T).to(G.dtype)
 
     def overlap(self, X):
-        """Max |coefficient| of (X - mu) on the tag subspace; 0.0 == clean."""
+        """Max |coefficient| of (X - mu) on the tag subspace; 0.0 == clean. NOTE:
+        in one-sided mode this stays nonzero by design -- it includes the kept
+        away-from-bad (negative) component. Use toward_overlap for what the shield
+        actually removes."""
         if self.Q.numel() == 0:
             return 0.0
         return ((X.float() - self.mu) @ self.Q).abs().max().item()
+
+    def toward_overlap(self, X):
+        """Max POSITIVE coefficient of (X - mu) on the tag subspace -- the
+        toward-bad lean, i.e. exactly what the shield removes in BOTH modes. 0 ==
+        no bad component. one-sided keeps negative (away-from-bad) coefficients, so
+        this is the number that should go to ~0 even when overlap() does not."""
+        if self.Q.numel() == 0:
+            return 0.0
+        return ((X.float() - self.mu) @ self.Q).clamp(min=0.0).max().item()

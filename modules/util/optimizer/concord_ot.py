@@ -105,7 +105,8 @@ class ConcordController:
     optimizer is built); driven by the trainer via before_step()/after_step()."""
 
     def __init__(self, unet, device, learning_rate: float, total_steps: int, optimizer_config=None,
-                 module_filters=None, text_encoder=None, te_lr=None, te_wd_anchor=0.5):
+                 module_filters=None, text_encoder=None, te_lr=None, te_wd_anchor=0.5,
+                 text_encoder_2=None, te2_lr=None):
         from concord_winner import swap_unet_to_winner, GatedRebalance, swap_text_encoder_to_anchor, \
             set_lazy_gate, set_lazy_thresh, set_min_leak, set_evap_build_min
         self.config = make_concord_config(learning_rate, optimizer_config)
@@ -129,13 +130,22 @@ class ConcordController:
             step_cap=self.config.step_cap, gf_trust_delta_sq=self.config.gf_trust_delta_sq,
             verbose=False, module_filters=module_filters)
         self.gate = GatedRebalance(self.layers)
-        # Frozen-anchor TE training (CLIP-L): swapped AFTER the UNet so the shared global coh
-        # flags are already set; driven with its own lr. Empty unless a text_encoder is passed.
+        # Frozen-anchor TE training: CLIP-L (TE1) and/or CLIP-G (TE2), each anchored with its OWN
+        # lr; swapped AFTER the UNet so the shared global coh flags are already set. te_groups
+        # carries (layers, lr) per encoder for the schedule; te_layers is the combined list for the
+        # deploy-bridge filter; te_encoders the live modules that bridge iterates. Each empty unless
+        # its encoder is passed (TE2 only when the caller opts in via concord_te2_anchor).
         self.te_lr = float(te_lr) if te_lr else self.config.lr
-        self.text_encoder = text_encoder          # held for the reversible TE deploy bridge
-        self.te_layers = (swap_text_encoder_to_anchor(text_encoder, device, self.te_lr, te_wd_anchor)
-                          if text_encoder is not None else [])
-        self.te_gate = GatedRebalance(self.te_layers) if self.te_layers else None
+        self.te2_lr = float(te2_lr) if te2_lr else self.te_lr
+        _te1 = (swap_text_encoder_to_anchor(text_encoder, device, self.te_lr, te_wd_anchor)
+                if text_encoder is not None else [])
+        _te2 = (swap_text_encoder_to_anchor(text_encoder_2, device, self.te2_lr, te_wd_anchor)
+                if text_encoder_2 is not None else [])
+        self.text_encoder = text_encoder          # TE1 (back-compat ref)
+        self.te_encoders = [te for te in (text_encoder, text_encoder_2) if te is not None]
+        self.te_groups = [(lyr, lr) for lyr, lr in ((_te1, self.te_lr), (_te2, self.te2_lr)) if lyr]
+        self.te_layers = _te1 + _te2              # combined: deploy-bridge filter + "any TE?" check
+        self.te_gates = [GatedRebalance(lyr) for lyr, _lr in self.te_groups]
         # Lazy-update gate is a module-level global read at every kernel launch; swap_unet_to_winner
         # forces the coherence/noise flags but not this one, so set it explicitly from config here.
         set_lazy_gate(self.config.lazy_gate)
@@ -677,9 +687,9 @@ class ConcordController:
         # ratio floors are module-global and the last winner_step writer wins for
         # the whole model -- the emb group's noise=False used to zero sigma for
         # the UNet too. The self.layers call above is the single global writer.
-        if self.te_layers:
-            winner_step(self.step_idx, self.total_steps, self.te_layers,
-                        peak_lr=self.te_lr, config=self.config, update_globals=False)
+        for _te_lyr, _te_lr in self.te_groups:        # one schedule group per text encoder (own lr)
+            winner_step(self.step_idx, self.total_steps, _te_lyr,
+                        peak_lr=_te_lr, config=self.config, update_globals=False)
         # Quality-tag shield: refresh each plane's tag basis from the tags' current
         # deploy vectors (eager; the captured backward replays against the buffer).
         # No-op on planes without a shield wired.
@@ -709,8 +719,8 @@ class ConcordController:
     def after_step(self):
         """AFTER the optimizer update: gated rebalance (skips the no-op launches), tick."""
         self.gate()
-        if self.te_gate is not None:
-            self.te_gate()
+        for _g in self.te_gates:                       # per-encoder gated rebalance
+            _g()
         self.step_idx += 1
 
     @torch.no_grad()
@@ -799,25 +809,27 @@ class ConcordController:
         Returns a stash; pass it to restore_te_deploy() in a finally so training continues."""
         import torch.nn as nn
         from prototype_packed_b import ConcordLinearPackedB
-        if not self.te_layers or self.text_encoder is None:
+        if not self.te_layers or not self.te_encoders:
             return []
-        # ONLY the swapped TE transformer Linears (te_layers). The control-plane embedding
-        # core is also a ConcordLinearPackedB living inside the TE module tree, but it has its
-        # own save bridge (materialize_packed_embeddings_to_vectors) -> must NOT be clobbered.
+        # ONLY the swapped TE transformer Linears (te_layers), across every anchored encoder. The
+        # control-plane embedding core is also a ConcordLinearPackedB living inside the TE module
+        # tree, but it has its own save bridge (materialize_packed_embeddings_to_vectors) -> must
+        # NOT be clobbered.
         te_set = {id(m) for m in self.te_layers}
         stash = []
-        for parent in self.text_encoder.modules():
-            for name, child in list(parent.named_children()):
-                if isinstance(child, ConcordLinearPackedB) and id(child) in te_set:
-                    w = child.get_weight()
-                    lin = nn.Linear(child.in_features, child.out_features,
-                                    bias=child.bias is not None).to(
-                        device=child.packed_w.device, dtype=w.dtype)
-                    lin.weight.data.copy_(w)
-                    if child.bias is not None:
-                        lin.bias.data.copy_(child.bias.detach().to(lin.bias.dtype))
-                    setattr(parent, name, lin)
-                    stash.append((parent, name, child))
+        for te in self.te_encoders:
+            for parent in te.modules():
+                for name, child in list(parent.named_children()):
+                    if isinstance(child, ConcordLinearPackedB) and id(child) in te_set:
+                        w = child.get_weight()
+                        lin = nn.Linear(child.in_features, child.out_features,
+                                        bias=child.bias is not None).to(
+                            device=child.packed_w.device, dtype=w.dtype)
+                        lin.weight.data.copy_(w)
+                        if child.bias is not None:
+                            lin.bias.data.copy_(child.bias.detach().to(lin.bias.dtype))
+                        setattr(parent, name, lin)
+                        stash.append((parent, name, child))
         return stash
 
     @torch.no_grad()
@@ -946,9 +958,18 @@ def setup_packed_embeddings(model, config):
             freq_exponent=float(getattr(config, "concord_embedding_freq_exponent", 0.5)),
             calib_path=(str(Path(_ws) / "concord_embedding_calibration.json") if _ws else None),
             window_report=bool(getattr(config, "concord_embedding_window_report", False)))
-    # The plain-SGD wrapper path is bypassed; ensure both wrapper refs are None so
-    # after_optimizer_step's preserve_embedding_norm guard short-circuits (the model's
-    # __init__ leaves embedding_wrapper_2 unset).
+    # The plain-SGD wrapper path is bypassed; UNHOOK it before dropping the refs. The wrapper
+    # monkeypatches the ORIGINAL token_embedding's forward, which is now the control plane's
+    # .base -- so a base-route token (cp.base(flat)) would still run AdditionalEmbeddingWrapper
+    # .forward, which cats in the scattered additional-embedding .vectors. Those .vectors aren't
+    # in the TE module tree, so they don't follow text_encoder_*_to(device) -> the graph's
+    # encode_text (which runs the full TE forward, both encoders) crashes with a CPU-vs-CUDA
+    # mismatch. Unhooking restores cp.base to a plain nn.Embedding (the additional tokens are
+    # served by cp.trainable, not the wrapper). Then drop the refs so after_optimizer_step's
+    # preserve_embedding_norm guard short-circuits.
+    for _w in (getattr(model, "embedding_wrapper_1", None), getattr(model, "embedding_wrapper_2", None)):
+        if _w is not None:
+            _w.remove_hook_from_module()
     model.embedding_wrapper_1 = None
     model.embedding_wrapper_2 = None
     rows = len(planes[0]["row_map"]) if planes else 0
@@ -1009,12 +1030,20 @@ def materialize_packed_embeddings_to_vectors(model):
                 proj = QualityProjector(q_Q.to(dev), cp.trainable._quality_mu.to(dev))
                 mask = cp.trainable._quality_subject_mask.to(dev).bool()   # [K,1]
                 sub = mask.reshape(-1)
-                before = proj.overlap(deploy[sub])
-                cleaned = proj.project_positions(
-                    deploy, getattr(cp.trainable, "_quality_one_sided", False))
+                one_sided = getattr(cp.trainable, "_quality_one_sided", False)
+                nrm = deploy[sub].float().norm(dim=1).median().clamp_min(1e-12).item()
+                tb = proj.toward_overlap(deploy[sub])            # the bad lean we remove
+                cleaned = proj.project_positions(deploy, one_sided)
                 deploy = torch.where(mask, cleaned, deploy)      # subjects cleaned, tags as-is
-                print(f"[concord] quality-tag shield: TE{plane['te_idx']} subject deploy cleaned for "
-                      f"save, max tag-overlap {before:.2e} -> {proj.overlap(deploy[sub]):.2e}")
+                ta = proj.toward_overlap(deploy[sub])
+                # one-sided keeps the away-from-bad (good) component, so |overlap|
+                # stays nonzero BY DESIGN -- report it separately, not as the result.
+                extra = (f"; away-from-bad kept (|overlap| {proj.overlap(deploy[sub]):.2e})"
+                         if one_sided else "")
+                print(f"[concord] quality-tag shield: TE{plane['te_idx']} subjects cleaned for save "
+                      f"({'one-sided' if one_sided else 'hard'}): toward-bad overlap "
+                      f"{tb:.2e} -> {ta:.2e} ({100 * tb / nrm:.1f}% -> {100 * ta / nrm:.1f}% of row norm)"
+                      f"{extra}")
             except Exception as e:
                 print(f"[concord] quality-tag shield: save projection skipped for TE{plane['te_idx']} "
                       f"({type(e).__name__}: {e}); saving unprojected deploy "

@@ -19,7 +19,9 @@ class AdditionalEmbeddingsTab(ConfigList):
             from_external_file=False,
             add_button_text="add embedding",
             is_full_width=True,
-            show_toggle_button=True
+            show_toggle_button=True,
+            page_size=25,                 # render 25 rows/page: keeps the per-row Tk
+                                          # menu count bounded (no "No more menus")
         )
 
     def refresh_ui(self):
@@ -27,6 +29,7 @@ class AdditionalEmbeddingsTab(ConfigList):
             self.element_list.destroy()
             self.element_list = None
         self.widgets_initialized = False
+        self.page = 0
         self._create_element_list()
 
     def create_widget(self, master, element, i, open_command, remove_command, clone_command, save_command):

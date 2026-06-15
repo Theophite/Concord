@@ -430,6 +430,17 @@ class ManualUNetGraph:
     def _warmup_and_capture(self, model):
         # Real-gradient warmup on a side stream, then capture. Factored out so
         # the fragmentation-OOM retry in step() can re-run it after a rebuild.
+        if self.graph_te:
+            # The captured encode_text runs the FULL forward for BOTH text encoders (no cached
+            # hidden states -- backward has to reach the embeddings). A non-trained encoder (e.g.
+            # CLIP-G when only CLIP-L trains) lives on the temp/CPU device, and a pre-capture
+            # sample offloads even the trained ones, so force every TE onto the train device
+            # before warmup/capture. Otherwise the embedding lookup gets CPU weights vs CUDA
+            # token ids ("Expected all tensors to be on the same device"). No-op if already there.
+            for _to in ("text_encoder_1_to", "text_encoder_2_to"):
+                _fn = getattr(self.model, _to, None)
+                if _fn is not None:
+                    _fn(self.ms.train_device)
         if os.environ.get("CONCORD_RESAWARE_DEBUG") and self._min_snr:
             self._log_resaware()
         if os.environ.get("CONCORD_GRAPH_DEBUG"):

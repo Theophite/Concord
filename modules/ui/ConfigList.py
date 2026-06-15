@@ -31,6 +31,7 @@ class ConfigList(metaclass=ABCMeta):
             add_button_tooltip: str = "",
             is_full_width: bool = "",
             show_toggle_button: bool = False,
+            page_size: int = None,
     ):
         self.master = master
         self.train_config = train_config
@@ -53,6 +54,17 @@ class ConfigList(metaclass=ABCMeta):
         self.show_toggle_button = show_toggle_button
         self.is_opening_window = False
         self._is_current_item_enabled = False
+
+        # Pagination: page_size set -> render the list in pages of page_size rows
+        # (off-page widgets stay None, so widgets[i] still maps to current_config[i],
+        # and only ~page_size rows + their Tk menus exist at once). Default None =
+        # render every row (original behavior); only AdditionalEmbeddingsTab opts in.
+        self.page_size = page_size
+        self.page = 0
+        self.pagination_frame = None
+        self.page_label = None
+        self.prev_button = None
+        self.next_button = None
 
         self.master.grid_rowconfigure(0, weight=0)
         self.master.grid_rowconfigure(1, weight=1)
@@ -90,6 +102,9 @@ class ConfigList(metaclass=ABCMeta):
             self.toggle_button = components.button(self.top_frame, 0, 3, " ", self._toggle, tooltip="Disables/Enables all visible items in the current view", width=30, padx=5)
             self._update_toggle_button_text()
 
+        if self.page_size is not None and not self.from_external_file:
+            self._create_pagination_controls()
+
 
 
     @abstractmethod
@@ -126,7 +141,7 @@ class ConfigList(metaclass=ABCMeta):
         self._is_current_item_enabled = any(
             item.ui_state.get_var(self.enable_key).get()
             for i, item in enumerate(self.widgets)
-            if i < len(self.current_config) and self._element_matches_filters(self.current_config[i])
+            if item is not None and i < len(self.current_config) and self._element_matches_filters(self.current_config[i])
         )
 
     def _update_toggle_button_text(self):
@@ -142,9 +157,9 @@ class ConfigList(metaclass=ABCMeta):
     def _toggle_items(self):
         enable_state = not self._is_current_item_enabled
 
-        # Only toggle items that match current filters
+        # Only toggle items that match current filters (None = off-page, skip)
         for i, widget in enumerate(self.widgets):
-            if i < len(self.current_config) and self._element_matches_filters(self.current_config[i]):
+            if widget is not None and i < len(self.current_config) and self._element_matches_filters(self.current_config[i]):
                 widget.ui_state.get_var(self.enable_key).set(enable_state)
         self.save_current_config()
 
@@ -171,6 +186,8 @@ class ConfigList(metaclass=ABCMeta):
 
         self._update_widget_visibility()
         self._update_toggle_button_text()
+        if self.page_size is not None:
+            self._update_pagination_controls()
 
     def _initialize_all_widgets(self):
         self.widgets = []
@@ -183,21 +200,83 @@ class ConfigList(metaclass=ABCMeta):
         if self.is_full_width:
             self.element_list.grid_columnconfigure(0, weight=1)
 
-        for i, element in enumerate(self.current_config):
-            widget = self.create_widget(
-                self.element_list, element, i,
+        if self.page_size is not None:
+            self._build_page_widgets()
+        else:
+            for i, element in enumerate(self.current_config):
+                widget = self.create_widget(
+                    self.element_list, element, i,
+                    self.__open_element_window,
+                    self.__remove_element,
+                    self.__clone_element,
+                    self.save_current_config
+                )
+                self.widgets.append(widget)
+
+    def _page_count(self):
+        return max(1, (len(self.current_config) + self.page_size - 1) // self.page_size)
+
+    def _build_page_widgets(self):
+        """Create widgets ONLY for the current page's slice of current_config; the
+        rest of self.widgets stays None so index i still maps to current_config[i]
+        and only ~page_size rows (and their Tk menus) exist at once."""
+        total = len(self.current_config)
+        self.page = max(0, min(self.page, self._page_count() - 1))
+        start = self.page * self.page_size
+        end = min(start + self.page_size, total)
+        self.widgets = [None] * total
+        for i in range(start, end):
+            self.widgets[i] = self.create_widget(
+                self.element_list, self.current_config[i], i,
                 self.__open_element_window,
                 self.__remove_element,
                 self.__clone_element,
-                self.save_current_config
+                self.save_current_config,
             )
-            self.widgets.append(widget)
+
+    def _render_page(self):
+        """Re-render the current page in place: free the old rows (and their Tk
+        menus), rebuild the page slice, refresh visibility + the page label."""
+        for w in self.widgets:
+            if w is not None:
+                with contextlib.suppress(tk.TclError, AttributeError):
+                    w.destroy()
+        self._build_page_widgets()
+        self._update_widget_visibility()
+        self._update_pagination_controls()
+        self._update_toggle_button_text()
+
+    def _create_pagination_controls(self):
+        self.pagination_frame = ctk.CTkFrame(self.master, fg_color="transparent")
+        self.pagination_frame.grid(row=2, column=0, sticky="ew", pady=(2, 0))
+        self.prev_button = components.button(
+            self.pagination_frame, 0, 0, "< prev", lambda: self._change_page(-1), width=20, padx=5)
+        self.page_label = ctk.CTkLabel(self.pagination_frame, text="")
+        self.page_label.grid(row=0, column=1, padx=10)
+        self.next_button = components.button(
+            self.pagination_frame, 0, 2, "next >", lambda: self._change_page(1), width=20, padx=5)
+        self._update_pagination_controls()
+
+    def _change_page(self, delta: int):
+        new_page = max(0, min(self.page + delta, self._page_count() - 1))
+        if new_page != self.page:
+            self.page = new_page
+            self._render_page()
+
+    def _update_pagination_controls(self):
+        if self.page_label is None:
+            return
+        total = len(self.current_config)
+        start = self.page * self.page_size + 1 if total else 0
+        end = min((self.page + 1) * self.page_size, total)
+        self.page_label.configure(
+            text=f"page {self.page + 1} / {self._page_count()}    ({start}-{end} of {total})")
 
     def _update_widget_visibility(self):
         visible_index = 0
 
         for i, widget in enumerate(self.widgets):
-            if i < len(self.current_config):
+            if widget is not None and i < len(self.current_config):
                 element = self.current_config[i]
 
                 if self._element_matches_filters(element):
@@ -243,6 +322,12 @@ class ConfigList(metaclass=ABCMeta):
     def __add_element(self):
         new_element = self.create_new_element()
         self.current_config.append(new_element)
+        # paginated: jump to the page holding the new row and re-render it
+        if self.page_size is not None:
+            self.page = (len(self.current_config) - 1) // self.page_size
+            self._render_page()
+            self.save_current_config()
+            return
         # incremental insertion if widgets already initialized, else fall back to full rebuild
         if self.widgets_initialized and self.element_list is not None:
             i = len(self.current_config) - 1
@@ -266,6 +351,12 @@ class ConfigList(metaclass=ABCMeta):
         if modify_element_fun is not None:
             new_element = modify_element_fun(new_element)
         self.current_config.append(new_element)
+        # paginated: jump to the page holding the clone and re-render it
+        if self.page_size is not None:
+            self.page = (len(self.current_config) - 1) // self.page_size
+            self._render_page()
+            self.save_current_config()
+            return
         if self.widgets_initialized and self.element_list is not None:
             i = len(self.current_config) - 1
             widget = self.create_widget(
@@ -284,6 +375,11 @@ class ConfigList(metaclass=ABCMeta):
 
     def __remove_element(self, remove_i):
         self.current_config.pop(remove_i)
+        # paginated: re-render the current page (indices shift; page is re-clamped)
+        if self.page_size is not None:
+            self._render_page()
+            self.save_current_config()
+            return
         if self.widgets_initialized and 0 <= remove_i < len(self.widgets):
             removed = self.widgets.pop(remove_i)
             with contextlib.suppress(tk.TclError, AttributeError):
@@ -376,7 +472,7 @@ class ConfigList(metaclass=ABCMeta):
             window = self.open_element_window(i, ui_state)
             self.master.wait_window(window)
             try:
-                if self.widgets is not None and 0 <= i < len(self.widgets):
+                if self.widgets is not None and 0 <= i < len(self.widgets) and self.widgets[i] is not None:
                     self.widgets[i].configure_element()
             except Exception:
                 self.widgets_initialized = False

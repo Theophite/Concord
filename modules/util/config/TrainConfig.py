@@ -426,10 +426,11 @@ class TrainConfig(BaseConfig):
     concept_file_name: str
     concord_sanitize_tokens: str          # comma-separated single-token words to zero (sanitize)
     concord_cuda_graph: bool              # EXPERIMENTAL opt-in: graph the UNet step (default off)
-    concord_fused_matmul: bool           # default-on: dequant packed_w inside the matmul, drops the bf16 weight cache (~5 GB); auto-disabled when accum>1
+    concord_fused_matmul: bool           # default-on: dequant packed_w inside the matmul, drops the bf16 weight cache (~5 GB); works WITH gradient accumulation (accum is driven by the apply kernel's consolidate gate, orthogonal to fused vs cached)
     concord_packed_embeddings: bool       # default-on: train new-token embeddings via the norm-preserving packed self-stepping core (ConcordPackedEmbedding) instead of plain SGD -- pins the deploy norm to the vocab median (anti-overfit). Concord optimizer only.
     concord_bucket_contiguous: bool       # default-on: order aspect-ratio buckets as contiguous blocks (random block order per epoch) instead of globally shuffling batches across shapes -- avoids CUDA-graph recapture churn + allocator fragmentation when bucketing under the graph. latent_caching path only; no-op with a single bucket.
     concord_te_anchor: bool               # default-on under Concord + text_encoder.train (the "train text encoder 1" flag): train CLIP-L via the frozen-v_slow Concord anchor -- pretrained pinned in v_slow, a 16-bit fast/slow delta self-steps in the captured backward, wd_anchor pulls it back toward pretrained. Uses the text_encoder LR field. Set False to opt out.
+    concord_te2_anchor: bool              # SAME as concord_te_anchor but for CLIP-G (text_encoder_2). OFF by default (opt-in: newer than the TE1 path). On + text_encoder_2.train -> TE2 also trains via the Concord frozen-v_slow anchor + packed int-storage (CLIP-G is 694M, so the weight-cache/memory saving is large), with its OWN lr (text_encoder_2 LR field). Off -> TE2 trains via the standard optimizer (still graph-captured, so still fast -- this only adds the anchor discipline + packing, not speed).
     concord_te_wd_anchor: float           # strength of the elastic pull of the TE delta toward the pretrained anchor (kernel wd_anchor). ~0.5 = gentle (validated); 0 = no anchor (plain packed drift).
     concepts: list[ConceptConfig]
     aspect_ratio_bucketing: bool
@@ -1047,6 +1048,7 @@ class TrainConfig(BaseConfig):
         data.append(("concord_packed_embeddings", True, bool, False))
         data.append(("concord_bucket_contiguous", True, bool, False))
         data.append(("concord_te_anchor", True, bool, False))
+        data.append(("concord_te2_anchor", False, bool, False))
         data.append(("concord_te_wd_anchor", 0.5, float, False))
         data.append(("concepts", None, list[ConceptConfig], True))
         data.append(("aspect_ratio_bucketing", True, bool, False))
