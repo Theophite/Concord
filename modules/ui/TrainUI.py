@@ -915,13 +915,20 @@ class TrainUI(ctk.CTk):
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(command)
-            self.on_update_status(f"Requested '{command} now' -> the subprocess will run it, then recycle")
+            label = command.splitlines()[0] if command else command
+            self.on_update_status(f"Requested '{label} now' -> the subprocess will run it, then recycle")
         except OSError:
             traceback.print_exc()
 
     def sample_now(self):
         if self.training_subprocess is not None:
-            self.__write_gui_command("sample")
+            # Pipe the currently-selected sample-definition file through so the subprocess samples
+            # whatever the sampling-tab selector points at NOW -- not the list baked into the config
+            # at launch. Absolute path so it resolves regardless of the child's working directory.
+            sel = getattr(self.train_config, "sample_definition_file_name", "") or ""
+            if sel:
+                sel = os.path.abspath(sel)
+            self.__write_gui_command("sample" + ("\n" + sel if sel else ""))
             return
         train_commands = self.training_commands
         if train_commands:
