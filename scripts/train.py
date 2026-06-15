@@ -28,6 +28,34 @@ def main():
     callbacks = TrainCallbacks()
     commands = TrainCommands()
 
+    # GUI command bridge: TrainUI's restart-wrapper path runs us in a separate process, so the GUI
+    # can't reach this in-process TrainCommands. It writes a one-word request to CONCORD_GUI_CMD_FILE
+    # instead; this watcher maps it to the matching command so "Sample now" / "Backup now" work (a
+    # sample fires the WHOLE queue, then the wrapper recycles the process exactly as for timed ones).
+    import os as _os
+    _gui_cmd_file = _os.environ.get("CONCORD_GUI_CMD_FILE")
+    if _gui_cmd_file:
+        import threading as _threading
+        import time as _time
+
+        def _watch_gui_commands():
+            while True:
+                _time.sleep(1.0)
+                try:
+                    if not _os.path.exists(_gui_cmd_file):
+                        continue
+                    with open(_gui_cmd_file, "r", encoding="utf-8") as _f:
+                        _req = _f.read().strip()
+                    _os.remove(_gui_cmd_file)
+                    if _req == "sample":
+                        commands.sample_default()
+                    elif _req == "backup":
+                        commands.backup()
+                except Exception:
+                    pass
+
+        _threading.Thread(target=_watch_gui_commands, daemon=True).start()
+
     train_config = TrainConfig.default_values()
     with open(args.config_path, "r") as f:
         train_config.from_dict(json.load(f))

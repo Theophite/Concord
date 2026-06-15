@@ -133,6 +133,7 @@ class TrainUI(ctk.CTk):
         self.training_commands = None
         self.training_subprocess = None          # restart-wrapper subprocess (Concord+graph runs)
         self._subprocess_stop_requested = False  # graceful stop sent; second Stop = force-kill
+        self._gui_cmd_file = None                # command bridge to that subprocess (Sample/Backup now)
 
         self.start_time = None
         self.start_total_steps = None
@@ -801,6 +802,16 @@ class TrainUI(ctk.CTk):
         root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         wrapper = os.path.join(root, "scripts", "concord_train_restart.py")
 
+        # Command bridge: the GUI's Sample-now / Backup-now buttons write a one-word request to this
+        # file; the subprocess polls it (CONCORD_GUI_CMD_FILE) and runs the matching command. Clear
+        # any stale request from a previous run first.
+        self._gui_cmd_file = os.path.join(tempfile.gettempdir(), "onetrainer_gui_cmd")
+        try:
+            if os.path.exists(self._gui_cmd_file):
+                os.remove(self._gui_cmd_file)
+        except OSError:
+            pass
+
         self.start_total_steps = None
         self.start_time = time.monotonic()
         self.on_update_status("Training via restart wrapper -- progress in the launching console")
@@ -812,7 +823,8 @@ class TrainUI(ctk.CTk):
             spawn_kwargs["start_new_session"] = True
         try:
             self.training_subprocess = subprocess.Popen(
-                [sys.executable, "-X", "utf8", wrapper, "--config-path", cfg_path], **spawn_kwargs)
+                [sys.executable, "-X", "utf8", wrapper, "--config-path", cfg_path],
+                env=dict(os.environ, CONCORD_GUI_CMD_FILE=self._gui_cmd_file), **spawn_kwargs)
             ret = self.training_subprocess.wait()
         except Exception:
             traceback.print_exc()
@@ -895,17 +907,38 @@ class TrainUI(ctk.CTk):
             with open(file_path, "w") as f:
                 json.dump(self.train_config.to_pack_dict(secrets=False), f, indent=4)
 
+    def __write_gui_command(self, command: str):
+        """Bridge a button press to the restart-wrapper subprocess (which polls _gui_cmd_file)."""
+        path = getattr(self, "_gui_cmd_file", None)
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(command)
+            self.on_update_status(f"Requested '{command} now' -> the subprocess will run it, then recycle")
+        except OSError:
+            traceback.print_exc()
+
     def sample_now(self):
+        if self.training_subprocess is not None:
+            self.__write_gui_command("sample")
+            return
         train_commands = self.training_commands
         if train_commands:
             train_commands.sample_default()
 
     def backup_now(self):
+        if self.training_subprocess is not None:
+            self.__write_gui_command("backup")
+            return
         train_commands = self.training_commands
         if train_commands:
             train_commands.backup()
 
     def save_now(self):
+        if self.training_subprocess is not None:
+            self.on_update_status("Save-now is unavailable during a graph run (mid-training save is destructive) -- use Backup now")
+            return
         train_commands = self.training_commands
         if train_commands:
             train_commands.save()
