@@ -529,7 +529,6 @@ class TrainConfig(BaseConfig):
     concord_servo_waste_ceiling: float    # servo climb-freeze: a layer stops adding dissipation (kappa climb) once its per-layer waste = killed/(killed+carried) exceeds this. Puts the waste metric directly in the earn-gate (the servo otherwise never reads waste, so kappa ratchets up unopposed). Default 0.12; set >= 1.0 to disable. Concord optimizer only.
     concord_evap_slack: float             # EVAP CF-aware clamp: the kill gates on min(coh, coh_raw + slack) instead of coh_raw, so it stops shredding cf-coherent mass (deflates boil_cf) while the FIXED +slack cap keeps a cf-independent noise floor (spurious-cf noise still dies, genuine coherence still locks). Default 0.25; 0 = legacy coh_raw kill. Concord optimizer only.
     concord_m6a_meter: bool               # LOG-ONLY dissipation-space DIVERSITY meter (M6a = killed coherent mass in the hypothesis-infancy band [|s_fast|<evap_build_min] / consolidated s_slow energy). Rises when a climbing kappa evaporates coherent cross-example evidence before it consolidates (CPU-MNIST validated; memgap/waste are blind to this). DIAGNOSTIC only -- does NOT gate the servo. Default OFF (logs m6a on the [loss] line + TB when on). Concord optimizer only.
-    concord_servo_protected_boil_ceiling: float  # cf-scale servo SETPOINT/ceiling used when concord_servo_protected_boil is True (boil_cf lives on a ~0.4-0.6 scale, not the raw 0.05). The servo CLIMBS kappa (adds dissipation) while boil_cf is below it, and DESCENDS once boil_cf reaches it (boil-descend). It is the dissipation-aggressiveness dial: raise -> more climb/dissipation, lower -> less. Default 0.60 (above the images-good ~0.55, below the old lam-0.1 boil_cf ~0.63). autotune_boil_ceiling stays the raw-scale ceiling for protected_boil=False. Concord optimizer only.
     concord_embedding_anchor: bool
     concord_train_caption_vocab: bool   # opt-in (Concord only): train the base-vocab tokens that ACTUALLY appear in dataset captions via the packed per-token Concord path + the 'emb' dissipation servo, seeded from base.weight; default off = base vocab frozen. Distinct from added-token training (train_any_embedding()).
     concord_caption_vocab_anchor: bool  # anchor caption-vocab rows in v_slow (deploy=init+gated delta). Default False: anchor=True zeroes alpha_v_fast/drift_cancel_C so the emb servo's coherence climb never engages -- caption tokens seeded from a live base row want the leak ON.
@@ -1150,7 +1149,6 @@ class TrainConfig(BaseConfig):
         data.append(("concord_servo_waste_ceiling", 0.12, float, False))
         data.append(("concord_evap_slack", 0.25, float, False))
         data.append(("concord_m6a_meter", False, bool, False))
-        data.append(("concord_servo_protected_boil_ceiling", 0.60, float, False))
         data.append(("concord_embedding_anchor", True, bool, False))
         data.append(("concord_train_caption_vocab", False, bool, False))
         data.append(("concord_caption_vocab_anchor", False, bool, False))

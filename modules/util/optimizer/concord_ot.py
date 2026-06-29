@@ -318,9 +318,9 @@ class ConcordController:
                 _s = EpochDissipationServo(
                     _lyr, lr=_lr, seed_kappa=_seed, epoch_steps=epoch_steps,
                     climb_rate=float(getattr(self.config, "autotune_climb_rate", 0.5)),
-                    boil_ceiling=(float(getattr(self.config, "concord_servo_protected_boil_ceiling", 0.50))
-                                  if bool(getattr(self.config, "concord_servo_protected_boil", True))
-                                  else float(getattr(self.config, "autotune_boil_ceiling", 0.05))),
+                    # boil_ceiling: the protected servo IGNORES it (cf-ceiling removed 2026-06-29, PB:3870);
+                    # only the non-protected legacy path reads it -> always the raw-scale autotune_boil_ceiling.
+                    boil_ceiling=float(getattr(self.config, "autotune_boil_ceiling", 0.05)),
                     beta1_on=self.config.autotune_beta1_on,
                     beta1_coh_floor=self.config.autotune_beta1_coh,
                     protected_boil=bool(getattr(self.config, "concord_servo_protected_boil", True)),

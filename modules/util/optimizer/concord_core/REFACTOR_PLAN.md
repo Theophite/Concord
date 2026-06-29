@@ -381,7 +381,13 @@ data-tuples 1147-1153) and are READ at runtime via `getattr(self.config, …)` i
 do NOT delete. CONCORD_DEFAULTS path is `modules/util/optimizer_util.py:430-482` (NOT `optimizer/...`).
 
 ### PURGE (decision: consolidate + purge the PROVABLY-DEAD, 2026-06-29) — provably-dead set is SMALL
-- **`concord_servo_protected_boil_ceiling` — PURGE (PROVEN DEAD).** TrainConfig default **0.60**
+- **`concord_servo_protected_boil_ceiling` — ✅ PURGED (2026-06-29, in C:\fisher\concord-reorg-work).**
+  Removed the TrainConfig decl + data-tuple and the stale "dissipation-aggressiveness dial" comment;
+  collapsed concord_ot._mk_servo to `boil_ceiling=float(getattr(self.config,"autotune_boil_ceiling",0.05))`.
+  Gated: py_compile OK; no dangling refs; CPU goldens (G5/G3a/G3b) PASS; `TrainConfig.default_values()`
+  drops the attr AND `from_dict` of an OLD config still carrying the key does NOT crash (saved-config compat
+  verified). Behavior bit-identical (the protected servo ignored the value; servo off by default). Evidence below:
+- **`concord_servo_protected_boil_ceiling` — (was) PROVEN DEAD.** TrainConfig default **0.60**
   (TrainConfig.py:1153), but the concord_ot getattr fallback says **0.50** (concord_ot.py:321) — a live
   3-way disagreement (plan also said 0.50). It is read ONLY at concord_ot:321 to set the servo's
   `boil_ceiling` when `protected_boil=True`; but the 2026-06-29 servo edit made the protected path
