@@ -366,7 +366,7 @@ Therefore:
 ```
 WINNER dict literal (concord_winner.py:47-59)             -> recipe projection of ConcordConfig() (values identical)
 CONCORD_DEFAULTS literal (optimizer_util.py:430-482)      -> panel projection, kept AST-evaluable literal (values identical)
-ConcordConfig.dissipation None (concord_winner)           -> 0.025 (O7; aligns test-only picker w/ live controller; VERIFY no test asserts None)
+ConcordConfig.dissipation None (concord_winner)           -> KEEP None (O7 RESOLVED 2026-06-29: test_autotuner_cpu.py:128 ASSERTS `cfg_default.dissipation is None`; the None-vs-0.025 split is INTENTIONAL -- None = fall back to engine gf_consol for the test-only picker, 0.025 = live panel default; controller branches on `dissipation is not None` @concord_ot:145. Flipping breaks the test AND changes picker behavior -> NOT behavior-preserving. Deferred.)
 TrainConfig.concord_evap_slack  (LIVE field @TrainConfig:530/1151, read concord_ot:243) -> ConcordConfig.evap_slack via pick(); 0.25 unchanged
 TrainConfig.concord_train_cond_embed (LIVE @526/1147, read :158)  -> ConcordConfig.train_cond_embed; False unchanged
 TrainConfig.concord_conv_full_vhat (LIVE @527/1148, read :159)    -> ConcordConfig.conv_full_vhat; False unchanged
