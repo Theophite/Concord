@@ -4,6 +4,22 @@ def script_imports(allow_zluda: bool = True):
     import sys
     from pathlib import Path
 
+    # Anti-fragmentation CUDA allocator config for Windows. The Linux launcher exports
+    # PYTORCH_CUDA_ALLOC_CONF (lib.include.sh, gated on OT_CUDA_LOWMEM_MODE), but that bash include
+    # never runs on Windows -> Windows used the DEFAULT allocator -> WDDM memory fragmentation and
+    # silent demotion to shared memory (the slow-sampling / shared-spill wedge on tight 24 GB cards:
+    # plenty of total free, but no contiguous block for the sampler's large allocations). Apply the
+    # same config here, BEFORE torch is imported (the ZLUDA load below can pull it in). setdefault so
+    # an explicit env value (or a future Windows launcher export) still wins; Linux is untouched.
+    if sys.platform.startswith('win'):
+        # PyTorch >=2.x renamed the var PYTORCH_CUDA_ALLOC_CONF -> PYTORCH_ALLOC_CONF (the old name
+        # still works but warns). Set the NEW name (no warning on current PyTorch); also set the old
+        # for pre-rename builds. setdefault so an explicit env value wins.
+        _alloc_cfg = "garbage_collection_threshold:0.6,max_split_size_mb:128"
+        os.environ.setdefault("PYTORCH_ALLOC_CONF", _alloc_cfg)
+        if "PYTORCH_ALLOC_CONF" not in os.environ:
+            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", _alloc_cfg)
+
     # Filter out the Triton warning on startup.
     # xformers is not installed anymore, but might still exist for some installations.
     logging \

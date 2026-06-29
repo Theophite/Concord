@@ -1,0 +1,18 @@
+{
+  "git_sha": "6ecdafd6131a4609db39adab43f46c20b250a999-dirty",
+  "toolchain": {
+    "torch": "2.9.1+cu128",
+    "cuda": "12.8",
+    "python": "3.11.9",
+    "triton": "3.5.1"
+  },
+  "lane": "cpu-only",
+  "goldens": {
+    "g5_config.json": "G5 config-dict identity + doc-contract constants",
+    "g3a_servo_cpu.pt": "G3a EpochDissipationServo trajectory (protected on/off; cf-ceiling-removal catcher)",
+    "g3b_autotuner_cpu.pt": "G3b DissipationAutoTuner probe/commit/re-probe trace"
+  },
+  "notes": [
+    "CPU-only lane: safe to capture while a live run owns the GPU (CUDA_VISIBLE_DEVICES=\"\"). GPU goldens come from the full main()."
+  ]
+}

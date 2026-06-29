@@ -88,6 +88,15 @@ def make_concord_config(learning_rate: float, optimizer_config=None):
         gf_trust_delta_sq=float(pick("gf_trust_delta_sq", d.gf_trust_delta_sq)),
         min_leak=float(pick("min_leak", d.min_leak)),
         evap_build_min=float(pick("evap_build_min", d.evap_build_min)),
+        lamb_trust=bool(pick("lamb_trust", d.lamb_trust)),
+        lamb_cap=float(pick("lamb_cap", d.lamb_cap)),
+        lamb_clip=float(pick("lamb_clip", d.lamb_clip)),
+        beta2=float(pick("beta2", d.beta2) or d.beta2),
+        beta2_epoch_window=bool(pick("beta2_epoch_window", d.beta2_epoch_window)),
+        vhat_warmstart=bool(pick("vhat_warmstart", d.vhat_warmstart)),
+        bias_correct_v=bool(pick("bias_correct_v", d.bias_correct_v)),
+        coh_vhat=bool(pick("coh_vhat", d.coh_vhat)),
+        coh_kappa=float(pick("coh_kappa", d.coh_kappa)),
         dissipation_fill_ramp=bool(pick("dissipation_fill_ramp", d.dissipation_fill_ramp)),
         telescope_epoch_window=bool(pick("telescope_epoch_window", d.telescope_epoch_window)),
         autotune_table=pick("autotune_table", d.autotune_table),
@@ -95,6 +104,10 @@ def make_concord_config(learning_rate: float, optimizer_config=None):
         autotune_beta1_coh=float(pick("autotune_beta1_coh", d.autotune_beta1_coh)),
         autotune_reprobe_band=pick("autotune_reprobe_band", d.autotune_reprobe_band),
         autotune_gamma_snr=pick("autotune_gamma_snr", d.autotune_gamma_snr),
+        autotune_gamma_snr_on=bool(pick("autotune_gamma_snr_on", d.autotune_gamma_snr_on)),
+        autotune_servo=bool(pick("autotune_servo", d.autotune_servo)),
+        autotune_climb_rate=float(pick("autotune_climb_rate", d.autotune_climb_rate)),
+        autotune_boil_ceiling=float(pick("autotune_boil_ceiling", d.autotune_boil_ceiling)),
         dissipation=pick("dissipation", d.dissipation),
     )
 
@@ -106,10 +119,23 @@ class ConcordController:
 
     def __init__(self, unet, device, learning_rate: float, total_steps: int, optimizer_config=None,
                  module_filters=None, text_encoder=None, te_lr=None, te_wd_anchor=0.5,
-                 text_encoder_2=None, te2_lr=None):
+                 text_encoder_2=None, te2_lr=None, te_chase_alpha=None,
+                 te_use_anchor=True, te2_use_anchor=True):
         from concord_winner import swap_unet_to_winner, GatedRebalance, swap_text_encoder_to_anchor, \
-            set_lazy_gate, set_lazy_thresh, set_min_leak, set_evap_build_min
+            swap_text_encoder_to_winner, \
+            set_lazy_gate, set_lazy_thresh, set_min_leak, set_evap_build_min, set_lamb_trust, \
+            set_coh_vhat, set_coh_kappa, set_evap_slack
         self.config = make_concord_config(learning_rate, optimizer_config)
+        # D3 guard: step_cap and gf_trust_delta_sq are the two step bounds (hard clamp vs the
+        # rank-1-Adam denominator). With BOTH <= 0 the denom collapses to eps and step_cap=0
+        # zeroes every step -> the UNet never learns. Unexposed knobs that serialize to 0.0 are
+        # honored verbatim by pick(), so this pair can arise silently. Restore the v_hat denom
+        # rather than train with a dead step; paired with the kernel's step_cap<=0 "no clamp"
+        # guard, step_cap-off then runs as bounded rank-1 Adam.
+        if float(self.config.step_cap) <= 0.0 and float(self.config.gf_trust_delta_sq) <= 0.0:
+            self.config.gf_trust_delta_sq = 1.0
+            print("[concord] guard: step_cap and gf_trust_delta_sq both <=0 (would zero the "
+                  "step) -> restored gf_trust_delta_sq=1.0 (v_hat IS the denom)", flush=True)
         # Dimensionless dissipation: the physical friction knob is lam = lr*kappa
         # (u <- u - lr*kappa*(1-coh)*u). When `dissipation` is set it overrides
         # gf_consol with lam/lr, so the same lam means the same per-step friction
@@ -128,7 +154,9 @@ class ConcordController:
         self.layers = swap_unet_to_winner(
             unet, device, self.config.lr, gf_consol=self.config.gf_consol,
             step_cap=self.config.step_cap, gf_trust_delta_sq=self.config.gf_trust_delta_sq,
-            verbose=False, module_filters=module_filters)
+            verbose=False, module_filters=module_filters,
+            train_cond_embed=bool(getattr(self.config, "concord_train_cond_embed", False)),
+            conv_full_vhat=bool(getattr(self.config, "concord_conv_full_vhat", False)))
         self.gate = GatedRebalance(self.layers)
         # Frozen-anchor TE training: CLIP-L (TE1) and/or CLIP-G (TE2), each anchored with its OWN
         # lr; swapped AFTER the UNet so the shared global coh flags are already set. te_groups
@@ -137,15 +165,65 @@ class ConcordController:
         # its encoder is passed (TE2 only when the caller opts in via concord_te2_anchor).
         self.te_lr = float(te_lr) if te_lr else self.config.lr
         self.te2_lr = float(te2_lr) if te2_lr else self.te_lr
-        _te1 = (swap_text_encoder_to_anchor(text_encoder, device, self.te_lr, te_wd_anchor)
-                if text_encoder is not None else [])
-        _te2 = (swap_text_encoder_to_anchor(text_encoder_2, device, self.te2_lr, te_wd_anchor)
-                if text_encoder_2 is not None else [])
+        # ANCHOR-PATH config below (only consulted when te_use_anchor=True, i.e. concord_te_anchor /
+        # concord_te2_anchor = True). The TOP-LEVEL TE default is now the WINNER recipe (train like
+        # the UNet -- see _swap_te / swap_text_encoder_to_winner); the anchor is opt-in. WITHIN the
+        # anchor path it defaults to FROZEN (creep binned 2026-06-18): v_slow pinned at pretrained W
+        # (alpha_v_fast=0), gate inert (C*=0), wd_anchor decays the delta (s_slow,s_fast) toward 0 --
+        # which, because v_slow is pinned at W, is a SYMMETRIC restore of the live weight toward
+        # pretrained. The validated low-drift mode; every toggle in it is self-consistent.
+        # The CREEP variant (a tiny alpha_v_fast lets v_slow creep so the gate goes live) is retained
+        # OPT-IN ONLY: set CONCORD_TE_CREEP_ALPHA>0. NOT recommended — its "anchor" creeps off
+        # pretrained (no fixed reference) and wd_anchor there decays toward ZERO, not pretrained (the
+        # mis-semantic the anchor audit flagged). CONCORD_TE_CREEP_GF is unchanged (creep-only).
+        import os as _os
+        _cav = _os.environ.get("CONCORD_TE_CREEP_ALPHA")
+        if _cav is None or not _cav.strip():
+            _creep_av = None                        # default: FROZEN anchor (creep binned)
+        else:
+            try:
+                _v = float(_cav)
+            except ValueError:
+                _v = -1.0                           # "off"/"frozen"/garbage -> opt out
+            _creep_av = _v if _v > 0.0 else None    # <=0 -> frozen anchor; >0 -> opt-in creep
+        _creep_gf = float(_os.environ.get("CONCORD_TE_CREEP_GF", "0") or 0.0)
+        # TE swap mode, PER ENCODER: WINNER recipe (default = train like the UNet) or the frozen
+        # ANCHOR (opt-in via te_use_anchor/te2_use_anchor, bound by the setup to concord_te_anchor/
+        # concord_te2_anchor). Winner shares the UNet's gf_consol/step_cap/gf_trust so the TE runs
+        # the same dissipation/step bounds; the anchor path keeps the creep/wd_anchor knobs.
+        def _swap_te(_te, _lr, _use_anchor):
+            if _te is None:
+                return []
+            if _use_anchor:
+                return swap_text_encoder_to_anchor(_te, device, _lr, te_wd_anchor,
+                                                   alpha=te_chase_alpha,
+                                                   creep_alpha_v=_creep_av, creep_gf_consol=_creep_gf)
+            return swap_text_encoder_to_winner(_te, device, _lr,
+                                               gf_consol=self.config.gf_consol,
+                                               step_cap=self.config.step_cap,
+                                               gf_trust_delta_sq=self.config.gf_trust_delta_sq,
+                                               verbose=True)   # loud per-encoder mode log at startup
+        _te1 = _swap_te(text_encoder, self.te_lr, te_use_anchor)
+        _te2 = _swap_te(text_encoder_2, self.te2_lr, te2_use_anchor)
         self.text_encoder = text_encoder          # TE1 (back-compat ref)
         self.te_encoders = [te for te in (text_encoder, text_encoder_2) if te is not None]
         self.te_groups = [(lyr, lr) for lyr, lr in ((_te1, self.te_lr), (_te2, self.te2_lr)) if lyr]
         self.te_layers = _te1 + _te2              # combined: deploy-bridge filter + "any TE?" check
         self.te_gates = [GatedRebalance(lyr) for lyr, _lr in self.te_groups]
+        # Winner-recipe TEs have drift_cancel_C>0 and wd_anchor=0, so the kernel's write_boil gate is
+        # TRUE -- they would atomic-add into the SHARED per-device _boil_buf/_memgap_buf that
+        # read_flow_audit reports as the UNET audit (the [loss]-line boil/waste). Route their meters
+        # to a TE-only scratch sink so the UNet audit stays UNet-only. Registered BEFORE graph capture
+        # (graph-safe baked pointer), reusing the per-layer routing the servo uses. Frozen anchors
+        # (drift_cancel_C=0) never write boil, so this touches winner TEs only.
+        _winner_te = [m for m in self.te_layers if getattr(m, "alpha_v_fast", 0.0) > 0.0]
+        if _winner_te:
+            from prototype_packed_b import register_layer_meters
+            _dev = _winner_te[0].packed_w.device
+            self._te_boil_scratch = torch.zeros(6, dtype=torch.float32, device=_dev)   # [0..3] boil/waste; [4],[5] = M6a diversity meter
+            self._te_memgap_scratch = torch.zeros(1, dtype=torch.float32, device=_dev)
+            for _m in _winner_te:
+                register_layer_meters(_m.packed_w, self._te_boil_scratch, self._te_memgap_scratch)
         # Lazy-update gate is a module-level global read at every kernel launch; swap_unet_to_winner
         # forces the coherence/noise flags but not this one, so set it explicitly from config here.
         set_lazy_gate(self.config.lazy_gate)
@@ -155,13 +233,38 @@ class ConcordController:
         set_min_leak(self.config.min_leak)
         # Hypothesis-infancy guard: no dissipation below one deploy tick.
         set_evap_build_min(self.config.evap_build_min)
+        # Per-layer LAMB relative-step trust cap: brakes the small-norm (texture-conv) overcook.
+        # Module global like min_leak; CUDA-graph safe (static per-layer buffer, device-only recompute).
+        set_lamb_trust(self.config.lamb_trust, self.config.lamb_cap, self.config.lamb_clip)
+        # cf-modulated coherence: discount the Wiener residual by the coherent fraction cf=d_sv^2/v_hat
+        # so common-concept diversity isn't dissipated as noise (low-cf noise still killed; knee=coh_kappa).
+        set_coh_vhat(self.config.coh_vhat)
+        set_coh_kappa(self.config.coh_kappa)
+        set_evap_slack(float(getattr(self.config, "concord_evap_slack", 0.25)))   # EVAP clamp: kill on min(coh, coh_raw+slack)
         # Dissipation autotuner (probe-then-commit), opt-in via optimizer.autotune_table.
         # Built LAZILY on the first before_step(): total_steps here is a placeholder —
         # the trainer finalizes the horizon at train start.
         self.autotuner = None
-        self._autotune_pending = bool(getattr(self.config, "autotune_table", None))
+        self.autotuners = []   # per-group servos (unet + winner TEs); self.autotuner aliases the unet one
+        self._autotune_pending = bool(getattr(self.config, "autotune_servo", False)) \
+            or bool(getattr(self.config, "autotune_table", None))
         self._snr_mod_announced = False
         self._current_fill_ramp = 1.0
+        # Live [loss]-line dissipation telemetry while the servo owns the boil/memgap meters: the
+        # readers PEEK the per-layer buffers non-destructively (the servo keeps the per-epoch reset)
+        # and return the per-call DELTA, replacing the stale per-epoch _agg cache. Each reader tracks
+        # its own cumulative baseline + the servo epoch it last saw; an _epoch change means the servo
+        # just zeroed the meters at a boundary -> rebaseline so it isn't read as a negative spike.
+        self._gap_peek_cum = 0.0
+        self._gap_peek_epoch = -1
+        self._boil_peek_cum = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        self._boil_peek_epoch = -1
+        self._last_boil_protected = None   # cf-discounted boil, set by read_flow_audit for the TB log
+        self._last_m6a = None   # M6a dissipation-space diversity meter ([4]/[5]), set by read_flow_audit (log-only)
+        # Per-layer servo kappa restored from the backup sidecar (concord_servo.json), consumed when
+        # _build_autotuner constructs the EpochDissipationServo so the climb survives the per-epoch
+        # exit-42 relaunch instead of resetting to the scalar seed.
+        self._servo_resume_state = None
         self.emb_cores = []         # packed-embedding cores (register_embedding_cores)
         self.emb_trainables = []    # the ConcordPackedEmbedding modules (drive/accum)
         self.emb_row_names = []     # row -> placeholder (calibration report)
@@ -187,8 +290,88 @@ class ConcordController:
         coherence reads ~0 regardless of data quality; including it would drag the
         probe mean toward "maximum noise"."""
         import json
-        from prototype_packed_b import DissipationAutoTuner
+        from prototype_packed_b import DissipationAutoTuner, EpochDissipationServo
         self._autotune_pending = False
+        if bool(getattr(self.config, "autotune_servo", False)):
+            # Per-layer, table-free epoch servo (the redesign). gf_consol is the
+            # seed kappa (= dissipation/lr). The kernel's consolidation branch is
+            # baked IN at capture only if gf_consol > 0, so require it (same rule
+            # as the table tuner). The servo then climbs each layer's kappa
+            # one-sided from this seed; no probe window, no table.
+            if self.config.gf_consol <= 0:
+                print("[concord] autotune_servo ON but gf_consol<=0 -> the kernel "
+                      "consolidation branch bakes OUT at capture; servo DISABLED. "
+                      "Set dissipation (or gf_consol) > 0 to seed it.")
+                self.autotuner = None
+                return
+            _real_spe = int(self.steps_per_epoch) if self.steps_per_epoch > 0 \
+                else max(1, self.total_steps // 100)
+            # Servo cadence: actuate N times per epoch (default 3, was 1) by shrinking the
+            # servo's window to steps_per_epoch / N. The firing (t % epoch_steps == 0), the
+            # boil/memgap meter windows (read+zeroed each firing) and the half-window baseline
+            # all retime together -> N x more responsive; no other servo logic is touched.
+            # N=1 restores the legacy once-per-epoch cadence. Override: config.autotune_servo_per_epoch.
+            _servo_per_epoch = max(1, int(getattr(self.config, "autotune_servo_per_epoch", 3)))
+            epoch_steps = max(1, _real_spe // _servo_per_epoch)
+            self.autotuners = []
+            def _mk_servo(_lyr, _lr, _seed, _nm):
+                _s = EpochDissipationServo(
+                    _lyr, lr=_lr, seed_kappa=_seed, epoch_steps=epoch_steps,
+                    climb_rate=float(getattr(self.config, "autotune_climb_rate", 0.5)),
+                    boil_ceiling=(float(getattr(self.config, "concord_servo_protected_boil_ceiling", 0.50))
+                                  if bool(getattr(self.config, "concord_servo_protected_boil", True))
+                                  else float(getattr(self.config, "autotune_boil_ceiling", 0.05))),
+                    beta1_on=self.config.autotune_beta1_on,
+                    beta1_coh_floor=self.config.autotune_beta1_coh,
+                    protected_boil=bool(getattr(self.config, "concord_servo_protected_boil", True)),
+                    waste_ceiling=float(getattr(self.config, "concord_servo_waste_ceiling", 0.12)),
+                    name=_nm)
+                self.autotuners.append((_nm, _s))
+                return _s
+            # UNet servo; self.autotuner aliases it for the gamma-SNR hook + the [loss]-line readers.
+            self.autotuner = _mk_servo(self.layers, self.config.lr, self.config.gf_consol, "unet")
+            # Per-group winner-TE servos: each SINGLE-LR so cap/floor/seed are correct, seeded at the
+            # SAME dimensionless lam as the UNet (lam/te_lr, NOT the UNet-lr gf_consol, which under-seeds
+            # them ~10x). Each servo's __init__ registers per-layer meters, overriding the
+            # _te_boil_scratch sink so it reads its own layers.
+            _lam = self.config.gf_consol * self.config.lr          # = dissipation (lr-invariant)
+            for _gi, (_te_lyr, _te_lr) in enumerate(self.te_groups):
+                _winner = [m for m in _te_lyr if getattr(m, "alpha_v_fast", 0.0) > 0.0]
+                if _winner and _te_lr > 0:
+                    _mk_servo(_winner, _te_lr, _lam / max(_te_lr, 1e-12), f"te{_gi + 1}")
+            # 4th group: the NON-anchored packed token-embedding cores (caption-vocab, and any
+            # non-anchored added tokens), at the embedding lr. Gate on alpha_v_fast>0, mirroring the
+            # te_groups winner filter: an ANCHORED core (added-token default) has drift_cancel_C=0, so
+            # its boil meter is structurally 0 (write_boil False) while memgap still writes -- it would
+            # bypass the boil-ceiling brake and ratchet kappa on memgap alone, over-dissipating the
+            # anchored delta. Leave anchored cores on register_embedding_cores' fixed kappa_emb. The
+            # sighting gate gives per-row sparsity, so a SCALAR kappa per table is correct.
+            _emb_live = [m for m in (getattr(self, "emb_cores", None) or [])
+                         if getattr(m, "alpha_v_fast", 0.0) > 0.0]
+            if _emb_live and getattr(self, "emb_lr", 0.0) > 0:
+                _mk_servo(_emb_live, self.emb_lr, _lam / max(self.emb_lr, 1e-12), "emb")
+            # Restore each group from the sidecar ({group: state}; a legacy single-servo dict -> unet).
+            if self._servo_resume_state is not None:
+                _st = self._servo_resume_state
+                if isinstance(_st, dict) and "kappa" in _st:       # legacy single-servo sidecar
+                    _st = {"unet": _st}
+                for _nm, _sv in self.autotuners:
+                    _slice = _st.get(_nm) if isinstance(_st, dict) else None
+                    if _slice is None:
+                        continue
+                    try:
+                        if _sv.import_state(_slice):
+                            _ks = sorted(_sv._kappa.values())
+                            print(f"[concord] servo[{_nm}] RESTORED from sidecar: {len(_sv.layers)} "
+                                  f"layers, epoch {_sv._epoch}, kappa min/med/max="
+                                  f"{_ks[0]:.0f}/{_ks[len(_ks) // 2]:.0f}/{_ks[-1]:.0f}", flush=True)
+                        else:
+                            print(f"[concord] servo[{_nm}] sidecar mismatch -> fresh seed", flush=True)
+                    except Exception as _e:
+                        print(f"[concord] servo[{_nm}] sidecar restore failed ({_e}) -> fresh seed",
+                              flush=True)
+                self._servo_resume_state = None
+            return
         table = [(float(c), float(k)) for c, k in json.loads(self.config.autotune_table)]
         if self.config.dissipation is not None:
             # dimensionless mode: the table's kappa column is lam = lr*kappa ->
@@ -310,7 +493,7 @@ class ConcordController:
                                if p.get("cp") is not None and p["cp"].trainable is not None]
         self.emb_cores = [t.core for t in self.emb_trainables]
         self.emb_row_names = next((
-            [emb.placeholder for emb, _k in p["row_map"]]
+            [(emb.placeholder if emb is not None else f"base:{_k}") for emb, _k in p["row_map"]]
             for p in planes if p.get("row_map")), [])
         self.emb_lr = float(emb_lr)
         self.emb_delay_epochs = max(0.0, float(delay_epochs))
@@ -539,7 +722,7 @@ class ConcordController:
         every example votes once. C* is a function of alpha_v, so it is
         re-derived per layer; the telescope-clock consumers (fill ramp,
         probe floor, watchdog arm delay) read config.alpha_v_fast and follow
-        automatically. UNet layers only (the TE anchor is pinned). Call at
+        automatically. UNet + winner-recipe TEs; frozen-anchor TEs (alpha_v==0) pinned. Call at
         horizon-finalize time, BEFORE the first training step / capture
         (alpha_v_fast and C* are launch-time scalars baked at capture).
         Idempotent across resumes."""
@@ -554,6 +737,36 @@ class ConcordController:
                       f"= {self.emb_delay_steps} steps (divot: UNet digs first against the "
                       f"pristine anchors; fresh warmup at release, cosine ends at horizon)",
                       flush=True)
+        # v_hat (Adafactor) second-moment EMA window, keyed to the epoch -- INDEPENDENT of the
+        # telescope alpha_v window below (applies even with telescope_epoch_window off). Set at
+        # train start, BEFORE the first step / capture, like alpha_v. beta2_epoch_window pins
+        # beta2 = 1 - 1/steps_per_epoch; else the manual config.beta2. vhat_warmstart is flagged
+        # per-layer here and consumed in the backward (init v_row/v_col from the first g^2).
+        if steps_per_epoch > 0:
+            new_b2 = (1.0 - 1.0 / float(steps_per_epoch)) if self.config.beta2_epoch_window \
+                else float(self.config.beta2)
+            # bias_correct_v supersedes warm-start (mutually exclusive: warm-start seeds v_hat~g^2 at a
+            # non-zero scale, the 1/(1-b2^t) correction assumes a zero start -> running both over-damps).
+            want_warm = bool(self.config.vhat_warmstart) and not bool(self.config.bias_correct_v)
+            n_warm = 0
+            for m in (list(self.layers) + list(self.te_layers)):
+                if not getattr(m, "track_adafactor_v", False):
+                    continue
+                m.adafactor_beta2 = new_b2
+                vr = getattr(m, "v_row", None)
+                if vr is None:
+                    continue
+                # Warm-start ONLY a genuinely fresh accumulator (v_row == 0). On the per-epoch
+                # exit-42 relaunch v_row is restored non-zero -> skip, so the carried-over v_hat is
+                # never clobbered. Host sync is fine here (eager, pre-capture); the blend it arms in
+                # the backward is graph-safe and self-zeroing.
+                fresh = bool(want_warm and float(vr.abs().sum().item()) == 0.0)
+                vr._concord_warm = (torch.ones(1, device=vr.device, dtype=vr.dtype) if fresh else None)
+                n_warm += int(fresh)
+            print(f"[concord] v_hat beta2 = {new_b2:g} "
+                  f"({'1-epoch window' if self.config.beta2_epoch_window else 'manual'}); "
+                  f"warm-start = {'on' if want_warm else 'off'}"
+                  f"{(' (armed on %d fresh layers)' % n_warm) if want_warm else ''}", flush=True)
         if not self.config.telescope_epoch_window or steps_per_epoch <= 0:
             return
         new_av = 1.0 / (2.0 * float(steps_per_epoch))
@@ -563,6 +776,12 @@ class ConcordController:
             m.alpha_v_fast = new_av
             m.drift_cancel_C = compute_drift_cancel_C(
                 m.alpha, new_av, mass_preserve=bool(getattr(m, "mass_preserve_v", True)))
+        # Winner-recipe TEs telescope too (alpha_v_fast>0); frozen-anchor TEs (==0) stay pinned.
+        for m in self.te_layers:
+            if getattr(m, "alpha_v_fast", 0.0) > 0.0:
+                m.alpha_v_fast = new_av
+                m.drift_cancel_C = compute_drift_cancel_C(
+                    m.alpha, new_av, mass_preserve=bool(getattr(m, "mass_preserve_v", True)))
         print(f"[concord] telescope epoch window: alpha_v {old_av:g} -> {new_av:g} "
               f"(window = {steps_per_epoch:.0f} steps = 1 epoch; C* re-derived; "
               f"fill ramp / probe floor / watchdog follow)", flush=True)
@@ -580,9 +799,30 @@ class ConcordController:
         from prototype_packed_b import read_boil
         if not self.layers:
             return None, None
-        a, b, c = read_boil(self.layers[0].packed_w.device)
+        if self.autotuner is not None and getattr(self.autotuner, "per_layer", False):
+            # Servo routes meters per-layer (the shared buffer is empty under it). PEEK the per-layer
+            # boil meters live and return the per-call delta -- live boil/waste, not the per-epoch
+            # _agg cache (which is 0 until the first post-enable boundary, then stale all epoch).
+            bsum = torch.stack([m._boil_meter for m in self.layers]).sum(0).tolist()
+            cur = (float(bsum[0]), float(bsum[1]), float(bsum[2]),
+                   float(bsum[3]) if len(bsum) > 3 else 0.0,
+                   float(bsum[4]) if len(bsum) > 4 else 0.0,
+                   float(bsum[5]) if len(bsum) > 5 else 0.0)
+            ep = int(getattr(self.autotuner, "_epoch", 0))
+            if ep != self._boil_peek_epoch:        # servo zeroed the meters at the boundary
+                self._boil_peek_epoch = ep
+                self._boil_peek_cum = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            pa, pb, pc, pd, pe, pf = self._boil_peek_cum
+            a, b, c, d = cur[0] - pa, cur[1] - pb, cur[2] - pc, cur[3] - pd
+            e, f = cur[4] - pe, cur[5] - pf   # M6a: e = sum killed^2*coh_raw*infancy-band, f = sum s_slow^2
+            self._boil_peek_cum = cur
+        else:
+            a, b, c = read_boil(self.layers[0].packed_w.device)
+            d = e = f = 0.0
         boil = (a / b) if b > 0 else None
         waste = (b / (b + c)) if (b + c) > 0 else None
+        self._last_boil_protected = (d / b) if b > 0 else None   # cf-discounted boil (servo gate when protected_boil on)
+        self._last_m6a = (e / f) if f > 0 else None   # M6a dissipation-space diversity meter (log-only)
         return boil, waste
 
     def read_memorization_gap(self):
@@ -597,7 +837,32 @@ class ConcordController:
         from prototype_packed_b import read_memgap
         if not self.layers:
             return 0.0
+        if self.autotuner is not None and getattr(self.autotuner, "per_layer", False):
+            # Servo routes memgap per-layer (the shared buffer is empty under it). PEEK the per-layer
+            # meters live and return the per-call delta -- live gap, not the per-epoch _agg cache.
+            cur = float(torch.stack([m._memgap_meter for m in self.layers]).sum().item())
+            ep = int(getattr(self.autotuner, "_epoch", 0))
+            if ep != self._gap_peek_epoch:         # servo zeroed the meters at the boundary
+                # Cold start (sentinel epoch -1): the per-layer meter holds the un-zeroed graph-warmup +
+                # first-accumulation lump, NOT a per-epoch delta -- absorb it into the baseline (d=0) so
+                # the deploy-loss EMA never seeds on it (else deploy_smooth shows ~2e12 then decays). A
+                # NORMAL boundary already zeroed the meters, so cur is a fresh delta -> baseline 0 as before.
+                self._gap_peek_cum = cur if self._gap_peek_epoch < 0 else 0.0
+                self._gap_peek_epoch = ep
+            d = cur - self._gap_peek_cum
+            self._gap_peek_cum = cur
+            return -d
         return -read_memgap(self.layers[0].packed_w.device)
+
+    def export_servo_state(self):
+        """Per-GROUP per-layer servo kappa for the backup sidecar, as {group_name: state}; None when
+        no per-layer servo is active. (The trainer writes it next to concord_clock.json so the climb
+        survives the relaunch; import in _build_autotuner restores each group, legacy dict -> unet.)"""
+        out = {}
+        for nm, sv in getattr(self, "autotuners", []):
+            if getattr(sv, "per_layer", False) and hasattr(sv, "export_state"):
+                out[nm] = sv.export_state()
+        return out or None
 
     @torch.no_grad()
     def on_timesteps(self, timesteps, alphas_cumprod):
@@ -627,10 +892,20 @@ class ConcordController:
         (device-to-device 0-dim copy, no host sync); the captured backward reads
         the buffers at replay. The host mirror (_gf_consol_value) keeps the
         UNMODULATED base. Call after the batch's timesteps are sampled and before
-        the backward / graph replay. TE layers are never modulated.
+        the backward / graph replay. Frozen-anchor TEs (alpha_v==0) are never
+        modulated; winner-recipe TEs (alpha_v>0) are, same as the UNet.
         """
         knee = self.config.autotune_gamma_snr
-        if knee is None:
+        if (not getattr(self.config, "autotune_gamma_snr_on", True)
+                or knee is None or float(knee) <= 0.0):
+            # Selector OFF, or no/degenerate knee: skip the modulation. before_step has already
+            # written gf_consol_buf = base(/servo) * fill_ramp, so the un-modulated lam stands --
+            # NOT scaled by SNR, NOT clamped to lam=1. (knee=0 used to mean snr/0 -> inf -> every
+            # step pinned at the lam=1 cap; <= 0 now reads as OFF.)
+            if not self._snr_mod_announced:
+                self._snr_mod_announced = True
+                print("[concord] gamma-SNR dissipation modulation OFF "
+                      "(base/servo lam applies directly; not capped to lam=1)")
             return
         if self.autotuner is not None:
             base = self.autotuner.committed
@@ -643,10 +918,7 @@ class ConcordController:
         ac = alphas_cumprod.to(timesteps.device)[timesteps.long()].float()
         snr = ac / (1.0 - ac).clamp_min(1e-8)
         mod = (snr / float(knee)).clamp_min(1.0).mean()
-        cap = self._LAM_MOD_CAP / max(self.config.lr, 1e-12)
-        # compose with the fill ramp (run-level infancy) -- this hook runs after
-        # before_step and would otherwise overwrite the ramped buffer value
-        kappa_t = (mod * float(base) * self._current_fill_ramp).clamp_max(cap)
+        cap = self._LAM_MOD_CAP / max(self.config.lr, 1e-12)   # UNet cap, for the announcement below
         if not self._snr_mod_announced:
             self._snr_mod_announced = True
             print(f"[concord] gamma-SNR dissipation modulation ON: knee={float(knee):g}, "
@@ -659,8 +931,25 @@ class ConcordController:
                       f"runs at the cap: effective lam = {self._LAM_MOD_CAP:g} < your "
                       f"base. Lower the base into the plateau (exp 21: lam* ~ 0.5-1.0) "
                       f"or disable gamma-SNR to run above it.")
-        for layer in self.layers:
-            layer._gf_consol_buf.copy_(kappa_t)
+        servo = getattr(self.autotuner, "per_layer", False)
+        # Winner-recipe TEs are modulated like the UNet; frozen-anchor TEs (alpha_v==0) are not.
+        _mod_layers = self.layers + [m for m in self.te_layers
+                                     if getattr(m, "alpha_v_fast", 0.0) > 0.0]
+        # PER-LAYER stability cap: the kernel applies evap_frac = lr*gf_consol*(1-coh) with each
+        # layer's OWN lr, so the lam <= _LAM_MOD_CAP cap must use THAT lr -- config.lr for the UNet,
+        # te_lr/te2_lr for each winner TE. A single config.lr cap would over-clamp a low-LR TE and,
+        # worse, under-clamp a high-LR TE (lam_te could exceed _LAM_MOD_CAP). Compose the global
+        # timestep shape (mod) with each layer's base (servo: per-layer _gf_consol_value mirror; else
+        # the global base) and the fill ramp, then clamp to the per-layer cap.
+        _lr_of = {id(m): self.config.lr for m in self.layers}
+        for _te_lyr, _te_lr in self.te_groups:
+            for _m in _te_lyr:
+                _lr_of[id(_m)] = _te_lr
+        for layer in _mod_layers:
+            _cap_l = self._LAM_MOD_CAP / max(_lr_of.get(id(layer), self.config.lr), 1e-12)
+            _base_l = float(layer._gf_consol_value) if servo else float(base)
+            layer._gf_consol_buf.copy_(
+                (mod * _base_l * self._current_fill_ramp).clamp_max(_cap_l))
 
     @torch.no_grad()
     def before_step(self):
@@ -669,20 +958,48 @@ class ConcordController:
         from concord_winner import winner_step
         if self._autotune_pending:
             self._build_autotuner()
-        if self.autotuner is not None:
+        if self.autotuners:
+            for _, _sv in self.autotuners:
+                _sv.step(self.step_idx)
+        elif self.autotuner is not None:
             self.autotuner.step(self.step_idx)
-        winner_step(self.step_idx, self.total_steps, self.layers, config=self.config)
+        # D4: anneal the ratio-coh bootstrap floors over ONE EPOCH (like the telescope), not the
+        # whole run. winner_step defaults floor_horizon=total_iters when None, which keeps the
+        # chase/leak floors high for most of training; steps_per_epoch (set by apply_epoch_window)
+        # is the intended window.
+        _fh = self.steps_per_epoch if self.steps_per_epoch > 0 else None
+        winner_step(self.step_idx, self.total_steps, self.layers, config=self.config,
+                    floor_horizon=_fh)
+        # Adam bias-correction on the rank-1 v_hat: drive 1/(1-b2^t) into the per-device buffer the
+        # kernel multiplies v_hat by (prototype :808) -- which is BEFORE both the preconditioner (:810)
+        # and the cf=d_sv^2/v_hat block (:838), so this one driver fixes the cold-start step overshoot
+        # AND the cf over-optimism (~125x at t=1 with the 1-epoch beta2). Keyed to the GLOBAL step_idx so
+        # it -> 1.0 (inert) once warm and never re-warms on the per-epoch exit-42 relaunch.
+        if self.config.bias_correct_v and self.layers:
+            if getattr(self, "_bc_pb", None) is None:
+                import prototype_packed_b as _pb
+                _pb.set_bias_correct_v(True)
+                for _m in self.layers:
+                    _pb._v_bc_buf(_m.packed_w.device)          # pre-create so step 0 is already corrected
+                self._bc_pb = _pb
+                print("[concord] Adam v_hat bias-correction ON (1/(1-b2^t) driver; corrects step + cf; "
+                      "vhat_warmstart suppressed)", flush=True)
+            _b2 = float(getattr(self.layers[0], "adafactor_beta2", self.config.beta2))
+            self._bc_pb.set_v_bias_correction(self._bc_pb.bias_correction_factor(self.step_idx, _b2))
         # Run-level infancy (dissipation_fill_ramp): write kappa_base * ramp into
         # the per-layer device buffers each step (the lr/sigma pattern; the host
         # mirror _gf_consol_value keeps the unmodulated base, so tuner commits and
         # this compose cleanly). Don't boil weight off while the pretrained mass
         # is in transit: friction ~0 early, 63% at the telescope time constant,
         # ~full by 3 tau, then the cosine lr takes it down -- rising-late, like
-        # the fluctuation sigma. UNet layers only (the TE anchor path is pinned).
+        # the fluctuation sigma. UNet + winner-recipe TEs; frozen-anchor TEs (alpha_v==0) pinned.
         if self.config.dissipation_fill_ramp:
             self._current_fill_ramp = self._fill_ramp(self.step_idx, self.config.alpha_v_fast)
             for m in self.layers:
                 m._gf_consol_buf.fill_(m._gf_consol_value * self._current_fill_ramp)
+            for m in self.te_layers:               # winner TEs only; frozen anchors (alpha_v==0,
+                if getattr(m, "alpha_v_fast", 0.0) > 0.0:   # gf_consol=0) have no fill-ramp to apply
+                    m._gf_consol_buf.fill_(m._gf_consol_value * self._current_fill_ramp)
         # Secondary groups are SCHEDULE-ONLY (update_globals=False): sigma and the
         # ratio floors are module-global and the last winner_step writer wins for
         # the whole model -- the emb group's noise=False used to zero sigma for
@@ -714,6 +1031,24 @@ class ConcordController:
             else:
                 winner_step(clk[0], clk[1], self.emb_cores, peak_lr=self.emb_lr,
                             noise=False, config=self.config, update_globals=False)
+        # Per-layer LAMB trust-scale maintenance, AFTER every winner_step (so each layer's _lr_buf is
+        # current): one alloc-free _lamb_scale_kernel/layer computes the scale from last step's norms +
+        # zeroes the accumulators. HOST-SIDE + eager, one step stale -- stays OUT of the captured
+        # backward, like lr/sigma/floors/fill-ramp. (The coh cf-discount needs no host prep: cf is
+        # computed in-kernel from sig2/v_hat.)
+        import prototype_packed_b as _ppb
+        if _ppb._LAMB_TRUST:
+            def _maint(m):
+                if getattr(m, "_lr_buf", None) is not None:
+                    _ppb._lamb_scale_kernel[(1,)](_ppb._lamb_wnorm_sq_buf(m.packed_w),
+                                                  _ppb._lamb_stepnorm_sq_buf(m.packed_w),
+                                                  m._lr_buf, _ppb._lamb_scale_buf(m.packed_w),
+                                                  _ppb._LAMB_CAP, 1.0 / _ppb._LAMB_CLIP, _ppb._LAMB_CLIP)
+            for m in self.layers:
+                _maint(m)
+            for m in self.te_layers + self.emb_cores:      # winner TEs + active embeddings; frozen
+                if getattr(m, "alpha_v_fast", 0.0) > 0.0:  # anchors (alpha_v==0) don't step -> skip
+                    _maint(m)
 
     @torch.no_grad()
     def after_step(self):
@@ -722,6 +1057,110 @@ class ConcordController:
         for _g in self.te_gates:                       # per-encoder gated rebalance
             _g()
         self.step_idx += 1
+        # Live washout/dissipation probe. Off-loop diagnostic; MUST never crash training
+        # (try/except) and MUST not pressure VRAM at the ceiling (per-layer temps, freed
+        # each iter; one host sync). Tune cadence / disable via CONCORD_HEALTH_EVERY (0=off).
+        import os
+        _hk = int(os.environ.get("CONCORD_HEALTH_EVERY", "50"))
+        if _hk > 0 and self.layers and self.step_idx % _hk == 0:
+            try:
+                self._log_health()
+            except Exception as _e:
+                print(f"[concord-health] probe error (skipped): {_e!r}", flush=True)
+        if os.environ.get("CONCORD_GRADW_DIAG"):
+            try:
+                from prototype_packed_b import read_gradw_diag
+                _cos, _gn = read_gradw_diag()
+            except Exception as _e:
+                _cos, _gn = None, 0
+                print(f"[concord-gradw] diag error (skipped): {_e!r}", flush=True)
+            if _gn:
+                self._gradw_count = getattr(self, "_gradw_count", 0) + 1
+                print(f"[concord-gradw] step={self.step_idx} (#{self._gradw_count}) cos(.,DEPLOY) over "
+                      f"{_gn} applies:  raw={_cos['raw']:+.4f}  step_live={_cos['step']:+.4f}  "
+                      f"s_fast={_cos['sfast']:+.4f}  coh(sig)={_cos['coh']:+.4f}  "
+                      f"incoh(noise)={_cos['incoh']:+.4f}", flush=True)
+                _gmax = int(os.environ.get("CONCORD_GRADW_MAXSTEPS", "6"))
+                if _gmax > 0 and self._gradw_count >= _gmax:
+                    print("[concord-gradw] probe done -> exiting. The stage where cos first departs "
+                          "~0 toward s_fast's -0.02 is where the contractive bias enters.", flush=True)
+                    os._exit(0)
+
+    @torch.no_grad()
+    def _log_health(self):
+        """Per-probe intrinsic state from the live packed weights (same decode as
+        measure_coherence): position/anchor/velocity norms, whether evaporation is firing
+        (build_ok), the coherence the gate reads (incl. the coh_vhat cf-modulation when on, so it
+        matches the kernel's ACTUAL gate coh, NOT measure_coherence's raw sig/noise decode), and whether the velocity pulls the
+        position toward zero (cos<0). Decoded on-device per layer, accumulated in fp64
+        device scalars, synced once. Watch: ||deploy|| (washout), build_ok (0=dissipation
+        inert), coh (~0.98 healthy), cos(sf,dep) (<0 contractive)."""
+        # Decode one layer-set into fp64 aggregates, accumulated on-device, synced once.
+        # acc = [dep, v, s, sf, sf*coh, dot, build, gap]. gap = ||(s_slow-v_slow)*128|| in
+        # weight units -- the leak lag the coherence is built from (sig = C*gap). For the
+        # creep TE it starts ~0 (gap-zero init) and grows as v_slow lags s_slow; for the
+        # frozen TE (s_slow=0, v_slow=W) it sits at ~||W|| and is static.
+        def _metrics(layers):
+            # build_ok = the soft drain gate's EXPECTED firing rate, mean(min(|s_fast|/evap_build_min, 1)),
+            # NOT a >= threshold count. The kernel gate is stochastic (P(drain) = |s_fast|/evap_build_min);
+            # a >= count reads ~0 whenever the chase pins |s_fast| below the scale, hiding whether the
+            # drain fires at all. This reports the real duty cycle: 0% = truly off, small = pegged low.
+            import prototype_packed_b as _ppb
+            build_min = float(_ppb._EVAP_BUILD_MIN)
+            dev = layers[0].packed_w.device
+            acc = torch.zeros(8, dtype=torch.float64, device=dev)
+            ntot = 0
+            for m in layers:
+                p = m.packed_w
+                sf = (p >> 16).float()
+                ss = ((p << 16) >> 24).float()
+                vs = ((p << 24) >> 24).float()
+                sc = (m.row_exp.float()[:, None] + m.col_exp.float()[None, :] - 15.0).exp2()
+                sc128 = sc * 128.0
+                sfW = sf * sc
+                dep = (ss + vs) * sc128
+                acc[0] += (dep * dep).sum(dtype=torch.float64)
+                acc[1] += ((vs * sc128) ** 2).sum(dtype=torch.float64)
+                acc[2] += ((ss * sc128) ** 2).sum(dtype=torch.float64)
+                acc[5] += (sfW * dep).sum(dtype=torch.float64)
+                acc[7] += (((ss - vs) * sc128) ** 2).sum(dtype=torch.float64)
+                del dep
+                C = float(getattr(m, "drift_cancel_C", 0.0))
+                sig = C * (ss - vs) * 128.0
+                noise = sf - sig
+                noise2 = noise * noise
+                if _ppb._USE_COH_VHAT and getattr(m, "alpha_v_fast", 0.0) > 0.0 \
+                        and getattr(m, "v_row", None) is not None:
+                    # Match the gate's ACTUAL coh under coh_vhat: discount noise^2 by kappa/(cf+kappa)
+                    # with cf = d_sv_W^2/v_hat, exactly as the apply kernel does (scale_fwd cancels in the
+                    # coh ratio, so the dimensionless discount applies straight to the mantissa noise^2).
+                    vh = m.v_row[:, None] * m.v_col[None, :] * m._sum_v_inv
+                    vh = torch.maximum(vh, 0.03 * vh.mean())    # match kernel: floor v_hat at 3% of layer-mean
+                    dsv_w = (ss - vs) * sc128
+                    cf = (dsv_w * dsv_w) / (vh + 1e-30)
+                    noise2 = noise2 * _ppb._COH_KAPPA / (cf + _ppb._COH_KAPPA)
+                coh = (sig * sig) / (sig * sig + noise2 + 1e-30)
+                sf2 = sfW * sfW
+                acc[3] += sf2.sum(dtype=torch.float64)
+                acc[4] += (sf2 * coh).sum(dtype=torch.float64)
+                acc[6] += (sf.abs() / (build_min + 1e-30)).clamp(max=1.0).sum(dtype=torch.float64)
+                ntot += sf.numel()
+            return acc.tolist(), ntot
+
+        def _line(tag, layers):
+            if not layers:
+                return
+            a, ntot = _metrics(layers)
+            nd, nsf = a[0] ** 0.5, a[3] ** 0.5
+            print(f"[concord-health:{tag}] step={self.step_idx} "
+                  f"||deploy||={nd:.1f} ||v||={a[1] ** 0.5:.1f} ||s||={a[2] ** 0.5:.1f} "
+                  f"||s_fast||={nsf:.3f} build_ok={100.0 * a[6] / max(1, ntot):.3f}% "
+                  f"coh={a[4] / max(a[3], 1e-30):.3f} cos(sf,dep)={a[5] / max(nsf * nd, 1e-30):+.3f} "
+                  f"gap={a[7] ** 0.5:.1f}",
+                  flush=True)
+
+        _line("unet", self.layers)
+        _line("te", self.te_layers)   # frozen TE -> coh~0, gap~||W||; creep TE -> coh live, gap grows from ~0
 
     @torch.no_grad()
     def consolidate_into_unet(self, unet):
@@ -755,7 +1194,6 @@ class ConcordController:
         print(f"[concord] consolidated {n} layers -> standard nn.Linear/nn.Conv2d for deploy")
         return n
 
-    @torch.no_grad()
     @torch.no_grad()
     def materialize_unet_deploy(self):
         """Reversible deploy window, ZERO GPU allocations: D2H-copy each packed
@@ -804,8 +1242,9 @@ class ConcordController:
 
     def materialize_te_deploy(self):
         """REVERSIBLE TE deploy: replace each text-encoder ConcordLinearPackedB with a temp
-        nn.Linear holding its get_weight() (keeps s_fast -> the ~16-bit deploy, NOT the
-        s_fast-dropping consolidated_weight), so the TE serializes as a standard CLIPTextModel.
+        nn.Linear holding its consolidated_weight() (DROPS s_fast, matching the UNet deploy --
+        the TE deploys its consolidated position, not the live transient; this keeps the
+        coherence-gated s_fast evaporation from showing up directly in the deployed TE weight).
         Returns a stash; pass it to restore_te_deploy() in a finally so training continues."""
         import torch.nn as nn
         from prototype_packed_b import ConcordLinearPackedB
@@ -821,7 +1260,7 @@ class ConcordController:
             for parent in te.modules():
                 for name, child in list(parent.named_children()):
                     if isinstance(child, ConcordLinearPackedB) and id(child) in te_set:
-                        w = child.get_weight()
+                        w = child.consolidated_weight()   # drop s_fast: deploy the consolidated position (like the UNet)
                         lin = nn.Linear(child.in_features, child.out_features,
                                         bias=child.bias is not None).to(
                             device=child.packed_w.device, dtype=w.dtype)
@@ -863,7 +1302,8 @@ def packed_embeddings_active(config) -> bool:
     from modules.util.enum.Optimizer import Optimizer
     return (config.optimizer.optimizer == Optimizer.CONCORD
             and bool(getattr(config, "concord_packed_embeddings", False))
-            and config.train_any_embedding())
+            and (config.train_any_embedding()
+                 or bool(getattr(config, "concord_train_caption_vocab", False))))
 
 
 def _packed_trainable_uuids(config):
@@ -874,6 +1314,92 @@ def _packed_trainable_uuids(config):
         if getattr(ec, "train", False) and not getattr(ec, "is_output_embedding", False):
             out.add(ec.uuid)
     return out
+
+
+def collect_caption_token_ids(config, tokenizer):
+    """Static union of base-vocab token ids that appear in any TRAINING caption, for this tokenizer.
+    Scanned once at setup (the attach set is static). add_special_tokens=False, no truncation (the
+    sighting gate makes a never-sighted row free), special ids + OOV stripped. Robust to concepts
+    being dicts (json.load) or ConceptConfig objects."""
+    import os
+    def _g(o, k, d=None):
+        return o.get(k, d) if isinstance(o, dict) else getattr(o, k, d)
+    try:
+        from modules.util import path_util
+        img_exts = set(path_util.supported_image_extensions())
+    except Exception:
+        img_exts = {".jpg", ".jpeg", ".jpe", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+    special = set(getattr(tokenizer, "all_special_ids", []) or [])
+    vocab_size = int(getattr(tokenizer, "vocab_size", 0) or 0)
+    ids = set()
+
+    def list_images(root, recurse):
+        out = []
+        try:
+            names = os.listdir(root)
+        except OSError:
+            return out
+        for name in names:
+            p = os.path.join(root, name)
+            if os.path.isdir(p):
+                if recurse and not name.startswith("."):
+                    out += list_images(p, recurse)
+            else:
+                stem, ext = os.path.splitext(p)
+                if (ext.lower() in img_exts
+                        and not (stem.endswith("-masklabel") or stem.endswith("-condlabel"))):
+                    out.append(p)
+        return out
+
+    def caption_lines(img, tcfg):
+        ps = _g(tcfg, "prompt_source", "sample")
+        src = str(getattr(ps, "value", ps) or "sample").lower()   # enum (ConceptConfig obj) or str (dict)
+        if src == "filename":
+            return [os.path.splitext(os.path.basename(img))[0]]
+        if src == "concept":
+            pp = _g(tcfg, "prompt_path", "") or ""
+            if pp and os.path.exists(pp):
+                with open(pp, encoding="utf-8") as f:
+                    return [ln.strip() for ln in f if ln.strip()]
+            return []
+        txt = os.path.splitext(img)[0] + ".txt"        # 'sample': per-image sidecar, one caption per line
+        if os.path.exists(txt):
+            with open(txt, encoding="utf-8") as f:
+                return [ln.strip() for ln in f if ln.strip()]
+        return []
+
+    concepts = getattr(config, "concepts", None)
+    if not concepts:                       # CLI / eager-GUI: concepts load lazily AFTER setup -> load the file now
+        cfn = getattr(config, "concept_file_name", None)
+        if cfn and os.path.exists(cfn):
+            try:
+                import json
+                from modules.util.config.ConceptConfig import ConceptConfig
+                with open(cfn, "r", encoding="utf-8") as f:
+                    concepts = [ConceptConfig.default_values().from_dict(c) for c in json.load(f)]
+            except Exception as _e:
+                print(f"[concord] caption-vocab: could not load concept file {cfn} ({_e})")
+                concepts = []
+    if not concepts:
+        print("[concord] caption-vocab: WARNING -- no concepts resolved; attaching NO caption tokens")
+    for concept in (concepts or []):
+        if not _g(concept, "enabled", True):
+            continue
+        if "VALIDATION" in str(_g(concept, "type", "") or "").upper():
+            continue
+        root = _g(concept, "path", "") or ""
+        if not root or not os.path.isdir(root):
+            continue
+        recurse = bool(_g(concept, "include_subdirectories", False))
+        tcfg = _g(concept, "text", {}) or {}
+        for img in list_images(root, recurse):
+            for line in caption_lines(img, tcfg):
+                toks = tokenizer(line, add_special_tokens=False, truncation=False).input_ids
+                ids.update(int(t) for t in toks)
+    ids -= special
+    if vocab_size > 0:
+        ids = {t for t in ids if t < vocab_size}
+    return ids
 
 
 def setup_packed_embeddings(model, config):
@@ -890,7 +1416,7 @@ def setup_packed_embeddings(model, config):
     from control_plane import ControlPlaneEmbedding
 
     train_uuids = _packed_trainable_uuids(config)
-    lr = float(config.embedding_learning_rate)
+    lr = float(config.embedding_learning_rate or config.learning_rate)   # emb LR is nullable (=use base LR)
     specs = [
         (1, model.text_encoder_1, model.tokenizer_1, model.all_text_encoder_1_embeddings()),
         (2, model.text_encoder_2, model.tokenizer_2, model.all_text_encoder_2_embeddings()),
@@ -923,12 +1449,39 @@ def setup_packed_embeddings(model, config):
                 tids.append(int(tid))
                 inits.append(emb.vector[k].detach().float())
                 row_map.append((emb, k))
+        # Caption-vocab: also train the BASE-vocab tokens that appear in the dataset captions, via the
+        # same single attach_trainable (it OVERWRITES cp.trainable, so caption rows must extend the same
+        # tids/inits/row_map). Seed from base.weight[tid] (base tokens have no emb.vector); mark each with
+        # a (None, tid) sentinel so the save bridge writes deploy back to base.weight[tid].
+        caption_tids = []
+        if bool(getattr(config, "concord_train_caption_vocab", False)):
+            cap_ids = collect_caption_token_ids(config, tokenizer)
+            cap_ids -= set(tids)                              # de-dup vs added-token ids
+            _san = getattr(model, "concord_sanitize", None)  # don't resurrect a sanitized (zeroed) token
+            if _san is not None:
+                cap_ids -= set(getattr(_san, "ids1" if te_idx == 1 else "ids2", None) or [])
+            for tid in sorted(cap_ids):
+                if tid < int(cp.kind.shape[0]) and int(cp.kind[tid]) != 0:
+                    continue                                 # already routed (sanitize/static/added)
+                tids.append(int(tid))
+                inits.append(base.weight[tid].detach().float())
+                row_map.append((None, int(tid)))
+                caption_tids.append(int(tid))
+            if caption_tids:
+                print(f"[concord] caption-vocab: TE{te_idx} +{len(caption_tids)} base-vocab token(s) "
+                      f"now trainable (seeded from base.weight)")
+        # anchor is per-CORE: a caption-ONLY plane honors concord_caption_vocab_anchor (default False, so
+        # the emb servo's coherence climb engages); any added token keeps concord_embedding_anchor.
+        _has_added = any(e is not None for (e, _k) in row_map)
+        anchor_flag = (bool(getattr(config, "concord_caption_vocab_anchor", False))
+                       if (caption_tids and not _has_added)
+                       else bool(getattr(config, "concord_embedding_anchor", True)))
         if tids:
             cp.attach_trainable(tids, torch.stack(inits).to(base.weight.device), lr, median,
-                                anchor=bool(getattr(config, "concord_embedding_anchor", True)))
+                                anchor=anchor_flag)
             if q_on:
-                is_tag = torch.tensor([(emb.placeholder in q_tag_set) for (emb, _k) in row_map],
-                                      dtype=torch.bool)
+                is_tag = torch.tensor([(emb is not None and emb.placeholder in q_tag_set)
+                                       for (emb, _k) in row_map], dtype=torch.bool)
                 if bool(is_tag.any()) and bool((~is_tag).any()):
                     tag_idx = torch.nonzero(is_tag, as_tuple=False).reshape(-1)
                     cp.trainable.set_quality_shield(tag_idx, (~is_tag).float(),
@@ -944,7 +1497,8 @@ def setup_packed_embeddings(model, config):
                     print(f"[concord] quality-tag shield: TE{te_idx} no rows matched tag list "
                           f"{sorted(q_tag_set)}; skipped")
         te.text_model.embeddings.token_embedding = cp
-        planes.append({"te_idx": te_idx, "te": te, "cp": cp, "base": base, "row_map": row_map})
+        planes.append({"te_idx": te_idx, "te": te, "cp": cp, "base": base, "row_map": row_map,
+                       "caption_tids": caption_tids})
     model.concord_control_planes = planes
     # bring the packed cores under the controller's physics (friction at the
     # embedding lr, warmup+cosine schedule, deploy-bridge inclusion, divot delay)
@@ -1049,8 +1603,13 @@ def materialize_packed_embeddings_to_vectors(model):
                       f"({type(e).__name__}: {e}); saving unprojected deploy "
                       f"(training-time gradient shield still applied)")
         with torch.no_grad():
+            base = plane["base"]
             for row, (emb, k) in enumerate(plane["row_map"]):
-                emb.vector[k].copy_(deploy[row].to(dtype=emb.vector.dtype, device=emb.vector.device))
+                if emb is None:                              # caption-vocab BASE token: no .vector;
+                    base.weight[k].copy_(deploy[row].to(  # k is the tid -> write deploy to base.weight[tid]
+                        dtype=base.weight.dtype, device=base.weight.device))
+                else:
+                    emb.vector[k].copy_(deploy[row].to(dtype=emb.vector.dtype, device=emb.vector.device))
 
 
 def deactivate_packed_embeddings(model):

@@ -310,6 +310,13 @@ class GenericTrainer(BaseTrainer):
         self._graphmem("pre-release")
         if _v2 is not None:
             _v2.release()
+            # The captured graph (which forced zero_grad(set_to_none=False) each step so the backward
+            # writes static .grad addresses) is now gone -> those grads are dead weight for the whole
+            # sample loop. FREE them so the sampler gets that VRAM (~1x the eager TE/embedding grad set;
+            # the big resident block release() doesn't touch). The next training step's recapture warmup
+            # (fresh fwd+bwd, concord_graph.py _warmup_and_capture) re-establishes every .grad before it
+            # re-captures, so this is a true-recapture-safe reclaim, not a replay hazard.
+            self.model.optimizer.zero_grad(set_to_none=True)
         self._graphmem("post-release")
         torch_gc()
         self._graphmem("post-gc")
@@ -419,9 +426,25 @@ class GenericTrainer(BaseTrainer):
                   flush=True)
             self.__backup(train_progress, True, print)
             self.__prune_backups(1)   # resume only ever needs the latest -> keep exactly one, no pile-up
+            self._kill_tensorboard_for_restart()
             sys.stdout.flush()
             sys.stderr.flush()
             sys.exit(42)
+
+    def _kill_tensorboard_for_restart(self):
+        """The exit-42 relaunch is NOT a clean exit, so _stop_tensorboard never runs and the TB
+        subprocess is orphaned -- it keeps port 6006 and tails the live event file, and its
+        no-TensorFlow fallback CRC (tensorflow_stub) occasionally access-violates on a half-written
+        record. Kill it before relaunching so each segment owns at most one TB instead of piling up
+        orphans (the "could not bind to 6006" errors + the periodic access-violation dumps). Guarded:
+        TB may not be running (tensorboard off, tensorboard_always_on skips _start_tensorboard, or it
+        already crashed)."""
+        proc = getattr(self, "tensorboard_subprocess", None)
+        if proc is not None and proc.poll() is None:
+            try:
+                self._stop_tensorboard()
+            except Exception:
+                pass
 
     def __validate(self, train_progress: TrainProgress):
         if self.__needs_validate(train_progress):
@@ -568,6 +591,19 @@ class GenericTrainer(BaseTrainer):
                             "global_step": int(train_progress.global_step),
                             "accum": int(max(1, self.config.gradient_accumulation_steps)),
                         }, f)
+                    # Per-layer servo kappa sidecar: the exit-42 relaunch rebuilds the servo from
+                    # the scalar seed, so without this the climb resets every epoch. Isolated in its
+                    # own try -- a sidecar failure must never abort the backup itself.
+                    try:
+                        _ss = (_ctrl.export_servo_state()
+                               if hasattr(_ctrl, "export_servo_state") else None)
+                        if _ss is not None:
+                            with open(os.path.join(backup_path, "concord_servo.json"),
+                                      "w", encoding="utf-8") as f:
+                                json.dump(_ss, f)
+                    except Exception as _se:
+                        print(f"[concord] could not write servo sidecar ({_se}); the servo "
+                              f"will reseed from dissipation on resume", flush=True)
                 except OSError as e:
                     print(f"[concord] could not write backup clock ({e}); a "
                           f"resume with a different accum will mis-seed", flush=True)
@@ -601,6 +637,7 @@ class GenericTrainer(BaseTrainer):
             import sys
             print("[concord-restart] backup written -> exit(42) for fresh-process "
                   "relaunch (skipping the in-process recommit)", flush=True)
+            self._kill_tensorboard_for_restart()
             sys.stdout.flush()
             sys.stderr.flush()
             sys.exit(42)
@@ -886,8 +923,17 @@ class GenericTrainer(BaseTrainer):
                     # count, accum-change-proof); fall back to deriving from
                     # micro-steps, which silently assumes accum never changed.
                     _resumed_updates = None
+                    # Only adopt a persisted controller clock when this process is
+                    # actually resuming (backup-continue or the restart-on-sample
+                    # wrapper, both of which set continue_last_backup). On a fresh
+                    # start get_last_backup_path() still returns the most recent
+                    # backup on disk -- without this gate a clean run reads that
+                    # stale clock (global_step 32) against its own train_progress=0,
+                    # prints the spurious "resume is at 0" fallback. Gate it.
                     _bk = (self.config.get_last_backup_path()
-                           if hasattr(self.config, "get_last_backup_path") else None)
+                           if (getattr(self.config, "continue_last_backup", False)
+                               and hasattr(self.config, "get_last_backup_path"))
+                           else None)
                     if _bk:
                         try:
                             with open(os.path.join(_bk, "concord_clock.json"),
@@ -904,6 +950,14 @@ class GenericTrainer(BaseTrainer):
                                       f"{_clk.get('global_step')} but resume is at "
                                       f"{getattr(train_progress, 'global_step', 0)}; "
                                       f"falling back to micro-step derivation", flush=True)
+                        except (OSError, ValueError, KeyError, TypeError):
+                            pass
+                        try:
+                            with open(os.path.join(_bk, "concord_servo.json"),
+                                      encoding="utf-8") as f:
+                                self.model.concord_controller._servo_resume_state = json.load(f)
+                            print("[concord] servo sidecar found; per-layer kappa will be "
+                                  "restored when the autotuner builds", flush=True)
                         except (OSError, ValueError, KeyError, TypeError):
                             pass
                     if _resumed_updates is None:
@@ -938,18 +992,27 @@ class GenericTrainer(BaseTrainer):
                 if self.commands.get_stop_command():
                     multi.warn_parameter_divergence(self.parameters, train_device)
 
-                if os.environ.pop("CONCORD_RESUMING", None):
-                    # Resumed right after a Concord sample-triggered checkpoint-restart: the sample at
-                    # THIS restored step already ran in the prior process. Skip it once (one-shot via
-                    # env pop) -- otherwise we'd re-sample, re-checkpoint and exit again at the same
-                    # step forever, since the "already sampled" state doesn't survive a restart. The
-                    # training step at this step still runs (only the duplicate sample is skipped).
-                    print("[concord-restart] resumed -> skipping the already-done sample at this step", flush=True)
+                _concord_resumed_step = bool(os.environ.pop("CONCORD_RESUMING", None))
+                if _concord_resumed_step:
+                    # Resumed right after a Concord checkpoint-restart. Two things at THIS restored
+                    # step already happened in the prior process and must NOT be redone, or the
+                    # segment exit(42)s before any training step runs and livelocks at the boundary:
+                    #   (1) the sample at this step already ran; the "already sampled" flag doesn't
+                    #       survive a restart, so re-sampling would re-checkpoint + re-exit.
+                    #   (2) under CONCORD_RESTART_ON_BACKUP the per-epoch backup we resumed FROM is
+                    #       this exact (epoch, epoch_step==0) boundary. __needs_backup is STATELESS
+                    #       for the EPOCH unit (fires whenever epoch_step==0 and epoch>0), so it
+                    #       re-fires here and re-exits(42) at the same step forever -- every backup
+                    #       pinned to <step>-<epoch>-0, zero steps trained.
+                    # Skip BOTH once (one-shot via the env pop): the training step still runs, so
+                    # epoch_step advances past 0 and the next backup fires at the NEXT epoch boundary.
+                    print("[concord-restart] resumed -> skipping the already-done sample + redundant "
+                          "boundary backup at this step", flush=True)
                 elif (not self.commands.get_stop_command() and self.__needs_sample(train_progress)) or self.commands.get_and_reset_sample_default_command():
                     self.__enqueue_sample_during_training(
                         lambda: self.__sample_during_training(train_progress, train_device)
                     )
-                if self.__needs_backup(train_progress):
+                if self.__needs_backup(train_progress) and not _concord_resumed_step:
                     self.commands.backup()
 
                 if self.__needs_save(train_progress):
@@ -1145,6 +1208,16 @@ class GenericTrainer(BaseTrainer):
                                     self.tensorboard.add_scalar(
                                         "loss/concord_waste", _waste, train_progress.global_step)
                                     _msg += f"  waste={_waste:.3f}"
+                                _boil_prot = getattr(_ctrl, "_last_boil_protected", None)
+                                if _boil_prot is not None:
+                                    self.tensorboard.add_scalar(
+                                        "loss/concord_boil_protected", _boil_prot, train_progress.global_step)
+                                    _msg += f"  boil_cf={_boil_prot:.3f}"
+                                _m6a = getattr(_ctrl, "_last_m6a", None)
+                                if _m6a is not None and getattr(self.config, "concord_m6a_meter", False):
+                                    self.tensorboard.add_scalar(
+                                        "loss/concord_m6a", _m6a, train_progress.global_step)
+                                    _msg += f"  m6a={_m6a:.3e}"
                             step_tqdm.write(_msg)
 
                         accumulated_loss = 0.0

@@ -539,6 +539,31 @@ class TrainingTab:
         components.entry(frame, row, 1, self.ui_state, f"text_encoder{suffix}.learning_rate")
         row += 1
 
+        # Concord frozen-anchor TE training (SDXL CLIP-L / CLIP-G; inert under other
+        # optimizers/models). Field names don't follow the _n suffix: i=1 -> concord_te_anchor,
+        # i=2 -> concord_te2_anchor. The anchor strength (kernel wd_anchor) is shared across both.
+        _concord_te_anchor_field = {1: "concord_te_anchor", 2: "concord_te2_anchor"}.get(i)
+        if _concord_te_anchor_field is not None:
+            components.label(frame, row, 0, f"Concord: Freeze TE {i} to Anchor (opt-in)",
+                             tooltip=f"Concord text-encoder {i} training MODE (SDXL + Concord only; inert "
+                                     "otherwise). OFF (default): train this CLIP via the same WINNER recipe "
+                                     "as the UNet -- live coherence gate, dissipation, rebalance, full "
+                                     "per-step/per-epoch scheduling, NO pull-to-pretrained. ON (opt-in): "
+                                     "frozen-v_slow anchor -- pretrained pinned in v_slow, wd_anchor pulls "
+                                     "the delta back toward pretrained, low-drift, no dissipation. Uses the "
+                                     f"Text Encoder {i} Learning Rate above.")
+            components.switch(frame, row, 1, self.ui_state, _concord_te_anchor_field)
+            row += 1
+
+            if i == 1:
+                components.label(frame, row, 0, "Concord: Anchor Strength",
+                                 tooltip="Elastic pull of the TE delta back toward the pretrained anchor "
+                                         "(kernel wd_anchor). ~0.5 = gentle (validated); lower = more reach "
+                                         "toward the concept (more drift / sharper conditioning); 0 = no "
+                                         "anchor (plain packed drift). Shared across both anchored text encoders.")
+                components.entry(frame, row, 1, self.ui_state, "concord_te_wd_anchor")
+                row += 1
+
         if supports_layer_skip:
             # text encoder layer skip (clip skip)
             components.label(frame, row, 0, f"Text Encoder {i} Clip Skip",
@@ -633,6 +658,19 @@ class TrainingTab:
                                  "leaving a subject free to move away (toward good). Default hard.")
         components.options(frame, 10, 1, ["hard", "one_sided"], self.ui_state,
                            "concord_embedding_quality_mode")
+
+        components.label(frame, 11, 0, "Concord: Train Caption Vocab",
+                         tooltip="Train the base-vocabulary tokens that appear in your captions via the "
+                                 "packed per-token Concord path + the 'emb' dissipation servo, instead of "
+                                 "leaving them frozen. Concord only; separate from training added "
+                                 "embeddings. Seeded from the pretrained base vectors; default off.")
+        components.switch(frame, 11, 1, self.ui_state, "concord_train_caption_vocab")
+
+        components.label(frame, 12, 0, "Concord: Caption-Vocab Anchor",
+                         tooltip="Freeze each caption token's base-row init in v_slow (deploy = init + "
+                                 "gated delta). Default OFF: anchoring zeroes the leak so the emb servo's "
+                                 "adaptive kappa climb never engages -- leave off to let the servo work.")
+        components.switch(frame, 12, 1, self.ui_state, "concord_caption_vocab_anchor")
 
     def __create_unet_frame(self, master, row):
         frame = ctk.CTkFrame(master=master, corner_radius=5)

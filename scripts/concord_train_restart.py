@@ -18,8 +18,17 @@ seamlessly. Net effect: full graph speedup during training, a clean allocator ev
 demotion compounding -- at the cost of one model reload (~1-2 min) per segment (per epoch in the
 standard sampling-off config).
 
+Bounded crash-retry: the sample/backup boundary work runs at the 24 GB ceiling, and once in a while
+the recommit/recapture there dies on a native fault (a CUDA-graph/WDDM access violation, exit code
+0xC0000005) instead of exiting 42 cleanly. Rather than let one such fault end an unattended run, this
+wrapper RESUMES from the last backup on an abnormal termination too -- but caps CONSECUTIVE crashes
+(CONCORD_MAX_CRASH_RETRIES, default 5) so a persistently broken state can't loop forever. The cap
+resets on every clean segment boundary (exit 42), so a run that keeps progressing is never starved.
+Intentional exits (0 = done; a small non-zero = a real Python error; Ctrl+C) are trusted -> stop.
+
 Usage (drop-in for scripts/train.py):
     python scripts/concord_train_restart.py --config-path path/to/config.json [--secrets-path ...]
+    Env: CONCORD_MAX_CRASH_RETRIES=N (default 5) -- consecutive native-crash resumes before giving up.
 
 Only relevant when the Concord CUDA graph is active (CONCORD optimizer + concord_cuda_graph gate)
 AND sampling is enabled. Plain `python scripts/train.py ...` is completely unaffected.
@@ -29,6 +38,26 @@ import subprocess
 import sys
 
 RESTART_EXIT_CODE = 42
+
+# Bounded crash-retry budget: consecutive native crashes we'll resume-through before giving up.
+# Resets on every clean segment boundary (exit 42), so only crashes with NO intervening progress
+# count against it. Tunable via env without editing the script.
+MAX_CRASH_RETRIES = int(os.environ.get("CONCORD_MAX_CRASH_RETRIES", "5"))
+
+# STATUS_CONTROL_C_EXIT: a Ctrl+C / GUI Stop that hard-terminates the child lands in the
+# 0xC0000000 NTSTATUS range like a real fault, but it's user-initiated -- never auto-restart it.
+_STATUS_CONTROL_C_EXIT = 0xC000013A
+
+
+def _is_crash(code):
+    """True only for an ABNORMAL termination the OS killed: a Windows NTSTATUS fault
+    (0xC0000005 access-violation, 0xC00000FD stack-overflow, 0xC0000374 heap-corruption, ...) or
+    a POSIX signal (negative code). Intentional Python exits -- 0 (done) and small positive codes
+    (sys.exit(1) tracebacks, deliberate stops) -- are NOT crashes: a resume won't change their
+    outcome, so we trust them and stop. Ctrl+C (STATUS_CONTROL_C_EXIT) is excluded explicitly."""
+    if code == _STATUS_CONTROL_C_EXIT:
+        return False
+    return code < 0 or code >= 0xC0000000
 
 
 def main():
@@ -53,6 +82,7 @@ def main():
     env["CONCORD_RESTART_ON_BACKUP"] = "1"
 
     segment = 0
+    consecutive_crashes = 0
     while True:
         if segment == 0:
             print(f"[concord-restart] launching training (segment {segment})", flush=True)
@@ -61,17 +91,36 @@ def main():
                   f"resume from last backup", flush=True)
 
         ret = subprocess.run([sys.executable, train_py] + train_args, env=env)
+        code = ret.returncode
 
-        if ret.returncode == RESTART_EXIT_CODE:
-            # Every relaunch after the first resumes from the backup the prior process just wrote.
+        if code == RESTART_EXIT_CODE:
+            # Clean segment boundary: the prior process checkpointed. Resume from it, and reset
+            # the crash budget -- we made forward progress.
             env["CONCORD_RESUMING"] = "1"
             segment += 1
+            consecutive_crashes = 0
             continue
 
-        # 0 = training finished normally; anything else = a real error. Either way, stop here.
-        print(f"[concord-restart] training exited with code {ret.returncode}; stopping "
+        if _is_crash(code):
+            # Native crash (e.g. the 0xC0000005 CUDA-graph/WDDM fault at the VRAM ceiling). The
+            # crashed process wrote no checkpoint this segment, so resume from the last good backup.
+            consecutive_crashes += 1
+            shown = f"{code} / 0x{code:08X}" if code >= 0xC0000000 else str(code)
+            if consecutive_crashes > MAX_CRASH_RETRIES:
+                print(f"[concord-restart] segment {segment} crashed (code {shown}); crash-retry "
+                      f"budget exhausted ({MAX_CRASH_RETRIES} consecutive) -> stopping.", flush=True)
+                sys.exit(code)
+            env["CONCORD_RESUMING"] = "1"
+            print(f"[concord-restart] segment {segment} crashed (code {shown}); "
+                  f"crash-retry {consecutive_crashes}/{MAX_CRASH_RETRIES} -> resume from last backup.",
+                  flush=True)
+            continue
+
+        # 0 = training finished normally; a small non-zero = a deliberate/clean error exit. Both
+        # are intentional (a resume won't change the outcome) -- stop here.
+        print(f"[concord-restart] training exited with code {code}; stopping "
               f"(after {segment} restart(s)).", flush=True)
-        sys.exit(ret.returncode)
+        sys.exit(code)
 
 
 if __name__ == "__main__":

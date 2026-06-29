@@ -1,0 +1,27 @@
+{
+  "git_sha": "6ecdafd6131a4609db39adab43f46c20b250a999-dirty",
+  "toolchain": {
+    "torch": "2.9.1+cu128",
+    "cuda": "12.8",
+    "python": "3.11.9",
+    "triton": "3.5.1",
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "torch_cuda_runtime": "12.8"
+  },
+  "goldens": {
+    "g1_kernel_matrix.pt": "G1 kernel-output matrix (fused x {0,1} x config matrix; meters now 6-wide incl M6a)",
+    "g2_shipped_trajectory.pt": "G2 shipped-default trajectory (fused x {0,1} x noise {off,on})",
+    "g5_config.json": "G5 config-dict identity + doc-contract constants",
+    "g3a_servo_cpu.pt": "G3a EpochDissipationServo trajectory (protected on/off; cf-ceiling-removal catcher)",
+    "g3b_autotuner_cpu.pt": "G3b DissipationAutoTuner probe/commit/re-probe trace",
+    "g3c_live_meters.pt": "G3c live 6-wide boil + coh_evap-[3] + M6a-[4]/[5] burst (INV-D)",
+    "gpu_envelope.pt": "Per-field self-jitter envelope (max|run_i-run_0| over 4 draws); the near-bit-exact tolerance"
+  },
+  "notes": [
+    "GATE MODEL (2026-06-29): the apply kernel is NOT bit-reproducible -- a single step from identical inputs/state diverges ~70/2048 ints, eager AND under CUDA-graph replay (HW float-reduction order). So GPU gates (G1/G2/G3c) are NEAR-bit-exact: refactored must stay within gpu_envelope (the baseline's measured self-jitter) x margin. BIT-EXACT atol=0 only for the HOST gates: G5 (config dict), G3a/G3b (servo/autotuner).",
+    "G2 noise_on restores rng_fingerprint (cpu+cuda RNG) so the only residual vs golden is kernel jitter (within-envelope), not a different noise draw.",
+    "_FUSED_MATMUL captured under BOTH True/False via direct attribute assignment (no setter exists -- the refactor MUST add set_fused()).",
+    "G1 includes a cuda:0-device-string case to exercise the _STEP_COUNTERS vs _CONSOLIDATE_FLAGS keying asymmetry (INV-C).",
+    "2026-06-29 DRIFT: boil buffer is 6-wide ([3]=coh_evap-weighted, [4]/[5]=M6a). _read_meters snapshots the raw 6-vector. G3a covers BOTH protected_boil modes (servo cf-ceiling REMOVAL PB:3870-3877 changed the protected trajectory; legacy stays bit-identical)."
+  ]
+}

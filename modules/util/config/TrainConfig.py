@@ -93,12 +93,23 @@ class TrainOptimizerConfig(BaseConfig):
     dissipation: float
     autotune_beta1_on: float
     autotune_beta1_coh: float
+    autotune_servo: bool
+    autotune_climb_rate: float
+    autotune_boil_ceiling: float
     warmup: int
     lr_min_frac: float
     step_cap: float
     gf_trust_delta_sq: float
     min_leak: float
     evap_build_min: float
+    lamb_trust: bool
+    lamb_cap: float
+    lamb_clip: float
+    beta2_epoch_window: bool
+    vhat_warmstart: bool
+    bias_correct_v: bool
+    coh_vhat: bool
+    coh_kappa: float
     dissipation_fill_ramp: bool
     telescope_epoch_window: bool
     weight_lr_power: float
@@ -225,15 +236,27 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("autotune_table", None, str, True))
         data.append(("autotune_reprobe_band", None, float, True))
         data.append(("autotune_gamma_snr", None, float, True))
+        data.append(("autotune_gamma_snr_on", None, bool, True))
         data.append(("dissipation", None, float, True))
         data.append(("autotune_beta1_on", None, float, True))
         data.append(("autotune_beta1_coh", None, float, True))
+        data.append(("autotune_servo", None, bool, True))
+        data.append(("autotune_climb_rate", None, float, True))
+        data.append(("autotune_boil_ceiling", None, float, True))
         data.append(("warmup", None, int, True))
         data.append(("lr_min_frac", None, float, True))
         data.append(("step_cap", None, float, True))
         data.append(("gf_trust_delta_sq", None, float, True))
         data.append(("min_leak", None, float, True))
         data.append(("evap_build_min", None, float, True))
+        data.append(("lamb_trust", None, bool, True))
+        data.append(("lamb_cap", None, float, True))
+        data.append(("lamb_clip", None, float, True))
+        data.append(("beta2_epoch_window", None, bool, True))
+        data.append(("vhat_warmstart", None, bool, True))
+        data.append(("bias_correct_v", None, bool, True))
+        data.append(("coh_vhat", None, bool, True))
+        data.append(("coh_kappa", None, float, True))
         data.append(("dissipation_fill_ramp", None, bool, True))
         data.append(("telescope_epoch_window", None, bool, True))
         data.append(("weight_lr_power", None, float, True))
@@ -430,9 +453,10 @@ class TrainConfig(BaseConfig):
     concord_fused_matmul: bool           # default-on: dequant packed_w inside the matmul, drops the bf16 weight cache (~5 GB); works WITH gradient accumulation (accum is driven by the apply kernel's consolidate gate, orthogonal to fused vs cached)
     concord_packed_embeddings: bool       # default-on: train new-token embeddings via the norm-preserving packed self-stepping core (ConcordPackedEmbedding) instead of plain SGD -- pins the deploy norm to the vocab median (anti-overfit). Concord optimizer only.
     concord_bucket_contiguous: bool       # default-on: order aspect-ratio buckets as contiguous blocks (random block order per epoch) instead of globally shuffling batches across shapes -- avoids CUDA-graph recapture churn + allocator fragmentation when bucketing under the graph. latent_caching path only; no-op with a single bucket.
-    concord_te_anchor: bool               # default-on under Concord + text_encoder.train (the "train text encoder 1" flag): train CLIP-L via the frozen-v_slow Concord anchor -- pretrained pinned in v_slow, a 16-bit fast/slow delta self-steps in the captured backward, wd_anchor pulls it back toward pretrained. Uses the text_encoder LR field. Set False to opt out.
-    concord_te2_anchor: bool              # SAME as concord_te_anchor but for CLIP-G (text_encoder_2). OFF by default (opt-in: newer than the TE1 path). On + text_encoder_2.train -> TE2 also trains via the Concord frozen-v_slow anchor + packed int-storage (CLIP-G is 694M, so the weight-cache/memory saving is large), with its OWN lr (text_encoder_2 LR field). Off -> TE2 trains via the standard optimizer (still graph-captured, so still fast -- this only adds the anchor discipline + packing, not speed).
+    concord_te_anchor: bool               # MODE selector for Concord CLIP-L training (under Concord + text_encoder.train). False (DEFAULT, since 2026-06-18) = train CLIP-L via the WINNER recipe, exactly like the UNet (even-split load, live coherence gate alpha_v>0, drift_cancel_C>0, gf_consol>0 evaporation, NO wd_anchor, NO pinned v_slow). True (OPT-IN) = frozen-v_slow anchor -- pretrained pinned in v_slow, a 16-bit fast/slow delta self-steps, wd_anchor pulls it back toward pretrained (low-drift, but no live gate/dissipation). Uses the text_encoder LR field. NOTE the flip: configs that OMIT this now get winner (was frozen); set True to keep the old anchor behavior. (Winner-TE is unvalidated vs the frozen anchor -- watch for CLIP drift/collapse.)
+    concord_te2_anchor: bool              # SAME mode selector as concord_te_anchor but for CLIP-G (text_encoder_2), under text_encoder_2.train. False (default) = WINNER recipe (train like the UNet); True (opt-in) = frozen-v_slow anchor. Own lr (text_encoder_2 LR field). CLIP-G is 694M, so the packed int-storage saving is large in either mode.
     concord_te_wd_anchor: float           # strength of the elastic pull of the TE delta toward the pretrained anchor (kernel wd_anchor). ~0.5 = gentle (validated); 0 = no anchor (plain packed drift).
+    concord_te_chase_alpha: float         # s_fast->s_slow chase (consolidation) rate for the anchored TEs (kernel alpha). 0.1 = the shared UNet/WINNER default. The TE deploys with s_fast KEPT, so this sets only the coarse-int8(s_slow) / fine-int16(s_fast) split, not the deployed weight: lower keeps small anchored excursions in the fine s_fast (more precise); 0 = no chase (all learning stays in s_fast). Raise only if deltas are large enough to need s_slow's extra range.
     concepts: list[ConceptConfig]
     aspect_ratio_bucketing: bool
     latent_caching: bool
@@ -499,7 +523,16 @@ class TrainConfig(BaseConfig):
     dynamic_timestep_shifting: bool
     concord_epoch_cache_release: bool
     concord_sample_deploy: bool
+    concord_train_cond_embed: bool        # default OFF: the timestep (time_embedding) + added-conditioning (add_embedding) MLPs are NOT trained (frozen at base) unless this is True. Default-frozen avoids the embedding norm over-cook (the free-run-collapse driver); the base already encodes noise-level + size conditioning. The per-resnet time_emb_proj is unaffected. Concord optimizer only.
+    concord_conv_full_vhat: bool          # default OFF: use a per-element (full) second-moment v_hat for CONV layers instead of the rank-1 Adafactor v_row*v_col product. Fixes the conv-specific over-cook (rank-1 mis-estimates conv-kernel variance -> over-steps). Costs one extra [out,in*k*k] fp32 buffer per conv. Concord optimizer only.
+    concord_servo_protected_boil: bool    # default ON: the dissipation servo's earn/climb gate keys on the cf-DISCOUNTED coherence (boil_protected = boil_ptr[3]/[1]) instead of the raw coh_raw boil ([0]/[1]). Fixes the ratchet-coherence mismatch: coh_raw drives the kill+boil while the cf-discounted coh drives carry/leak, so the servo was blind to killing cf-protected mass and ratcheted kappa. Concord optimizer only.
+    concord_servo_waste_ceiling: float    # servo climb-freeze: a layer stops adding dissipation (kappa climb) once its per-layer waste = killed/(killed+carried) exceeds this. Puts the waste metric directly in the earn-gate (the servo otherwise never reads waste, so kappa ratchets up unopposed). Default 0.12; set >= 1.0 to disable. Concord optimizer only.
+    concord_evap_slack: float             # EVAP CF-aware clamp: the kill gates on min(coh, coh_raw + slack) instead of coh_raw, so it stops shredding cf-coherent mass (deflates boil_cf) while the FIXED +slack cap keeps a cf-independent noise floor (spurious-cf noise still dies, genuine coherence still locks). Default 0.25; 0 = legacy coh_raw kill. Concord optimizer only.
+    concord_m6a_meter: bool               # LOG-ONLY dissipation-space DIVERSITY meter (M6a = killed coherent mass in the hypothesis-infancy band [|s_fast|<evap_build_min] / consolidated s_slow energy). Rises when a climbing kappa evaporates coherent cross-example evidence before it consolidates (CPU-MNIST validated; memgap/waste are blind to this). DIAGNOSTIC only -- does NOT gate the servo. Default OFF (logs m6a on the [loss] line + TB when on). Concord optimizer only.
+    concord_servo_protected_boil_ceiling: float  # cf-scale servo SETPOINT/ceiling used when concord_servo_protected_boil is True (boil_cf lives on a ~0.4-0.6 scale, not the raw 0.05). The servo CLIMBS kappa (adds dissipation) while boil_cf is below it, and DESCENDS once boil_cf reaches it (boil-descend). It is the dissipation-aggressiveness dial: raise -> more climb/dissipation, lower -> less. Default 0.60 (above the images-good ~0.55, below the old lam-0.1 boil_cf ~0.63). autotune_boil_ceiling stays the raw-scale ceiling for protected_boil=False. Concord optimizer only.
     concord_embedding_anchor: bool
+    concord_train_caption_vocab: bool   # opt-in (Concord only): train the base-vocab tokens that ACTUALLY appear in dataset captions via the packed per-token Concord path + the 'emb' dissipation servo, seeded from base.weight; default off = base vocab frozen. Distinct from added-token training (train_any_embedding()).
+    concord_caption_vocab_anchor: bool  # anchor caption-vocab rows in v_slow (deploy=init+gated delta). Default False: anchor=True zeroes alpha_v_fast/drift_cancel_C so the emb servo's coherence climb never engages -- caption tokens seeded from a live base row want the leak ON.
     concord_embedding_delay_epochs: float  # "divot": freeze packed embeddings for the first N epochs so the UNet digs its basin against the pristine anchors; tokens then release on a fresh warmup (cosine still ends at the horizon). Counters fast-variable slaving (measured: 1 epoch @ lr 1e-3 slewed tokens ~50 deg off init). Doubles as the auto-drive calibration window.
     concord_embedding_auto_drive: bool  # at divot release, normalize each token's rate by sighting count: drive_i = (median(n)/n_i)^freq_exponent (decade clamp), so per-epoch motion tracks D_i = ||coherent grad sum||/n_i -- the data's own per-appearance evidence. Converged-but-frequent tokens slow down because D is small (not boosted for a small total); rare-but-far tokens get a frequency boost. Drive scaling preserves per-token lambda (evap_frac is a fraction of the buffer). Requires delay_epochs > 0 for a calibration window.
     concord_embedding_freq_exponent: float  # beta in drive = (median(n)/n)^beta. Hierarchical tokens (style tokens containing object tokens) assign shared features BY frequency: the style rightfully wins shared content because it integrates it n_style/n_obj times faster; coherence keeps object content with the object. beta=1 flattens per-epoch rates -- attribution parity, shared features split by noise (style/object clobbering); beta=0 is raw dynamics (correct attribution, but hot tokens fry). beta=0.5 equalizes the NOISE motion across tokens (D_noise ~ 1/sqrt(n), so sqrt(n)*D_noise is constant) while justified motion keeps a sqrt(frequency) advantage -- styles still win shared features, fry suppressed.
@@ -1049,9 +1082,10 @@ class TrainConfig(BaseConfig):
         data.append(("concord_fused_matmul", True, bool, False))
         data.append(("concord_packed_embeddings", True, bool, False))
         data.append(("concord_bucket_contiguous", True, bool, False))
-        data.append(("concord_te_anchor", True, bool, False))
+        data.append(("concord_te_anchor", False, bool, False))
         data.append(("concord_te2_anchor", False, bool, False))
         data.append(("concord_te_wd_anchor", 0.5, float, False))
+        data.append(("concord_te_chase_alpha", 0.1, float, False))
         data.append(("concepts", None, list[ConceptConfig], True))
         data.append(("aspect_ratio_bucketing", True, bool, False))
         data.append(("latent_caching", True, bool, False))
@@ -1110,7 +1144,16 @@ class TrainConfig(BaseConfig):
         data.append(("resolution_aware_loss_weight", False, bool, False))
         data.append(("concord_epoch_cache_release", True, bool, False))
         data.append(("concord_sample_deploy", True, bool, False))
+        data.append(("concord_train_cond_embed", False, bool, False))
+        data.append(("concord_conv_full_vhat", False, bool, False))
+        data.append(("concord_servo_protected_boil", True, bool, False))
+        data.append(("concord_servo_waste_ceiling", 0.12, float, False))
+        data.append(("concord_evap_slack", 0.25, float, False))
+        data.append(("concord_m6a_meter", False, bool, False))
+        data.append(("concord_servo_protected_boil_ceiling", 0.60, float, False))
         data.append(("concord_embedding_anchor", True, bool, False))
+        data.append(("concord_train_caption_vocab", False, bool, False))
+        data.append(("concord_caption_vocab_anchor", False, bool, False))
         data.append(("concord_embedding_delay_epochs", 1.0, float, False))
         data.append(("concord_embedding_auto_drive", True, bool, False))
         data.append(("concord_embedding_freq_exponent", 0.5, float, False))

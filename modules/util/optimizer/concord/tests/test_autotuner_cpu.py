@@ -215,9 +215,9 @@ check("7c default table lam ceiling stable (< 2)",
 check("7d default table converts to finite kappa at SDXL lr",
       max(k / 7.5e-5 for _, k in tab) == 0.4 / 7.5e-5)
 check("7e watchdog armed by default", gd["autotune_reprobe_band"] == 0.02)
-check("7f subsumed knobs pruned from the panel (config-file only)",
-      not any(k in gd for k in
-              ("gf_consol", "ratio_coh", "autotune_beta1_on", "autotune_beta1_coh")))
+check("7f config-file-only knobs absent from the panel (gf_consol/ratio_coh; the "
+      "autotune_beta1 pair is now an INTENTIONAL panel entry -- optimizer_util.py:428)",
+      not any(k in gd for k in ("gf_consol", "ratio_coh")))
 check("7f2 lazy pair restored to the panel (orthogonal to build threshold)",
       gd["lazy_gate"] is False and gd["lazy_active_thresh"] == 0.0001)
 check("7g step cap / trust region exposed at winner values",
@@ -232,6 +232,7 @@ def snr_hook_rig(knee, base_committed, lr=7.5e-5, tuner=True, gf_consol=333.0):
         config=SimpleNamespace(autotune_gamma_snr=knee, gf_consol=gf_consol, lr=lr),
         autotuner=SimpleNamespace(committed=base_committed) if tuner else None,
         layers=[SimpleNamespace(_gf_consol_buf=torch.full((1,), -1.0)) for _ in range(3)],
+        te_layers=[], te_groups=[],          # per-group servo: on_timesteps modulates TE groups too
         _snr_mod_announced=True, _LAM_MOD_CAP=ConcordController._LAM_MOD_CAP,
         _current_fill_ramp=1.0)
     return rig
@@ -311,28 +312,33 @@ check("10b read returns accumulated value and resets",
       ppb.read_memgap("cpu") == 0.25 and float(buf[0]) == 0.0
       and ppb.read_memgap("cpu") == 0.0)
 buf += -0.5                          # s_fast anti-aligned with grad (typical)
-rig10 = SimpleNamespace(layers=[SimpleNamespace(packed_w=torch.zeros(1))])
+rig10 = SimpleNamespace(autotuner=None, layers=[SimpleNamespace(packed_w=torch.zeros(1))])
 gap = ConcordController.read_memorization_gap(rig10)
 check("10c controller flips sign: deploy reads HIGHER than live",
       gap == 0.5 and float(buf[0]) == 0.0)
 check("10d empty-layers path returns 0.0",
       ConcordController.read_memorization_gap(SimpleNamespace(layers=[])) == 0.0)
 
-# ---- 11. evap build threshold (hypothesis-infancy guard) --------------------
-def evap_with_build(lam, coh, d_fs, min_leak=0.1, build_min=128.0):
-    """Mirror of the kernel: evaporated amount on one element."""
-    frac = min(lam * (1.0 - coh), 1.0 - min_leak)
-    build_ok = 1.0 if abs(d_fs) >= build_min else 0.0
-    return frac * d_fs * build_ok
+# ---- 11. soft, size-proportional build gate (stochastic-rounding) -----------
+def soft_build_p(d_fs, build_min):
+    """P(drain) for the soft build gate; the kernel realizes it via the SR hash."""
+    return min(abs(d_fs) / (build_min + 1e-30), 1.0)
 
-check("11a sub-tick velocity is never dissipated (|u| < 128)",
-      evap_with_build(1.0, 0.0, 100.0) == 0.0
-      and evap_with_build(1.0, 0.0, -127.0) == 0.0)
-check("11b committable velocity dissipates normally (|u| >= 128)",
-      abs(evap_with_build(0.4, 0.0, 200.0) - 80.0) < 1e-9
-      and evap_with_build(1.0, 0.0, -130.0) == -130.0 * 0.9)
-check("11c build_min=0 is bit-exact legacy",
-      evap_with_build(0.4, 0.0, 1.0, build_min=0.0) == 0.4)
+def evap_expected(lam, coh, d_fs, min_leak=0.1, build_min=128.0):
+    """Expected evaporated amount on one element: the gate fires with prob soft_build_p."""
+    frac = min(lam * (1.0 - coh), 1.0 - min_leak)
+    return frac * d_fs * soft_build_p(d_fs, build_min)
+
+check("11a sub-LSB velocity drains IN PROPORTION to size (soft, not never)",
+      abs(soft_build_p(64.0, 128.0) - 0.5) < 1e-9
+      and abs(soft_build_p(100.0, 128.0) - 100.0 / 128.0) < 1e-9
+      and soft_build_p(0.0, 128.0) == 0.0)
+check("11b at/above the scale the probability saturates to 1 (== old above-threshold)",
+      soft_build_p(128.0, 128.0) == 1.0 and soft_build_p(200.0, 128.0) == 1.0
+      and abs(evap_expected(0.4, 0.0, 200.0) - 80.0) < 1e-9)
+check("11c build_min=0 -> p=1 everywhere (all-pass preserved exactly)",
+      soft_build_p(1.0, 0.0) == 1.0 and soft_build_p(1e-9, 0.0) == 1.0
+      and abs(evap_expected(0.4, 0.0, 1.0, build_min=0.0) - 0.4) < 1e-9)
 check("11d module default and setter",
       hasattr(ppb, "set_evap_build_min") and ppb._EVAP_BUILD_MIN == 128.0)
 cfg11 = make_concord_config(7.5e-5, SimpleNamespace(evap_build_min=64.0))
@@ -373,7 +379,7 @@ a, b, c = ppb.read_boil("cpu")
 check("13b energy decomposition and reset",
       a == 1.0 and b == 5.0 and c == 15.0 and float(bbuf.sum()) == 0.0)
 bbuf[0] += 1.0; bbuf[1] += 5.0; bbuf[2] += 15.0
-rig13 = SimpleNamespace(layers=[SimpleNamespace(packed_w=torch.zeros(1))])
+rig13 = SimpleNamespace(autotuner=None, layers=[SimpleNamespace(packed_w=torch.zeros(1))])
 boil13, waste13 = ConcordController.read_flow_audit(rig13)
 check("13c controller boil and waste fractions",
       abs(boil13 - 0.2) < 1e-12 and abs(waste13 - 0.25) < 1e-12)
@@ -392,6 +398,7 @@ def ew_rig(flag=True, av=0.001):
     return SimpleNamespace(
         config=SimpleNamespace(telescope_epoch_window=flag, alpha_v_fast=av),
         emb_cores=[], emb_delay_epochs=0.0, emb_delay_steps=0, steps_per_epoch=0.0,
+        te_layers=[], te_groups=[],          # per-group servo: apply_epoch_window telescopes winner TEs
         layers=[SimpleNamespace(alpha=0.1, alpha_v_fast=av, drift_cancel_C=0.0,
                                 mass_preserve_v=True) for _ in range(2)])
 
@@ -488,8 +495,10 @@ check("16d per-step pin is a no-op under anchor (no requant churn)",
 emb_l = ConcordPackedEmbedding(2, 16, device="cpu", lr=1e-3, target_norm=0.5)
 emb_l.init_tokens(init=init_vec.clone(), anchor=False)
 sf2, ss2, vs2 = unpack(emb_l.core.packed_w)
-check("16e legacy mode unchanged: position in s_slow",
-      int(ss2.abs().sum()) > 0 and int(vs2.abs().sum()) == 0)
+check("16e non-anchor uses the EVEN split (s_slow == v_slow, gap-zero, both populated)",
+      int(ss2.abs().sum()) > 0 and int(vs2.abs().sum()) > 0
+      and int((ss2 - vs2).abs().max()) <= 2,
+      f"|s_slow-v_slow|max={int((ss2 - vs2).abs().max())}")
 ppb.ConcordLinearPackedB._resync_weight_buf = _orig_resync
 ppb.materialize_packed_bf16 = _orig_mat
 

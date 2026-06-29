@@ -193,35 +193,35 @@ class ConcordPackedEmbedding(nn.Module):
     def init_tokens(self, init=None, scale=0.05, anchor=False):
         if init is None:
             init = torch.randn(self.K, self.dim, device=self.target.device) * scale
-        self.core.load_weights(init)                     # mantissa lands in s_fast
-        pw = self.core.packed_w
-        sf = (pw >> 16)
         if anchor:
-            # ANCHOR MODE: the init vector is FROZEN in v_slow (alpha_v = 0 ->
-            # the leak never moves it, C* = 0 exactly), and everything learned
-            # accumulates in s_slow as a friction-disciplined delta:
+            # ANCHOR MODE: the init vector is FROZEN in v_slow (alpha_v = 0 -> the leak
+            # never moves it, C* = 0 exactly), and everything learned accumulates in
+            # s_slow as a friction-disciplined delta:
             #     deploy = init (immutable) + gated-learned-delta
-            # The token can never drift off its founding semantics -- the
-            # fried-embedding mechanism is structurally impossible. The anchor
-            # also carries the norm, so the per-step norm pin (and its
-            # requantization churn) is skipped; we pin ONCE here so the init
-            # row lands at the vocab-median norm.
-            vs = (sf.float() / V_SLOW_FACTOR).round().clamp(-128, 127).to(torch.int32)
-            sf = (sf - vs * V_SLOW_FACTOR).clamp(INT16_MIN, INT16_MAX).to(torch.int32)
-            self.core.packed_w.copy_(((sf & 0xFFFF) << 16) | (vs & 0xFF))
-            self.core._resync_weight_buf()
+            # The token can never drift off its founding semantics. The anchor carries the
+            # norm, so the per-step pin (and its requant churn) is skipped; we pin ONCE here.
+            #
+            # load_weights_anchor puts the COARSE mantissa directly in v_slow (s_slow=0,
+            # fine residual in s_fast) -> deploy = (0 + v_slow)*128 ~= init. The drift
+            # d_sv = s_slow - v_slow = -coarse is large, but C* = 0 keeps the gate inert (a
+            # frozen anchor has no coherence by design), so the big gap does NOT ruin the
+            # gate; a creep-resume rebalances it via resplit_anchor_to_even before the leak
+            # is restored. The OLD path called load_weights then re-read (pw>>16) -- only the
+            # <=64 fine RESIDUAL after load_weights, NOT the mantissa -- so v_slow collapsed
+            # to ~0 and the anchor deployed ~0 (nonsense samples). Mirrors the Linear
+            # load_weights_anchor.
+            self.core.load_weights_anchor(init)
             self._pin_norm(torch.arange(self.K, device=self.target.device))
             self.core.alpha_v_fast = 0.0
             self.core.drift_cancel_C = 0.0               # C*(alpha_v=0) = 0 exactly
             self._anchored = True
             return
-        # legacy: position into s_slow so DEPLOY (s_slow+v_slow) is non-zero at
-        # init (else pinning the deploy norm divides by ~0); the leak telescopes
-        # it toward v_slow over the run. s_slow is the x128 coarse field.
-        ss = (sf.float() / S_SLOW_FACTOR).round().clamp(-128, 127).to(torch.int32)
-        sf = (sf - ss * S_SLOW_FACTOR).clamp(INT16_MIN, INT16_MAX).to(torch.int32)
-        self.core.packed_w.copy_(((sf & 0xFFFF) << 16) | ((ss & 0xFF) << 8))
-        self.core._resync_weight_buf()
+        # NON-anchor: load_weights packs the mantissa into the PROTECTED slow path with the
+        # EVEN split (s_slow == v_slow, gap-zero, d_sv ~= 0, alpha_v_fast>0 adaptive); deploy =
+        # (s_slow+v_slow)*128 ~= W from step 0 -- exactly the adaptive state non-anchor /
+        # caption-vocab tokens want. Then pin the norm. (The old in-place re-split here re-read
+        # the <=64 residual and collapsed deploy to ~0; deleted -- just use load_weights' state.)
+        self.core.load_weights(init)
         self._pin_norm(torch.arange(self.K, device=self.target.device))
 
     def deploy_weight(self):

@@ -458,6 +458,7 @@ def _apply_packed_sgd_kernel(
         # underestimated the true saturation risk by ~2x because v_slow
         # tracks s_slow tightly and contributes another ~equal mass.
         abs_eff = tl.abs(s_slow_c * 128 + s_fast_c + v_slow_c * 128)
+        abs_eff = tl.maximum(abs_eff, tl.abs(s_fast_c))   # D1: trip re-exponent on s_fast saturating alone (see adamw apply)
         abs_eff = tl.where(nk_mask, abs_eff, 0)
         tile_row_max = tl.max(abs_eff, axis=1)
         tile_col_max = tl.max(abs_eff, axis=0)
@@ -623,6 +624,25 @@ def apply_packed_sgd(packed_w, grad_W, weight_buf, row_exp, col_exp,
 # ============================================================
 
 @triton.jit
+def _lamb_scale_kernel(wnsq_ptr, snsq_ptr, lr_ptr, out_ptr, cap, inv_clip, clip):
+    """LAMB trust scale = clamp(cap*||W|| / (lr*||step||), inv_clip, clip), with ||W||,||step|| read
+    from the apply kernel's PREVIOUS-step atomic-add accumulators (one step stale); snsq==0 (step 0 /
+    empty) -> 1.0. Then ZERO both accumulators so this step's apply re-accumulates fresh. Launched
+    per-layer from the controller's before_step (host-side, eager, alloc-free) -- it's host-side
+    per-layer scalar maintenance feeding the captured apply (which reads out_ptr to brake), NOT captured
+    math. out_ptr/wnsq_ptr/snsq_ptr are the same static bufs the captured apply is handed."""
+    snsq = tl.load(snsq_ptr)
+    wnsq = tl.load(wnsq_ptr)
+    un = tl.load(lr_ptr) * tl.sqrt(snsq)
+    sc = cap * tl.sqrt(wnsq) / (un + 1e-20)
+    sc = tl.minimum(tl.maximum(sc, inv_clip), clip)
+    sc = tl.where(snsq > 0.0, sc, 1.0)            # step 0 / empty -> no brake
+    tl.store(out_ptr, sc)
+    tl.store(wnsq_ptr, 0.0)                       # zero so THIS step's captured apply atomic-adds fresh
+    tl.store(snsq_ptr, 0.0)
+
+
+@triton.jit
 def _apply_packed_adamw_kernel(
     packed_ptr,        # [N, K] int32, mutated in place
     grad_W_ptr,        # [N, K] bf16
@@ -635,11 +655,15 @@ def _apply_packed_adamw_kernel(
     v_col_ptr,         # [K] fp32 — Adafactor col second-moment EMA (g²)
     sum_v_inv_ptr,     # [1] fp32 — 1 / Σ_k v_row_k (precomputed by caller)
     coh_pre_ptr,       # [N,K] fp32 — per-coord established-coherence EMA
+    v_full_ptr,        # [N,K] fp32 — per-element 2nd-moment EMA (read only when USE_FULL_V; stub=packed_w off)
+    vhat_mean_ptr,     # *fp32[1] — device-computed mean(v_full)*v_bc, the coh-floor scale (USE_FULL_V; stub=sum_v_inv off)
     N, K,
     lr_ptr, mantissa_bias, alpha, beta1_ptr,
     weight_decay, eps_ptr, step_cap,
     lazy_thresh,          # fp32: τ for the lazy-update gate (a coord stays active iff s_fast_in_w² > τ·v̂)
     v_scale, precond_p, gf_consol_ptr, drift_cancel_C, alpha_v_fast,
+    coh_kappa,           # fp32: coherence knee for the cf = d_sv^2/v_hat residual discount (read when USE_COH_VHAT)
+    evap_slack,          # fp32: EVAP clamp -- kill gates on min(coh, coh_raw+evap_slack); 0 = legacy coh_raw kill
     wd_sv, wd_sf, wd_anchor,
     gf_trust_delta_sq,   # fp32: δ² in step = grad/√(Var + δ²·v̂);
                           # 0 disables (legacy: clamp by step_cap only)
@@ -658,15 +682,19 @@ def _apply_packed_adamw_kernel(
     memgap_ptr,          # *fp32[1]: memorization-gap accumulator -- per-tile atomic add of
                           # sum(grad * s_fast_in_W), the first-order (L_live - L_deploy).
                           # (Distinct from gap_inv_scale, the gap-FEEDBACK split below.)
-    boil_ptr,            # *fp32[3]: flow audit -- [0] += sum(killed_w^2 * coh),
-                          # [1] += sum(killed_w^2), [2] += sum(chase_w^2); killed_w /
-                          # chase_w in W units. boil = [0]/[1]; waste = [1]/([1]+[2]).
+    boil_ptr,            # *fp32[6]: flow audit -- [0] += sum(killed_w^2 * coh_raw),
+                          # [1] += sum(killed_w^2), [2] += sum(realized_carry_w^2) (the
+                          # LSB-quantized s_slow transfer), [3] += sum(killed_w^2 * coh) (cf-discounted).
+                          # boil = [0]/[1]; waste = [1]/([1]+[2]); boil_protected = [3]/[1].
     gap_inv_scale,       # fp32: 1/gap_scale for the conserved gap-feedback pass/evap split
     step_salt_ptr,
     consolidate_ptr,     # *int32[1]: gradient-accumulation gate. 1 = consolidate (full apply,
                           # today's behavior). 0 = tick-only: SR-tick s_fast from this micro-
                           # batch's grad, but FREEZE weight_buf + skip chase/leak/rebalance, so
                           # gradients accumulate in s_fast and weights stay frozen mid-cycle.
+    step_scale_ptr,      # *fp32[1]: LAMB per-layer trust cap multiplying delta_grad (1.0 = off)
+    wnorm_sq_ptr,        # *fp32[1]: LAMB ‖W_deploy‖² accumulator (atomic-add per tile when on)
+    stepnorm_sq_ptr,     # *fp32[1]: LAMB ‖step‖² accumulator (atomic-add per tile when on)
     stride_pn, stride_pk,
     stride_gn, stride_gk,
     stride_wn, stride_wk,
@@ -678,11 +706,19 @@ def _apply_packed_adamw_kernel(
     USE_GF_CONSOLIDATION: tl.constexpr,  # True → gf-gated evaporation routing
     USE_COHPRE: tl.constexpr,  # True → coh_pre-gated acceptance (chase)
     USE_FIXED_COH: tl.constexpr,  # True → Wiener coh = S/(S+noise²) (units-correct)
+    USE_COH_VHAT: tl.constexpr,  # True -> discount Wiener residual N^2 by coh_kappa/(cf+coh_kappa), cf=d_sv^2/v_hat
     USE_RATIO_COH: tl.constexpr,  # True -> gate chase+leak by live coh, no coh_pre
     USE_GAP_FEEDBACK: tl.constexpr,  # True -> conserved gap-magnitude pass/evap split (strips floor)
     USE_LAZY_GATE: tl.constexpr,  # True -> freeze gf_consol evap + leak on idle coords (no accumulated signal)
     USE_GRAD_ACTIVITY: tl.constexpr,  # True -> activity = gradient PRESENT this launch (sighting-clocked
                           # dissipation for embedding rows; overrides the lazy buffer-vs-v_hat test)
+    WRITE_BOIL: tl.constexpr,  # True -> emit the device-shared flow audit (boil/waste). False for
+                          # coh-degenerate layers (anchored TE: drift_cancel_C=0 -> coh≡0): their
+                          # kills land only in the denominator [1] (dragging boil->0) and their chase
+                          # pollutes [2] (pinning waste->0) on the per-device buffer read as the UNet's.
+    WRITE_LAMB_NORMS: tl.constexpr,  # True -> atomic-add ‖W_deploy‖² + ‖step‖² for the LAMB trust
+                          # ratio (one step stale; host computes the scale next step). False -> skip.
+    USE_FULL_V: tl.constexpr,  # True -> per-element v_hat from v_full_ptr (Conv); False (default) -> rank-1 (bit-exact)
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -690,6 +726,14 @@ def _apply_packed_adamw_kernel(
     # lr is read from a device tensor so it can change between
     # CUDA-graph replays without re-capturing the graph.
     lr = tl.load(lr_ptr).to(tl.float32)
+    # LAMB per-layer trust cap (1.0 = bit-exact no-op), loaded HERE -- above the dissipation block --
+    # so it acts as a TRUE per-layer LR: lr_eff = lr*step_scale multiplies EVERY lr-proportional term
+    # (gradient tick, evaporation, weight-decays), not just the tick. This preserves the lr-cancellation
+    # (dimensionless lambda = lr*gf_consol) PER LAYER; without it a braked layer (step_scale<1) keeps
+    # unbraked dissipation -> lambda_eff = lambda/step_scale -> over-dissipation/washout on exactly the
+    # small-norm convs LAMB targets. step_scale ALSO multiplies the (non-lr) momentum term below, by design.
+    step_scale = tl.load(step_scale_ptr)
+    lr_eff = lr * step_scale
     # eps likewise read from a device tensor — lets an eps warmup
     # schedule update it between graph replays (e.g. SGD->precond handoff).
     eps = tl.load(eps_ptr).to(tl.float32)
@@ -759,13 +803,23 @@ def _apply_packed_adamw_kernel(
     # v̂ (Adafactor rank-1, W² units) feeds both the trust region and the
     # consolidation-coherence gate, so load it if either is active.
     coh = 0.0
+    coh_raw = 0.0   # default mirror of coh: coh_raw is otherwise only assigned inside the coherence
+                    # block below, but the beta1 gate (:991) reads it -> needs a fallback when skipped
     if (USE_GF_TRUST_REGION or USE_GF_CONSOLIDATION) or (USE_COHPRE or USE_RATIO_COH) or USE_LAZY_GATE:
-        v_row_tile = tl.load(v_row_ptr + offs_n,
-                              mask=n_mask, other=0.0).to(tl.float32)
-        v_col_tile = tl.load(v_col_ptr + offs_k,
-                              mask=k_mask, other=0.0).to(tl.float32)
-        sum_v_inv = tl.load(sum_v_inv_ptr).to(tl.float32)
-        v_hat = v_row_tile[:, None] * v_col_tile[None, :] * sum_v_inv
+        if USE_FULL_V:
+            # Per-element 2nd moment (Conv): load v_full[N,K] directly (row-major [N,K],
+            # same layout/strides as weight_buf) instead of the rank-1 outer product.
+            v_full_off = offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+            v_hat = tl.load(v_full_ptr + v_full_off,
+                            mask=n_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
+            sum_v_inv = tl.load(sum_v_inv_ptr).to(tl.float32)   # kept for the (compiled-out) else floor
+        else:
+            v_row_tile = tl.load(v_row_ptr + offs_n,
+                                  mask=n_mask, other=0.0).to(tl.float32)
+            v_col_tile = tl.load(v_col_ptr + offs_k,
+                                  mask=k_mask, other=0.0).to(tl.float32)
+            sum_v_inv = tl.load(sum_v_inv_ptr).to(tl.float32)
+            v_hat = v_row_tile[:, None] * v_col_tile[None, :] * sum_v_inv
         v_hat = v_hat * tl.load(v_bc_ptr).to(tl.float32)   # (1) Adam bias-correction 1/(1-b2^t)
     if USE_GF_TRUST_REGION:
         v_proxy = v_proxy + gf_trust_delta_sq * v_hat
@@ -783,11 +837,34 @@ def _apply_packed_adamw_kernel(
             # gradient-SNR (vs the broken α_v·d_sv vs E[g²] units mismatch).
             sig_w = drift_cancel_C * d_sv * scale_fwd
             sig2 = sig_w * sig_w
-            coh = sig2 / (sig2 + noise_in_w * noise_in_w + 1e-30)
+            coh_n2 = noise_in_w * noise_in_w
+            coh_raw = sig2 / (sig2 + coh_n2 + 1e-30)   # UN-discounted coh -> the DISSIPATION (evap + boil)
+            if USE_COH_VHAT:                            # reads this, so the cf-discount can NEVER zero friction
+                # Discount the residual by the COHERENT FRACTION of the admission, not raw energy:
+                # cf = d_sv_W^2 / v_hat = sig2/(C^2 v_hat) -- of all the gradient energy this coord
+                # spent, how much became NET established drift vs cancelled as scatter (1-cf is the
+                # normalized admission variance). HIGH cf = real diversity around a concept -> discount
+                # its residual, protect it; LOW cf = noise -> leave raw coh, let it die. v_hat (energy)
+                # ALONE is anti-predictive (loves loud noise); cf is what separates signal from noise.
+                # Floor v_hat at 3% of the layer-mean v_hat (= 1/(sum_v_inv*N*K), free in-kernel since
+                # sum(v_hat)=1/sum_v_inv) so an idle coord whose v_hat has decayed toward 0 can't run
+                # cf -> inf (the lock-in / runaway hole). Caps the protection ceiling; cf still decays on
+                # the v_hat beta2 window for active coords.
+                if USE_FULL_V:
+                    # Layer-mean floor for the per-element path (device-precomputed mean(v_full)*v_bc;
+                    # the rank-1 identity sum(v_hat)=1/sum_v_inv does not hold for full v_hat).
+                    vhat_fl = tl.maximum(v_hat, 0.03 * tl.load(vhat_mean_ptr).to(tl.float32))
+                else:
+                    vhat_fl = tl.maximum(v_hat, 0.03 / (sum_v_inv * N * K))
+                cf = sig2 / (drift_cancel_C * drift_cancel_C * vhat_fl + 1e-30)
+                coh_n2 = coh_n2 * coh_kappa / (cf + coh_kappa)
+            coh = sig2 / (sig2 + coh_n2 + 1e-30)
         else:
             mean_grad_w = alpha_v_fast * d_sv * scale_fwd
             coh = mean_grad_w * mean_grad_w / (v_hat + 1e-12)
+            coh_raw = coh                                   # legacy path: dissipation tracks the legacy coh
         coh = tl.minimum(tl.maximum(coh, 0.0), 1.0)
+        coh_raw = tl.minimum(tl.maximum(coh_raw, 0.0), 1.0)
         if USE_GAP_FEEDBACK:
             # Conserved pass<->evaporate split, gated by the GAP MAGNITUDE |d_sv|:
             # pass fraction c = min(1, coh + exp(-|d_sv|*gap_inv_scale)). Large gap ->
@@ -812,6 +889,13 @@ def _apply_packed_adamw_kernel(
     denom_p = tl.exp2(precond_p * tl.log2(v_proxy + eps))
     step_live = grad_W / denom_p
     step_live = tl.minimum(tl.maximum(step_live, -step_cap), step_cap)
+    if WRITE_LAMB_NORMS:
+        # LAMB trust-ratio norms, reduced HERE and consumed next step (one step stale). step_live is
+        # the raw preconditioned+clamped step (pre-WD/scale = the old eager `step`); the deploy
+        # weight drops s_fast. Atomic-add per tile like memgap; masked lanes load 0 -> contribute 0.
+        w_deploy = (s_slow_full + v_slow_full).to(tl.float32) * scale_fwd
+        tl.atomic_add(wnorm_sq_ptr, tl.sum(w_deploy * w_deploy))
+        tl.atomic_add(stepnorm_sq_ptr, tl.sum(step_live * step_live))
     # Cautious weight decay: decay s_fast (the velocity) toward 0,
     # equivalently decay the live weight W toward (s_slow + v_slow)·
     # scale_fwd (the persistent "slow position"), NOT toward 0. The
@@ -869,36 +953,76 @@ def _apply_packed_adamw_kernel(
         # point lam = 1 it keeps the meter fed, and it also removes the lam > 1
         # sign-flip ringing and the lam = 2 hard instability (the survival
         # factor stays in [min_leak, 1]).
-        evap_frac = tl.minimum(lr * gf_consol * (1.0 - coh), 1.0 - min_leak)
+        # EVAP-coherence: clamp the cf-discounted coh to at most coh_raw + evap_slack so the KILL aligns
+        # with the protection definition (deflates boil_cf -- stops shredding cf-coherent mass), while the
+        # FIXED +slack cap keeps the noise floor f=lam*(1-coh_raw-slack) cf-INDEPENDENT (spurious-cf noise
+        # still dies, and genuine coherence still locks as coh_raw->1). coh>=coh_raw always, and coh==coh_raw
+        # when USE_COH_VHAT is off, so evap_slack=0 is bit-identical to the legacy coh_raw kill.
+        coh_evap = tl.minimum(coh, coh_raw + evap_slack)
+        evap_frac = tl.minimum(lr_eff * gf_consol * (1.0 - coh_evap), 1.0 - min_leak)   # dissipation = lambda*(1 - clamped coh)
         # Hypothesis-infancy guard: no dissipation below the first committable
         # size (one s_slow LSB). Sub-tick mass is invisible at deploy, so
         # friction there only kills nascent hypotheses the meter cannot yet
         # judge. evap_build_min = 0 -> all pass (bit-exact legacy).
-        build_ok = (tl.abs(d_fs) >= evap_build_min).to(tl.float32)
+        # Soft, size-proportional build gate (stochastic-rounding flavour, like the chase SR
+        # below): instead of the hard |d_fs| >= evap_build_min cliff, RESOLVE a sub-LSB velocity
+        # with probability |d_fs|/evap_build_min, so it drains in proportion to size (rate ~ size,
+        # unbiased) and never consolidates unfiltered -- extending the Wiener filter into the
+        # sub-LSB band. At/above evap_build_min the probability saturates to 1 (== the old gate);
+        # evap_build_min=0 -> p=1 everywhere (the |d_fs|>=0 all-pass case is preserved exactly).
+        # The chase already SR-transfers sub-LSB velocity; this is the matching stochastic DRAIN.
+        p_build = tl.minimum(tl.abs(d_fs) / (evap_build_min + 1e-30), 1.0)
+        r_build = _hash_uniform(s_fast, (offs_n[:, None] << 16) ^ offs_k[None, :],
+                                step_salt ^ 0x42424242)
+        build_ok = (r_build < p_build).to(tl.float32)
         evap_mantissa = evap_frac * d_fs * g_active * build_ok
-        # boil meter: energy decomposition of the realized kill (W units)
-        killed_w = evap_mantissa * scale_fwd
+        # boil meter: energy decomposition of the REALIZED kill (W units). The kill is
+        # only realized on the consolidate step -- the weight update below gates evap by
+        # consf (delta_t += consf*(... - evap_mantissa)) -- so the meter MUST carry consf
+        # too, exactly like the chase meter (chase_mantissa *= consf). Without it the
+        # denominator [1] sums phantom kills on every accumulation micro-step (consf=0),
+        # where s_fast is mid-refill so coh~0 and killed^2 is large: [0]/[1] gets dragged
+        # to ~0 and swings wildly step-to-step, and waste's kill numerator is over-counted
+        # against the (consf-gated) chase. consf in {0.0, 1.0} -> bit-exact on consolidate
+        # steps and a no-op when grad-accumulation is off.
+        killed_w = evap_mantissa * consf * scale_fwd
         killed_sq = killed_w * killed_w
-        tl.atomic_add(boil_ptr, tl.sum(killed_sq * coh))
-        tl.atomic_add(boil_ptr + 1, tl.sum(killed_sq))
+        if WRITE_BOIL:
+            tl.atomic_add(boil_ptr, tl.sum(killed_sq * coh_raw))   # boil = drift-aligned frac of the (raw-gated) kill
+            tl.atomic_add(boil_ptr + 1, tl.sum(killed_sq))
+            tl.atomic_add(boil_ptr + 3, tl.sum(killed_sq * coh_evap))   # protected boil meter, weighted by coh_evap (= min(coh, coh_raw+evap_slack), the SAME clamped coh the kill used) -- 2026-06-29 fixed the meter/actuator mismatch; un-clamped `coh` over-stated boil_cf on high-drift coords
+            # M6a DIVERSITY meter (2026-06-29, LOG-ONLY, bit-irrelevant to the weight update). [4] = killed
+            # COHERENT mass in the hypothesis-INFANCY band (|s_fast| < evap_build_min: coherent cross-example
+            # evidence still BUILDING, not yet consolidated); [5] = consolidated s_slow energy. M6a = [4]/[5]
+            # RISES when a climbing kappa evaporates coherent-building evidence before it admits across examples
+            # (CPU-MNIST validated: steepens ~3x at the over-dissipation turn-over, where memgap/waste are blind).
+            band_inf = (tl.abs(d_fs) < evap_build_min).to(tl.float32)
+            s_slow_w = s_slow_full.to(tl.float32) * scale_fwd
+            tl.atomic_add(boil_ptr + 4, tl.sum(killed_sq * coh_raw * band_inf))
+            tl.atomic_add(boil_ptr + 5, tl.sum(s_slow_w * s_slow_w))
     else:
         step_live = step_live + weight_decay * s_fast_in_w
         evap_mantissa = 0.0
-    delta_grad = -lr * step_live * scale_inv     # mantissa units
+    delta_grad = -lr_eff * step_live * scale_inv     # mantissa units (lr_eff = lr*step_scale, loaded above)
     # FAST-ACCUMULATOR MOMENTUM (beta1), COHERENCE-GATED: the velocity here is
     # d_fs = s_fast; a heavy-ball term reinforces s_fast by beta1*velocity, applied BACK
     # to s_fast (NOT carried to s_slow = the slow-momentum chase). UNGATED this amplifies
     # the NOISE in the velocity and diverges (s_fast is part of the live weight, so it's
     # a non-mass-preserving acceleration that feeds back through the preconditioner). So
-    # gate by coh = Wiener S/(S+N): reinforce only the COHERENT fraction, beta1*coh*d_fs
-    # -- equivalently the noise fraction (1-coh)*beta1*d_fs is evaporated/cancelled, so
+    # gate by coh_raw = the UN-cf'd Wiener S/(S+N): reinforce only the COHERENT fraction, beta1*coh_raw*d_fs
+    # -- equivalently the noise fraction (1-coh_raw)*beta1*d_fs is evaporated/cancelled, so
     # the momentum can't run away on noise. Coherent coords accelerate; incoherent ones
     # don't. (coh init 0 -> 0 momentum without a gate.) The grad it accumulates is
     # already RMS-normalized by sqrt(v_hat) (v-hat AdamW).
     # delta_grad (the gradient tick) ALWAYS applies -> accumulates in s_fast.
     # The consolidation terms (momentum reinforcement + evaporation) only fire
     # on the consolidate step (consf=1); gated to 0 during accumulation.
-    delta_t = delta_grad + consf * (beta1 * coh * d_fs - evap_mantissa)
+    # cf-modulation guard (2026-06-22): gate on coh_raw, NOT the cf-discounted coh. USE_COH_VHAT
+    # shrinks the noise term to protect the chase residual, so coh -> 1 exactly on high-drift
+    # (memorizing) coords; feeding that into this non-mass-preserving reinforcement broke the
+    # noise-cancellation above and diverged (deploy-weight runaway -> NaN at the servo's first
+    # beta1-on boundary, the half-epoch baseline). Evap (:938) gates on coh_raw for the same reason.
+    delta_t = delta_grad + consf * (beta1 * coh_raw * d_fs * step_scale - evap_mantissa)
 
     # ── SR-tick s_fast ────────────────────────────────────────
     pos_hash = (offs_n[:, None] << 16) ^ offs_k[None, :]
@@ -929,18 +1053,32 @@ def _apply_packed_adamw_kernel(
             coh_pre = tl.load(coh_pre_ptr + p_off,
                               mask=nk_mask, other=1.0).to(tl.float32)
             gate = coh + coh_pre * (1.0 - coh)
-            coh_pre_new = (1.0 - alpha_v_fast) * coh_pre + alpha_v_fast * coh
+            # EMA only on the consolidate step: established-coherence memory must advance
+            # once per OPTIMIZER step, matching its rate alpha_v_fast = 1/(2*steps_per_epoch)
+            # which is defined in UPDATE steps. Ungated it EMAs N times per step toward the
+            # within-window coh (which sags as s_fast refills with raw gradient between
+            # consolidations), so coh_pre decays ~N x too fast and reads low -> the chase
+            # gate coh+coh_pre*(1-coh) under-accepts at consolidation. consf in {0.0,1.0}:
+            # bit-exact at accum=1, frozen on accumulation micro-steps.
+            coh_pre_ema = (1.0 - alpha_v_fast) * coh_pre + alpha_v_fast * coh
+            coh_pre_new = coh_pre + consf * (coh_pre_ema - coh_pre)
             tl.store(coh_pre_ptr + p_off, coh_pre_new, mask=nk_mask)
         # consf gate: 0 during accumulation -> no chase (s_fast keeps accumulating).
         chase_mantissa = alpha * gate * gate_gain * s_fast.to(tl.float32) * consf
-        # flow audit: consolidated-energy counterpart of the kill meter above
-        chase_w = chase_mantissa * scale_fwd
-        tl.atomic_add(boil_ptr + 2, tl.sum(chase_w * chase_w))
         chase_int8_f = chase_mantissa / 128.0
         r2 = _hash_uniform(s_fast, pos_hash, step_salt ^ 0x5A5A5A5A)
         floor_s = tl.floor(chase_int8_f)
         frac_s = chase_int8_f - floor_s
         tick_slow_i8 = (floor_s + (r2 < frac_s).to(tl.float32)).to(tl.int32)
+        # flow audit: consolidated-energy counterpart of the kill meter. Count the REALIZED
+        # carry (tick_slow_i8 * 128 = the ACTUAL transfer to s_slow), NOT the sub-LSB intended
+        # chase_mantissa: consolidation is quantized to one s_slow LSB (128 mantissa), so the
+        # smooth chase_mantissa (typically << 128) undercounts the realized transfer energy by
+        # ~128/chase_mantissa -- which made `waste` read ~1 once the sub-LSB drain (soft build
+        # gate) started firing. The kill is mantissa-resolution, so it needs no such correction.
+        if WRITE_BOIL:
+            realized_chase_w = (tick_slow_i8.to(tl.float32) * 128.0) * scale_fwd
+            tl.atomic_add(boil_ptr + 2, tl.sum(realized_chase_w * realized_chase_w))
         s_slow_i8 = s_slow_i8 + tick_slow_i8
         s_fast = s_fast - tick_slow_i8 * 128
 
@@ -966,7 +1104,7 @@ def _apply_packed_adamw_kernel(
         v_slow_full_post = new_v_int8 * 128
         # wd_sv: pull s_slow_i8 toward v_slow_full_post (at int8 scale).
         d_sv_full_post = (s_slow_i8 * 128 - v_slow_full_post).to(tl.float32)
-        wd_sv_delta_int8 = lr * wd_sv * d_sv_full_post / 128.0 * consf
+        wd_sv_delta_int8 = lr_eff * wd_sv * d_sv_full_post / 128.0 * consf
         r4 = _hash_uniform(s_fast, pos_hash, step_salt ^ 0x66665555)
         floor_wd_sv = tl.floor(wd_sv_delta_int8)
         frac_wd_sv = wd_sv_delta_int8 - floor_wd_sv
@@ -977,7 +1115,7 @@ def _apply_packed_adamw_kernel(
         # v_slow_full_post. Tick goes to s_fast (mantissa units).
         s_fast_logical_post = s_slow_i8 * 128 + s_fast
         d_sf_full_post = (s_fast_logical_post - v_slow_full_post).to(tl.float32)
-        wd_sf_delta = lr * wd_sf * d_sf_full_post * consf
+        wd_sf_delta = lr_eff * wd_sf * d_sf_full_post * consf
         r5 = _hash_uniform(s_fast, pos_hash, step_salt ^ 0x77770000)
         floor_wd_sf = tl.floor(wd_sf_delta)
         frac_wd_sf = wd_sf_delta - floor_wd_sf
@@ -992,12 +1130,12 @@ def _apply_packed_adamw_kernel(
         # half of a mass-preserved (s_slow+v_slow) position — drags the weight to
         # ~2*anchor. wd_anchor shrinks only the delta. consf-gated; wd_anchor=0
         # (default) floors both ticks to 0 -> bit-exact no-op for every existing run.
-        anc_s8 = lr * wd_anchor * s_slow_i8.to(tl.float32) * consf
+        anc_s8 = lr_eff * wd_anchor * s_slow_i8.to(tl.float32) * consf
         r6 = _hash_uniform(s_fast, pos_hash, step_salt ^ 0x13571357)
         floor_a8 = tl.floor(anc_s8)
         tick_a8 = (floor_a8 + (r6 < (anc_s8 - floor_a8)).to(tl.float32)).to(tl.int32)
         s_slow_i8 = s_slow_i8 - tick_a8
-        anc_sf = lr * wd_anchor * s_fast.to(tl.float32) * consf
+        anc_sf = lr_eff * wd_anchor * s_fast.to(tl.float32) * consf
         r7 = _hash_uniform(s_fast, pos_hash, step_salt ^ 0x2468ACE1)
         floor_af = tl.floor(anc_sf)
         tick_af = (floor_af + (r7 < (anc_sf - floor_af)).to(tl.float32)).to(tl.int32)
@@ -1033,6 +1171,17 @@ def _apply_packed_adamw_kernel(
         # by ~2x (v_slow tracks s_slow tightly via the leak, so the two
         # contribute roughly equal magnitudes).
         abs_eff = tl.abs(s_slow_c * 128 + s_fast_c + new_v_int8 * 128)
+        # D1 fix: also trip the re-exponent on the FINE accumulator saturating ALONE.
+        # s_fast is int16-clamped at ±32767 with no re-exponent (line 1029); when
+        # s_slow/v_slow carry opposite-sign mass the full mantissa above can sit far
+        # below MAX_M while |s_fast| pins at the ceiling (e.g. s_fast=32767,
+        # s_slow=v_slow=-127 -> full=255), so the cancelled-sum trigger is structurally
+        # blind to it. max-ing in |s_fast| makes the ratchet renormalize (SR-right-shift
+        # halves s_fast, bumps the exponent) BEFORE it clamps -- value-preserving, and a
+        # no-op in the live regime (|full| >> |s_fast|). Only bites under high-LR /
+        # large-step_cap / strong fast-vs-slow cancellation -- the regime a Muon-style
+        # orthogonalized step would push toward.
+        abs_eff = tl.maximum(abs_eff, tl.abs(s_fast_c))
         abs_eff = tl.where(nk_mask, abs_eff, 0)
         tile_row_max = tl.max(abs_eff, axis=1)
         tile_col_max = tl.max(abs_eff, axis=0)
@@ -1135,6 +1284,38 @@ def _denom_diagnostic(packed_w, grad_W, row_exp, col_exp,
 # broken S/v̂ that reads ~0). Module-global so it bakes into the kernel constexpr
 # without threading through the 30-arg autograd Function. Set once before training.
 _USE_FIXED_COH = True   # validated default: Wiener coh S/(S+noise^2). False=legacy(broken units)
+# cf-modulated coherence (2026-06-21): discount the Wiener residual N^2 by the COHERENT FRACTION of the
+# admission -- cf = d_sv_W^2/v_hat = (established-drift energy)/(gradient energy) = how much of the
+# gradient energy this coord spent became NET established drift vs cancelled as scatter. (1-cf is the
+# normalized variance of what's been admitted to s_slow.) v_hat (raw energy) ALONE is anti-predictive --
+# it's high for loud noise too; cf is what separates diverse signal from noise (validated AUC 0.96 vs
+# v_hat's 0.15). discount = kappa/(cf+kappa): high cf -> small discount -> residual protected; low cf ->
+# ~1 -> raw coh -> killed. cf is dimensionless (~bounded by the timescale ratio), so the knee kappa is a
+# fixed dimensionless number (~1), NOT a per-layer geomean -- no host reduction, no buffer.
+_USE_COH_VHAT = False    # bake-on flag: discount the coh residual by kappa/(cf+kappa), cf=d_sv^2/v_hat
+_COH_KAPPA = 1.0         # dimensionless coherence knee (cf threshold); baked at launch. Nudge to tune.
+def set_coh_vhat(on):
+    """Enable/disable cf-modulated coherence (discount the residual by the coherent fraction
+    cf = d_sv^2/v_hat). Protects the residual of coords whose admission is coherent (real diversity);
+    leaves noise at raw coh. The knee is set_coh_kappa()."""
+    global _USE_COH_VHAT
+    _USE_COH_VHAT = bool(on)
+    if _USE_COH_VHAT:
+        print(f"[concord] coh cf-modulation ON (discount = kappa/(cf+kappa), cf=d_sv^2/v_hat, "
+              f"kappa={_COH_KAPPA:g}): coherent-admission residual protected, noise still killed", flush=True)
+def set_coh_kappa(k):
+    """Coherence knee: discount = kappa/(cf+kappa). Larger -> only the most coherent coords are
+    protected; smaller -> protect more. cf is dimensionless (~O(timescale ratio)); ~1 is the default."""
+    global _COH_KAPPA
+    _COH_KAPPA = float(k)
+_EVAP_SLACK = 0.0        # EVAP clamp slack: kill uses min(coh, coh_raw + slack); 0 = legacy coh_raw kill. Baked at launch.
+def set_evap_slack(s):
+    """EVAP-coherence clamp slack: the kill gates on min(coh, coh_raw + slack) instead of coh_raw, so it
+    stops shredding cf-coherent mass (deflates boil_cf) while the FIXED +slack cap keeps a cf-INDEPENDENT
+    noise floor (spurious-cf noise still dies, genuine coherence still locks as coh_raw->1). 0 = legacy;
+    ~0.25 is the recommended ship value. Mirrors set_coh_kappa (module global -> baked at launch)."""
+    global _EVAP_SLACK
+    _EVAP_SLACK = float(s)
 # Scalar cosine schedule on the commitment gate (1.0 = off). Set per-step.
 # Servo min-leak floor (module global, set_min_leak): minimum per-step survival
 # fraction of the accumulated fast velocity under the gf evaporation. At
@@ -1169,6 +1350,84 @@ def set_min_leak(v):
     _MIN_LEAK = float(v)
 
 
+# ── LAMB-style per-layer trust ratio (opt-in; CUDA-GRAPH SAFE) ──
+# Diagnosed failure mode: the preconditioned step is ~constant in ABSOLUTE size, so
+# the per-step RELATIVE move ‖update‖/‖W‖ is largest for the smallest-norm weights
+# (the 128² texture convs) -- and nothing in the coherence gate or the servo is keyed
+# to relative step size, so those layers overcook first (bounded-norm fried output).
+# Genuine (two-sided) LAMB: NORMALIZE every layer's gradient tick (delta_grad) so its
+# per-step relative deploy move equals a common TARGET _LAMB_CAP -- brake the over-
+# steppers AND boost the under-movers -- clamped to [1/_LAMB_CLIP, _LAMB_CLIP] for safety:
+#     step_scale = clamp(_LAMB_CAP * ‖W_deploy‖ / ‖lr*step‖, 1/_LAMB_CLIP, _LAMB_CLIP)
+# Scales ONLY the gradient tick (+ its momentum term); dissipation + weight-decay are
+# untouched. _LAMB_CAP is the TARGET relative move (LAMB's eta role) -- set it ~ the native
+# median per-step move (≈ lr/rms(W)); the clamp bounds any miscalibration to ±_LAMB_CLIP.
+# The scale is recomputed every step with DEVICE-side ops only (lr/eps stay tensors -- no
+# float()/.item() sync) and written in place into a STATIC per-layer buffer, so it captures
+# cleanly inside the CUDA graph. The two norms it needs (‖W_deploy‖, ‖step‖) are REDUCED INSIDE
+# the apply kernel (atomic-add per tile, like memgap) rather than recomputed in eager PyTorch --
+# the eager recompute materialized ~5 full [N,K] temporaries + two transcendentals per layer per
+# step (~+50% step time). The scale is computed device-side from the PREVIOUS step's reductions
+# (one step stale -- a trust ratio is a slow per-layer controller, so the lag is negligible) and
+# applied this step. step-0 / norms-empty -> scale 1.0 (no-op).
+_LAMB_TRUST = False
+_LAMB_CAP = 0.0025          # TARGET per-step relative deploy move ‖update‖/‖W‖ (LAMB's eta role)
+_LAMB_CLIP = 4.0            # max per-layer scaling factor; step_scale in [1/clip, clip]
+_LAMB_SCALE_CACHE = {}      # id(packed_w) -> static per-layer [1] step-scale buffer (init 1.0)
+_LAMB_WNORM_SQ_CACHE = {}   # id(packed_w) -> static [1] ‖W_deploy‖² accumulator (kernel atomic-add)
+_LAMB_STEPNORM_SQ_CACHE = {}  # id(packed_w) -> static [1] ‖step‖² accumulator (kernel atomic-add)
+
+
+def set_lamb_trust(on, cap=None, clip=None):
+    global _LAMB_TRUST, _LAMB_CAP, _LAMB_CLIP
+    _LAMB_TRUST = bool(on)
+    if cap is not None:
+        _LAMB_CAP = float(cap)
+    if clip is not None:
+        _LAMB_CLIP = max(1.0, float(clip))   # >=1 so the clamp [1/clip, clip] stays ordered
+    if _LAMB_TRUST:
+        print(f"[concord] LAMB trust ratio ON (target={_LAMB_CAP}, clip={_LAMB_CLIP}) -- "
+              f"two-sided per-layer relative-step normalization, CUDA-graph safe", flush=True)
+
+
+def _lamb_scale_buf(packed_w):
+    """Static per-layer [1] fp32 step-scale buffer (the kernel multiplies delta_grad by it).
+    Lazily created at 1.0 -- the OFF / first-step value -- during eager warmup, then reused as
+    a STATIC tensor so both the in-place update and the kernel read capture cleanly under the
+    CUDA graph. Keyed by id(packed_w) (stable within a process; the graph is re-captured per
+    process, so the cache is process-scoped)."""
+    key = id(packed_w)
+    buf = _LAMB_SCALE_CACHE.get(key)
+    if buf is None:
+        buf = torch.ones(1, dtype=torch.float32, device=packed_w.device)
+        _LAMB_SCALE_CACHE[key] = buf
+    return buf
+
+
+def _lamb_wnorm_sq_buf(packed_w):
+    """Static per-layer [1] fp32 ‖W_deploy‖² accumulator. The apply kernel atomic-adds each tile's
+    Σ W_deploy² (deploy = (s_slow+v_slow)·128·2^exp, drops s_fast); the host reads sqrt() for the
+    trust ratio and zeros it before the next step. 0.0 = first-step / off."""
+    key = id(packed_w)
+    buf = _LAMB_WNORM_SQ_CACHE.get(key)
+    if buf is None:
+        buf = torch.zeros(1, dtype=torch.float32, device=packed_w.device)
+        _LAMB_WNORM_SQ_CACHE[key] = buf
+    return buf
+
+
+def _lamb_stepnorm_sq_buf(packed_w):
+    """Static per-layer [1] fp32 ‖step‖² accumulator. The apply kernel atomic-adds each tile's
+    Σ step_live² (the raw preconditioned+clamped step, pre-WD/scale -- the old eager `step`);
+    ‖lr*step‖ = lr·sqrt(this). Zeroed by the host each step. 0.0 = first-step / off."""
+    key = id(packed_w)
+    buf = _LAMB_STEPNORM_SQ_CACHE.get(key)
+    if buf is None:
+        buf = torch.zeros(1, dtype=torch.float32, device=packed_w.device)
+        _LAMB_STEPNORM_SQ_CACHE[key] = buf
+    return buf
+
+
 # Memorization-gap meter: per-device fp32[1] accumulator for the inner product
 # sum(grad * s_fast_in_W) over every packed layer's update. grad is dL/dW at the
 # LIVE weights and the live weight differs from the DEPLOY weight by exactly
@@ -1184,7 +1443,9 @@ _MEMGAP_BUFS = {}
 
 # Boil/waste meter: per-device fp32[3] accumulator auditing the dissipation's
 # flows. [0] = killed-energy aligned with the drift, [1] = killed energy,
-# [2] = chase-consolidated energy (the expectation flow alpha*gate*s_fast).
+# [2] = chase-consolidated energy: the REALIZED s_slow carry (tick_slow_i8*128),
+#       NOT the sub-LSB expectation alpha*gate*s_fast -- consolidation is LSB-quantized,
+#       so the smooth flow undercounts the transfer energy and inflates `waste`.
 #   boil  = [0]/[1]      -- of what was killed, how much did the drift
 #                           already recognize? (gate errors on ESTABLISHED
 #                           signal)
@@ -1211,7 +1472,7 @@ def _boil_buf(device):
     key = str(device)
     buf = _BOIL_BUFS.get(key)
     if buf is None:
-        buf = torch.zeros(3, dtype=torch.float32, device=device)
+        buf = torch.zeros(6, dtype=torch.float32, device=device)   # [0..3] boil/waste; [4],[5] = M6a diversity meter (num, denom)
         _BOIL_BUFS[key] = buf
     return buf
 
@@ -1245,6 +1506,52 @@ def read_memgap(device, reset=True):
     if buf is None:
         return 0.0
     v = float(buf.item())
+    if reset:
+        buf.zero_()
+    return v
+
+
+# ── Per-layer dissipation meters (EpochDissipationServo) ──────────────────
+# By default the kernel atomic-adds boil/memgap into the SHARED per-device
+# accumulators above (the global audit). A per-layer servo needs each layer's
+# OWN flow, so it registers per-layer buffers here keyed by the packed_w storage
+# pointer; the autograd backward looks them up via ctx.packed_w and passes them
+# to apply_packed_adamw (which routes the kernel writes there instead of the
+# shared buf). Register BEFORE CUDA-graph capture so the captured launch bakes
+# the stable per-layer pointer. Absent key => (None, None) => shared buf (the
+# pre-servo behavior, bit-identical).
+_PERLAYER_METERS = {}
+
+
+def register_layer_meters(packed_w, boil_buf, memgap_buf):
+    _PERLAYER_METERS[packed_w.data_ptr()] = (boil_buf, memgap_buf)
+
+
+def _lookup_layer_meters(packed_w):
+    return _PERLAYER_METERS.get(packed_w.data_ptr(), (None, None))
+
+
+def clear_layer_meters():
+    _PERLAYER_METERS.clear()
+
+
+def read_layer_boil(layer, reset=True):
+    """(aligned_kill, total_kill, chase_flow) for ONE layer's per-layer meter,
+    or the zeros tuple if the layer has no per-layer buffer registered."""
+    buf = getattr(layer, "_boil_meter", None)
+    if buf is None:
+        return 0.0, 0.0, 0.0, 0.0
+    a, b, c, d = float(buf[0]), float(buf[1]), float(buf[2]), float(buf[3])
+    if reset:
+        buf.zero_()
+    return a, b, c, d
+
+
+def read_layer_memgap(layer, reset=True):
+    buf = getattr(layer, "_memgap_meter", None)
+    if buf is None:
+        return 0.0
+    v = float(buf[0])
     if reset:
         buf.zero_()
     return v
@@ -1428,6 +1735,19 @@ def _v_bc_buf(device):
     return buf
 
 
+_VHAT_MEAN_BUFS = {}
+def _vhat_mean_buf(device):
+    """Per-device [1] fp32 scratch for the per-element-v_hat coh-floor scale
+    (mean(v_full)*v_bc). Written device-side just before each conv's apply launch
+    (graph-safe, no host sync); read by the kernel under USE_FULL_V."""
+    key = str(device)
+    buf = _VHAT_MEAN_BUFS.get(key)
+    if buf is None:
+        buf = torch.ones(1, dtype=torch.float32, device=device)
+        _VHAT_MEAN_BUFS[key] = buf
+    return buf
+
+
 def set_bias_correct_v(enabled):
     global _BIAS_CORRECT_V
     _BIAS_CORRECT_V = bool(enabled)
@@ -1445,6 +1765,32 @@ def bias_correction_factor(step, beta2=0.999):
     return 1.0 / (1.0 - beta2 ** (int(step) + 1))
 
 
+import os as _os_gw
+
+# grad·w diagnostic (env CONCORD_GRADW_DIAG; EAGER-only -- run with the CUDA graph OFF, a sync inside
+# a captured backward would break capture). Accumulates cos(RAW grad_W, live weight) across layer-
+# applies. grad_W here is the UN-preconditioned weight gradient, so: cos > 0 => the gradient aligns
+# with the weight (the loss penalizes |W| -> the deploy-norm contraction is the OBJECTIVE); cos ~ 0
+# while s_fast is contractive would instead implicate the preconditioner. Read+reset per step from
+# the controller after_step. Dormant unless the env var is set.
+_GRADW_KEYS = ("raw", "sign", "step", "clamp", "sfast", "coh", "incoh")
+_GRADW_DIAG = {"on": bool(_os_gw.environ.get("CONCORD_GRADW_DIAG")), "n": 0}
+for _k in _GRADW_KEYS:
+    _GRADW_DIAG[_k] = [0.0, 0.0, 0.0]   # [dot, q^2, W^2]
+
+
+def read_gradw_diag():
+    d = _GRADW_DIAG
+    out = {}
+    for k in _GRADW_KEYS:
+        a = d[k]
+        out[k] = a[0] / ((a[1] * a[2]) ** 0.5 + 1e-30)
+        a[0] = a[1] = a[2] = 0.0
+    n = d["n"]
+    d["n"] = 0
+    return out, n
+
+
 def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
                          row_max, col_max,
                          lr, mantissa_bias=15, alpha=0.1, beta1=0.0,
@@ -1456,8 +1802,10 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
                          mass_preserve=False, apply_chase=True,
                          track_rebalance=True,
                          v_row=None, v_col=None, sum_v_inv=None,
+                         v_full=None, use_full_v=False,
                          gf_trust_delta_sq=0.0, coh_pre=None,
                          gf_consol_buf=None, beta1_buf=None,
+                         boil_buf=None, memgap_buf=None,
                          grad_activity=False):
     """Wrapper for the AdamW three-accumulator packed apply kernel.
     weight_buf is updated with the new live weight (materialize-merge),
@@ -1476,11 +1824,59 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
     if drift_cancel_C is None:
         drift_cancel_C = compute_drift_cancel_C(alpha, alpha_v_fast,
                                                 mass_preserve=mass_preserve)
+    # The flow audit (boil/waste) is a per-device accumulator (_boil_buf keyed by
+    # device) that read_boil() reads as the UNet's -- but every Concord layer on the
+    # device atomic-adds into it. The frozen TE has drift_cancel_C=0 -> coh≡0 and is
+    # already excluded; the CREEP TE has drift_cancel_C != 0 (a live gate) and WOULD
+    # write, corrupting the UNet's audit. Gate additionally on wd_anchor<=0: the UNet
+    # swap leaves wd_anchor=0 while every anchored TE sets wd_anchor>0, so this keeps
+    # the audit UNet-only without threading a separate per-group buffer through the
+    # autograd. (The TE's own coherence is observed directly via [concord-health:te].)
+    write_boil = (abs(float(drift_cancel_C)) > 0.0) and (float(wd_anchor) <= 0.0)
     N, K = packed_w.shape
     assert packed_w.dtype == torch.int32
     assert grad_W.dtype == torch.bfloat16
     assert weight_buf.dtype == torch.bfloat16
     assert weight_buf.shape == packed_w.shape
+    if _GRADW_DIAG["on"]:                       # EAGER-only diagnostic (run with the CUDA graph off)
+        with torch.no_grad():
+            _p = packed_w
+            _sf = (_p >> 16).to(torch.float32)
+            _ss = ((_p << 16) >> 24).to(torch.float32)
+            _vs = ((_p << 24) >> 24).to(torch.float32)
+            _sc = (row_exp.to(torch.float32)[:, None]
+                   + col_exp.to(torch.float32)[None, :] - mantissa_bias).exp2()
+            _W = (_ss * 128.0 + _vs * 128.0) * _sc                 # DEPLOY weight (s_slow+v_slow): the
+            #   contracting quantity; EXCLUDES s_fast so there is no self-term in the s_fast column and
+            #   a step's alignment with deploy is not cancelled by its alignment with the velocity.
+            _g = grad_W.to(torch.float32)                          # gradient AS RECEIVED by the kernel
+            try:                                                   # reconstruct the kernel step (v_scale=0)
+                _vh = (v_row.to(torch.float32)[:, None]
+                       * v_col.to(torch.float32)[None, :] * sum_v_inv.to(torch.float32))
+                _denom = (float(gf_trust_delta_sq) * _vh + float(eps)) ** float(precond_p)
+                _step = _g / _denom
+                _cap = float(step_cap)
+                _stepc = _step.clamp(-_cap, _cap)
+            except Exception:
+                _step = _stepc = _g
+            _sfW = _sf * _sc                                       # accumulated velocity (weight units)
+            _dsv = (_ss - _vs) * 128.0 * _sc                       # d_sv = (s_slow - v_slow)*128 (weight units)
+            _sig = float(drift_cancel_C) * _dsv                    # COHERENT part of the velocity: sig = C*d_sv
+            _noise = _sfW - _sig                                   # INCOHERENT part: noise = s_fast - sig
+            _w2 = float((_W * _W).sum())
+            for _k, _q in (("raw", _g), ("sign", torch.sign(_g)), ("step", _step),
+                           ("clamp", _stepc), ("sfast", _sfW), ("coh", _sig), ("incoh", _noise)):
+                _acc = _GRADW_DIAG[_k]
+                _acc[0] += float((_q * _W).sum())
+                _acc[1] += float((_q * _q).sum())
+                _acc[2] += _w2
+            _GRADW_DIAG["n"] += 1
+    # step_cap <= 0 DISABLES the hard step clamp (kernel ~line 818): bound the step by the
+    # trust-region / preconditioner denominator instead. Mirrors gf_trust_delta_sq's "0 disables"
+    # semantics so turning the cap off is a usable mode (rank-1 Adam denom), not a step-zeroing
+    # footgun. make_concord_config guards the degenerate case where BOTH step bounds are off.
+    if step_cap is None or float(step_cap) <= 0.0:
+        step_cap = 1e30
     use_gf_trust = (gf_trust_delta_sq > 0)
     # A layer-owned gf_consol buffer means the value can CHANGE between graph
     # replays (autotuner probe-then-commit) -> bake the consolidation branch in;
@@ -1488,6 +1884,14 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
     use_gf_consol = (gf_consol_buf is not None) or (gf_consol > 0)
     use_cohpre = (coh_pre is not None)
     coh_pre_arg = coh_pre if coh_pre is not None else packed_w  # stub if off
+    # LAMB per-layer trust cap. _LAMB_TRUST is a python bool (baked at graph-capture time). The
+    # scale lives in a STATIC per-layer buffer (1.0 when off). When on, the two norms it needs
+    # (‖W_deploy‖, ‖step‖) are reduced INSIDE the apply kernel (atomic-add per tile, WRITE_LAMB_NORMS
+    # block); the scale is computed device-side just before the launch below from the PREVIOUS step's
+    # reductions (one step stale). No eager preconditioner recompute (that was ~+50% step time).
+    step_scale_ptr = _lamb_scale_buf(packed_w)
+    lamb_wnsq_ptr = _lamb_wnorm_sq_buf(packed_w)
+    lamb_snsq_ptr = _lamb_stepnorm_sq_buf(packed_w)
     if use_gf_trust or use_gf_consol or use_cohpre:
         assert v_row is not None and v_col is not None \
             and sum_v_inv is not None, \
@@ -1497,6 +1901,21 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         v_row = v_row if v_row is not None else packed_w
         v_col = v_col if v_col is not None else packed_w
         sum_v_inv = sum_v_inv if sum_v_inv is not None else packed_w
+    # Per-element v_hat (Conv only). vhat_mean = mean(v_full)*v_bc is the layer-mean coh-floor
+    # scale (the rank-1 0.03/(sum_v_inv*N*K) analog). Computed DEVICE-SIDE into a per-device
+    # scratch (no .item() -> CUDA-graph-safe); read by the kernel under USE_FULL_V. When off,
+    # v_full/vhat_mean are stubbed to live tensors the compiled-out branch never dereferences.
+    use_full_v = bool(use_full_v)
+    if use_full_v:
+        assert v_full is not None and v_full.shape == packed_w.shape \
+            and v_full.is_contiguous(), "use_full_v requires a contiguous [N,K] v_full"
+        vhat_mean_ptr = _vhat_mean_buf(packed_w.device)
+        vhat_mean_ptr.copy_(
+            (v_full.float().mean().clamp(min=1e-30)
+             * _v_bc_buf(packed_w.device).reshape(())).reshape(1))
+    else:
+        v_full = packed_w          # stub; kernel branch never reads it
+        vhat_mean_ptr = sum_v_inv  # stub; kernel branch never reads it
     step_counter = _get_step_counter(packed_w.device)
     step_counter.add_(1)
     consolidate_ptr = _get_consolidate_flag(packed_w.device)
@@ -1515,6 +1934,13 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
     _ratio_chase_floor_ptr, _ratio_leak_floor_ptr = _ensure_floor_tensors(packed_w.device)
     bc_buf = _v_bc_buf(packed_w.device)                   # (1) v_hat bias-correction buffer
     gap_inv = (1.0 / _GAP_SCALE) if (_GAP_FEEDBACK and _GAP_SCALE > 0) else 0.0
+    # LAMB trust scale (step_scale_ptr) is computed + the norm accumulators zeroed HOST-SIDE in the
+    # controller's before_step (one alloc-free _lamb_scale_kernel/layer, one step stale) -- NOT here --
+    # so this per-layer scalar maintenance stays OUT of the captured backward (like lr/sigma/floors).
+    # This launcher only creates+passes the bufs: step_scale_ptr (read to brake) and lamb_wnsq/snsq
+    # (atomic-added by the kernel when WRITE_LAMB_NORMS), all set above.
+    # coh cf-discount uses kappa (a baked float) + cf = sig2/(C^2 v_hat) computed IN-kernel from state
+    # already in the coh block (sig2, v_hat) -- no host prep, no per-layer buffer.
     BLOCK_N, BLOCK_K = 32, 64
     grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(K, BLOCK_K))
     _apply_packed_adamw_kernel[grid](
@@ -1522,6 +1948,8 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         row_max, col_max,
         v_row, v_col, sum_v_inv,
         coh_pre_arg,
+        v_full,
+        vhat_mean_ptr,
         N, K,
         lr_ptr, int(mantissa_bias), float(alpha), beta1_ptr,
         float(weight_decay), eps_ptr, float(step_cap),
@@ -1529,6 +1957,8 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         float(v_scale), float(precond_p), gf_consol_ptr,
         float(drift_cancel_C),
         float(alpha_v_fast),
+        float(_COH_KAPPA),
+        float(_EVAP_SLACK),
         float(wd_sv), float(wd_sf), float(wd_anchor),
         float(gf_trust_delta_sq),
         float(_MIN_LEAK),
@@ -1537,11 +1967,13 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         _ratio_chase_floor_ptr,
         _ratio_leak_floor_ptr,
         bc_buf,
-        _memgap_buf(packed_w.device),
-        _boil_buf(packed_w.device),
+        memgap_buf if memgap_buf is not None else _memgap_buf(packed_w.device),
+        boil_buf if boil_buf is not None else _boil_buf(packed_w.device),
         float(gap_inv),
         step_counter,
         consolidate_ptr,
+        step_scale_ptr,
+        lamb_wnsq_ptr, lamb_snsq_ptr,
         packed_w.stride(0), packed_w.stride(1),
         grad_W.stride(0), grad_W.stride(1),
         weight_buf.stride(0), weight_buf.stride(1),
@@ -1553,10 +1985,14 @@ def apply_packed_adamw(packed_w, grad_W, weight_buf, row_exp, col_exp,
         USE_GF_CONSOLIDATION=bool(use_gf_consol),
         USE_COHPRE=bool(use_cohpre),
         USE_FIXED_COH=bool(_USE_FIXED_COH),
+        USE_COH_VHAT=bool(_USE_COH_VHAT),
         USE_RATIO_COH=bool(_RATIO_COH),
         USE_GAP_FEEDBACK=bool(_GAP_FEEDBACK),
         USE_LAZY_GATE=bool(_LAZY_GATE),
         USE_GRAD_ACTIVITY=bool(grad_activity),
+        WRITE_BOIL=bool(write_boil),
+        WRITE_LAMB_NORMS=bool(_LAMB_TRUST),
+        USE_FULL_V=use_full_v,
     )
 
 
@@ -1960,14 +2396,26 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
                 g2_row = g2.sum(dim=1)
                 g2_col = g2.sum(dim=0)
                 b2 = ctx.adafactor_beta2
-                ctx.v_row.mul_(b2).add_(g2_row, alpha=1.0 - b2)
-                ctx.v_col.mul_(b2).add_(g2_col, alpha=1.0 - b2)
+                _warm = getattr(ctx.v_row, '_concord_warm', None)
+                if _warm is None:
+                    ctx.v_row.mul_(b2).add_(g2_row, alpha=1.0 - b2)
+                    ctx.v_col.mul_(b2).add_(g2_col, alpha=1.0 - b2)
+                else:
+                    # one-shot warm-start: warm=1 -> v=g2 (init from first g^2); warm=0 -> plain EMA.
+                    # v = warm*g2 + (1-warm)*(b2*v + (1-b2)*g2). Branchless tensor ops (CUDA-graph
+                    # safe); warm self-zeros after step 0 so every later replay is pure EMA.
+                    _cv = b2 * (1.0 - _warm)
+                    _cg = _warm + (1.0 - b2) * (1.0 - _warm)
+                    ctx.v_row.mul_(_cv).add_(g2_row.mul(_cg))
+                    ctx.v_col.mul_(_cv).add_(g2_col.mul(_cg))
+                    _warm.fill_(0.0)
                 # Precompute 1/Σv_row for the kernel.
                 sum_v = ctx.v_row.sum().clamp(min=1e-30)
                 ctx.sum_v_inv.fill_(0).add_(1.0 / sum_v)
         # Apply kernel emits the updated bf16 weight into ctx.weight_buf
         # as a side effect — that's what the next forward will read.
         if ctx.optimizer_kind == 'adamw':
+            _boil_m, _memgap_m = _lookup_layer_meters(ctx.packed_w)
             apply_packed_adamw(
                 ctx.packed_w, grad_W, ctx.weight_buf,
                 ctx.row_exp, ctx.col_exp,
@@ -1979,6 +2427,7 @@ class FusedConcordLinearPackedB(torch.autograd.Function):
                 v_scale=ctx.v_scale, precond_p=ctx.precond_p,
                 gf_consol=ctx.gf_consol,
                 gf_consol_buf=ctx.gf_consol_buf, beta1_buf=ctx.beta1_buf,
+                boil_buf=_boil_m, memgap_buf=_memgap_m,
                 drift_cancel_C=ctx.drift_cancel_C,
                 alpha_v_fast=ctx.alpha_v_fast,
                 wd_sv=ctx.wd_sv, wd_sf=ctx.wd_sf, wd_anchor=ctx.wd_anchor,
@@ -2054,6 +2503,13 @@ class ConcordLinearPackedB(nn.Module):
         # property-routed assignments below.
         self._beta1_buf = torch.zeros(1, dtype=torch.float32, device=device)
         self._gf_consol_buf = torch.zeros(1, dtype=torch.float32, device=device)
+        # Per-layer dissipation meters. None => the kernel uses the shared
+        # per-device _boil_buf/_memgap_buf (global audit, unchanged). The
+        # EpochDissipationServo allocates real buffers on the layers it manages
+        # and calls register_layer_meters(packed_w, ...) BEFORE graph capture so
+        # the captured backward routes this layer's boil/memgap writes here.
+        self._boil_meter = None
+        self._memgap_meter = None
         self.beta1 = beta1
         # lr is stored as both a scalar (self._lr_value) and a 1-elem
         # device tensor (self._lr_buf). The kernel reads the tensor so we
@@ -2097,6 +2553,10 @@ class ConcordLinearPackedB(nn.Module):
         # skip the EMA if you want neither diagnostic nor trust region.
         self.track_adafactor_v = True
         self.adafactor_beta2 = 0.999
+        # Per-element 2nd-moment switch (Conv-only feature). Base default False so Linear and
+        # un-flagged Conv stay bit-exact; ConcordConv2dPackedB registers the v_full buffer and
+        # the swap flips this to enable. On the base so any forward can read self.use_full_v.
+        self.use_full_v = False
         # Garbage-fraction trust region: when > 0, adds δ²·v̂ to v_proxy
         # so step is implicitly bounded by ~1/δ at gf→0 and → 0 at gf→1
         # — replaces the hard step_cap clamp with a smooth SNR gate.
@@ -2269,16 +2729,24 @@ class ConcordLinearPackedB(nn.Module):
         self.load_weights(w)
 
     @torch.no_grad()
-    def load_weights(self, W):
-        """Put the full mantissa in s_fast at init. s_slow_i8 starts at 0
-        and the mass-preserve chase fills it in over the first ~1/alpha
-        steps. v_slow_i8 stays at 0 (unused in this prototype).
+    def load_weights(self, W, gap=0.0):
+        """Gap-zero ADAPTIVE-ANCHOR init (gap=0): pack the pretrained mantissa into the PROTECTED
+        slow path (s_slow + v_slow), split so s_slow == v_slow to within one unit (d_sv ~= 0),
+        leaving only the sub-128 fine residual in s_fast. Deploy weight (s_slow+v_slow)*128 ~= W
+        from step 0; the live weight is exact to 16 bits.
 
-        This matches Option A's init pattern (bf16 = position, delta = 0)
-        and Option-A-int16-path's _init pattern (s_slow = full, s_fast = 0)
-        — except here the "fast" side carries the init mantissa, since
-        s_slow at × 128 quantization can't represent fine mantissa values
-        exactly. The chase will redistribute over the first ~10 steps.
+        Why the slow path, not s_fast: s_fast is the EVAPORATION target. The old init put the
+        whole pretrained mantissa in s_fast where, at step 0, d_sv=0 => coh=0 (incoherent by
+        construction) and |s_fast|>=128 => build_ok=1, so the dissipation boils the pretrained
+        weight off before any drift can justify it (only partly throttled by the fill ramp).
+        Here |s_fast|<=64 < evap_build_min, so the pretrained mass is never an evaporation target.
+
+        Why gap-zero (s_slow==v_slow), NOT a frozen v_slow anchor: the UNet anchor must ADAPT
+        (alpha_v_fast>0). Freezing it (alpha_v_fast=0) zeroes C* = compute_drift_cancel_C(alpha, 0)
+        and collapses the coherence gate to coh==0 -- acceptable only for the delicate TE
+        (load_weights_anchor), not the UNet. s_slow==v_slow makes the leak gap ~0 so the live leak
+        does not drain the anchor toward an empty s_slow, while alpha_v_fast>0 keeps C*>0 and the
+        gate alive; the gradient then grows d_sv (s_slow leads v_slow) and coherence engages.
         """
         W = W.to(device=self.packed_w.device, dtype=torch.float32)
         max_abs = W.abs().max(dim=1).values.clamp(min=1e-30)
@@ -2290,11 +2758,18 @@ class ConcordLinearPackedB(nn.Module):
                + self.col_exp[None, :].to(torch.float32)
                - self.MANTISSA_BIAS)
         scale = torch.pow(2.0, exp)
-        m_total = (W / scale).round().to(torch.int32).clamp(
-            INT16_MIN, INT16_MAX)
-        s_fast = m_total                          # int32 in int16 range
-        s_slow_i8 = torch.zeros_like(s_fast)
-        v_slow_i8 = torch.zeros_like(s_fast)
+        m_total = (W / scale).round().to(torch.int32).clamp(INT16_MIN, INT16_MAX)
+        # coarse (deploy-tick) part = s_slow + v_slow (== deploy, preserved for ANY gap).
+        coarse = (m_total.to(torch.float32) / 128.0).round().to(torch.int32).clamp(
+            2 * INT8_MIN, 2 * INT8_MAX)
+        # gap in [0,1]: 0 = even split (d_sv~=0, the gap-zero fine-tune init); >0 seeds s_slow AHEAD of
+        # v_slow by d_sv = gap*coarse -- a FROM-SCRATCH DIRECTION for the coherence gate (gap-zero gives
+        # sig=C*d_sv=0 -> coh=0 -> evap at full -> the seeded deploy collapses). gap=0 is bit-exact legacy.
+        v_slow_i8 = (coarse.to(torch.float32) * (1.0 - gap) / 2.0).round().to(torch.int32).clamp(
+            INT8_MIN, INT8_MAX)
+        s_slow_i8 = (coarse - v_slow_i8).clamp(INT8_MIN, INT8_MAX)
+        # fine residual stays in s_fast (|.|<=64 < evap_build_min => never an evaporation target)
+        s_fast = (m_total - (s_slow_i8 + v_slow_i8) * 128).clamp(INT16_MIN, INT16_MAX)
         packed = (
             ((s_fast & 0xFFFF) << 16)
             | ((s_slow_i8 & 0xFF) << 8)
@@ -2323,6 +2798,46 @@ class ConcordLinearPackedB(nn.Module):
         s_slow = torch.zeros_like(s_fast)
         self.packed_w.copy_(((s_fast & 0xFFFF) << 16) | ((s_slow & 0xFF) << 8) | (v_slow & 0xFF))
         self._resync_weight_buf()
+
+    @torch.no_grad()
+    def resplit_anchor_to_even(self, thresh=0.15, verbose=False):
+        """Mass-preserving rebalance of the slow channel to the EVEN split
+        (s_slow == v_slow == coarse/2, so d_sv ~= 0). DECONTAMINATES a CREEP layer
+        (alpha_v_fast>0) whose packed state was written by load_weights_anchor
+        (whole weight in v_slow, s_slow=0): there d_sv = (s_slow - v_slow) ~= -W, a
+        FIXED vector opposite the weight. With a live leak that -W is dragged through
+        the coherence gate as counterfeit "signal" and the mass-preserving leak drains
+        the anchor toward an empty s_slow -> TE washout. This preserves
+        deploy = (s_slow+v_slow)*128 AND s_fast EXACTLY (the live/deployed weight is
+        unchanged); only the s_slow<->v_slow split moves to where the leak is slowly +
+        corruptingly heading anyway. No-op (returns False) when already near-even
+        (||d_sv||/||deploy|| <= thresh) so a clean creep resume keeps its legitimate
+        recent-drift d_sv signal. Safe on a FROZEN anchor only if NOT called (the
+        caller gates on alpha_v_fast>0); a frozen v_slow MUST keep the whole weight."""
+        pw = self.packed_w
+        sf = (pw >> 16)
+        ss = (pw << 16) >> 24
+        vs = (pw << 24) >> 24
+        exp = (self.row_exp[:, None].float() + self.col_exp[None, :].float()
+               - self.MANTISSA_BIAS)
+        scale = torch.pow(2.0, exp)
+        dep = ((ss + vs).float() * 128.0) * scale
+        ndep = float((dep * dep).sum())
+        if ndep <= 0.0:
+            return False
+        dsv = ((ss - vs).float() * 128.0) * scale
+        ratio = (float((dsv * dsv).sum()) / ndep) ** 0.5
+        if ratio <= thresh:
+            return False
+        coarse = (ss + vs).to(torch.int32)
+        v_new = (coarse.float() / 2.0).round().to(torch.int32).clamp(INT8_MIN, INT8_MAX)
+        s_new = (coarse - v_new).clamp(INT8_MIN, INT8_MAX)
+        self.packed_w.copy_(((sf & 0xFFFF) << 16) | ((s_new & 0xFF) << 8) | (v_new & 0xFF))
+        self._resync_weight_buf()
+        if verbose:
+            print(f"[concord]   resplit anchor->even: ||d_sv||/||deploy|| {ratio:.3f} -> ~0 "
+                  f"(deploy + s_fast preserved exactly)", flush=True)
+        return True
 
     @torch.no_grad()
     def _resync_weight_buf(self):
@@ -2564,10 +3079,19 @@ class ConcordLinearPackedB(nn.Module):
                 w = self._coh_pre / self._coh_pre.mean().clamp(min=1e-12)
                 g2 = g2 * w
             b2 = self.adafactor_beta2
-            self.v_row.mul_(b2).add_(g2.sum(dim=1), alpha=1.0 - b2)
-            self.v_col.mul_(b2).add_(g2.sum(dim=0), alpha=1.0 - b2)
+            _warm = getattr(self.v_row, '_concord_warm', None)
+            if _warm is None:
+                self.v_row.mul_(b2).add_(g2.sum(dim=1), alpha=1.0 - b2)
+                self.v_col.mul_(b2).add_(g2.sum(dim=0), alpha=1.0 - b2)
+            else:
+                _cv = b2 * (1.0 - _warm)
+                _cg = _warm + (1.0 - b2) * (1.0 - _warm)
+                self.v_row.mul_(_cv).add_(g2.sum(dim=1).mul(_cg))
+                self.v_col.mul_(_cv).add_(g2.sum(dim=0).mul(_cg))
+                _warm.fill_(0.0)
             self._sum_v_inv.fill_(0).add_(1.0 / self.v_row.sum().clamp(min=1e-30))
         if self.optimizer_kind == 'adamw':
+            _boil_m, _memgap_m = _lookup_layer_meters(self.packed_w)   # per-layer meters for the 'emb' servo; (None,None) when unregistered -> shared per-device sink (unchanged)
             apply_packed_adamw(
                 self.packed_w, grad_W, wbuf,
                 self.row_exp, self.col_exp,
@@ -2579,6 +3103,7 @@ class ConcordLinearPackedB(nn.Module):
                 v_scale=self.v_scale, precond_p=self.precond_p,
                 gf_consol=self.gf_consol,
                 gf_consol_buf=self._gf_consol_buf, beta1_buf=self._beta1_buf,
+                boil_buf=_boil_m, memgap_buf=_memgap_m,
                 drift_cancel_C=self.drift_cancel_C,
                 alpha_v_fast=self.alpha_v_fast,
                 wd_sv=self.wd_sv, wd_sf=self.wd_sf, wd_anchor=self.wd_anchor,
@@ -2691,7 +3216,8 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
                 v_row, v_col, sum_v_inv,
                 adafactor_beta2, track_adafactor_v,
                 gf_trust_delta_sq, coh_pre,
-                gf_consol_buf, beta1_buf):
+                gf_consol_buf, beta1_buf,
+                v_full, use_full_v):
         # weight_buf kept fresh by previous apply (materialize-merge).
         # Initial population happens once in _ensure_buffers.
         weight_4d = weight_buf.view(out_channels, in_channels, kh, kw)
@@ -2716,6 +3242,8 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
         ctx.in_channels = in_channels
         ctx.out_channels = out_channels
         ctx.kh, ctx.kw = kh, kw
+        ctx.v_full = v_full
+        ctx.use_full_v = use_full_v
         ctx.stride = stride
         ctx.padding = padding
         ctx.lr = lr
@@ -2795,13 +3323,33 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
                 g2_row = g2.sum(dim=1)
                 g2_col = g2.sum(dim=0)
                 b2 = ctx.adafactor_beta2
-                ctx.v_row.mul_(b2).add_(g2_row, alpha=1.0 - b2)
-                ctx.v_col.mul_(b2).add_(g2_col, alpha=1.0 - b2)
+                _warm = getattr(ctx.v_row, '_concord_warm', None)
+                # Per-element 2nd-moment EMA (Conv-only): same beta2 + warm-start as the v_row/v_col
+                # marginals, so v_full is their un-marginalized counterpart. Reads _warm BEFORE the
+                # v_row block below zeros it. Skipped (bit-exact) when use_full_v is False.
+                if ctx.use_full_v and ctx.v_full is not None:
+                    if _warm is None:
+                        ctx.v_full.mul_(b2).add_(g2, alpha=1.0 - b2)
+                    else:
+                        ctx.v_full.mul_(b2 * (1.0 - _warm)).add_(g2.mul(_warm + (1.0 - b2) * (1.0 - _warm)))
+                if _warm is None:
+                    ctx.v_row.mul_(b2).add_(g2_row, alpha=1.0 - b2)
+                    ctx.v_col.mul_(b2).add_(g2_col, alpha=1.0 - b2)
+                else:
+                    # one-shot warm-start: warm=1 -> v=g2 (init from first g^2); warm=0 -> plain EMA.
+                    # v = warm*g2 + (1-warm)*(b2*v + (1-b2)*g2). Branchless tensor ops (CUDA-graph
+                    # safe); warm self-zeros after step 0 so every later replay is pure EMA.
+                    _cv = b2 * (1.0 - _warm)
+                    _cg = _warm + (1.0 - b2) * (1.0 - _warm)
+                    ctx.v_row.mul_(_cv).add_(g2_row.mul(_cg))
+                    ctx.v_col.mul_(_cv).add_(g2_col.mul(_cg))
+                    _warm.fill_(0.0)
                 sum_v = ctx.v_row.sum().clamp(min=1e-30)
                 ctx.sum_v_inv.fill_(0).add_(1.0 / sum_v)
         # Apply kernel emits the updated bf16 weight into ctx.weight_buf
         # (the same buffer the next forward will read from).
         if ctx.optimizer_kind == 'adamw':
+            _boil_m, _memgap_m = _lookup_layer_meters(ctx.packed_w)
             apply_packed_adamw(
                 ctx.packed_w, grad_W_2d, ctx.weight_buf,
                 ctx.row_exp, ctx.col_exp,
@@ -2813,6 +3361,7 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
                 v_scale=ctx.v_scale, precond_p=ctx.precond_p,
                 gf_consol=ctx.gf_consol,
                 gf_consol_buf=ctx.gf_consol_buf, beta1_buf=ctx.beta1_buf,
+                boil_buf=_boil_m, memgap_buf=_memgap_m,
                 drift_cancel_C=ctx.drift_cancel_C,
                 alpha_v_fast=ctx.alpha_v_fast,
                 wd_sv=ctx.wd_sv, wd_sf=ctx.wd_sf, wd_anchor=ctx.wd_anchor,
@@ -2823,6 +3372,7 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
                 sum_v_inv=ctx.sum_v_inv,
                 gf_trust_delta_sq=ctx.gf_trust_delta_sq,
                 coh_pre=ctx.coh_pre,
+                v_full=ctx.v_full, use_full_v=ctx.use_full_v,
             )
         else:
             # SGD path doesn't have a variance preconditioner, so the gf
@@ -2840,7 +3390,7 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
         grad_bias = None
         if ctx.has_bias:
             grad_bias = grad_y.sum(dim=(0, 2, 3))
-        # 36 forward args: only x (slot 0) and bias (slot 4) receive grads.
+        # forward args + v_full, use_full_v (2 trailing, no grad); only x (slot 0) and bias get grads.
         return (grad_x, None, None, None, grad_bias,
                 None, None, None, None, None, None,
                 None, None, None, None,
@@ -2852,6 +3402,7 @@ class FusedConcordConv2dPackedB(torch.autograd.Function):
                 None, None, None,
                 None, None, None,
                 None, None, None, None,
+                None, None,
                 None, None)
 
 
@@ -2875,6 +3426,12 @@ class ConcordConv2dPackedB(ConcordLinearPackedB):
                          out_features=out_channels,
                          bias=bias, device=device,
                          alpha=alpha, beta1=beta1, lr=lr)
+        # Per-element 2nd-moment EMA [N,K] for this conv (read by the kernel only when
+        # use_full_v is set; the swap flips that flag). Real buffer so it is checkpointed +
+        # device-moved; zero-init => first EMA == g^2 (like v_row/v_col).
+        self.register_buffer('v_full',
+            torch.zeros(out_channels, in_channels * kh * kw,
+                        dtype=torch.float32, device=device))
 
     def forward(self, x):
         in_dtype = x.dtype
@@ -2896,7 +3453,8 @@ class ConcordConv2dPackedB(ConcordLinearPackedB):
             float(self.adafactor_beta2),
             bool(self.track_adafactor_v),
             float(self.gf_trust_delta_sq), self._coh_pre,
-            self._gf_consol_buf, self._beta1_buf)
+            self._gf_consol_buf, self._beta1_buf,
+            self.v_full, bool(self.use_full_v))
         return y.to(in_dtype)
 
 
@@ -3098,6 +3656,319 @@ class DissipationAutoTuner:
                       f"steps {self.probe_start}-{self.probe_end})")
             return self.committed
         return None
+
+
+class EpochDissipationServo:
+    """Per-layer, one-sided, epoch-cadenced dissipation servo.
+
+    Replaces the table-based DissipationAutoTuner: NO prior table, NO global
+    probe-then-commit. Each layer's kappa (gf_consol) is SEEDED from
+    config.dissipation (the dimensionless lam; lam=1 is the Wiener point) and
+    CLIMBS once per epoch, ONE-SIDED, only while that layer is "earning":
+
+      - actuated error  = boil  = aligned_kill / total_kill  (per-layer): the
+        coherent-waste fraction. ~0 when the gate eats only incoherent mass;
+        rises only when friction destroys LEARNED signal. Climbing stops once
+        boil >= boil_ceiling.
+      - climb-permission = |memgap| (per-layer first-order deploy-loss) must be
+        STILL SHRINKING vs the previous epoch. Once it plateaus, more friction
+        is pure boil-off, so the climb halts.
+
+    TWO-SIDED. CLIMB when earning (boil < ceiling AND memgap shrinking). DESCEND
+    when the per-layer memgap (deploy-loss) is GROWING vs last epoch -- a real
+    kappa-RESPONSIVE regression (more evaporation -> changes s_fast -> changes the
+    gap), so lowering kappa relieves it; gated against shrinking so it never fights
+    a still-earning layer. Neither side chases COHERENCE (the exp-11b/c "react to
+    your own success" divergence: friction raises coherence, so a coherence setpoint
+    chases itself). NB boil DOES rise with kappa once it climbs (observed 0.006 ->
+    0.074), so it is not the pure kappa-invariant ratio the first analysis assumed
+    -- BUT the over-friction it flags is a SELF-LIMITING transient: the kappa step
+    drains accumulated s_fast in a burst, then boil/waste settle back below the
+    ceiling on their own with NO descend (observed: boil 0.067 -> 0.039, waste
+    0.046 -> 0). So a boil-triggered descend is intentionally DEFERRED; revisit only
+    if boil persists >= ceiling at an epoch BOUNDARY (a stuck over-friction, not a
+    post-climb burst). A +/- memgap_rel_floor deadband (flat memgap -> hold) prevents
+    flip-flop; kappa is floored above zero (a small lam) so a backed-off layer keeps
+    a Wiener skim.
+
+    beta1 is per-layer and coherence-gated: on iff measure_coherence(layer) is at
+    or above a NECESSARY floor (not a tuned cutoff). Set beta1_on=0 to disable.
+
+    The per-layer boil/memgap meters are the one kernel cost: the servo allocates
+    them on each managed layer and register_layer_meters() routes the kernel's
+    atomic-adds there (graph-safe; registered here, before capture). The actuators
+    (gf_consol, beta1) are existing per-layer device buffers, so a mid-run write
+    propagates into CUDA-graph replays without recapture.
+
+    Cadence: step(t) is called once per optimizer step; the servo acts only when
+    t crosses an epoch boundary. Requires evap_build_min below where the chase
+    pins |s_fast| (the winner default is now 0) -- otherwise evaporation never
+    fires, boil/memgap stay ~0, and the servo is blind.
+    """
+
+    per_layer = True   # marker: gamma-SNR hook modulates each layer's own base
+
+    def __init__(self, layers, lr, seed_kappa, epoch_steps,
+                 climb_rate=0.5, boil_ceiling=0.05, memgap_rel_floor=0.02,
+                 beta1_on=0.0, beta1_coh_floor=0.35, kappa_cap=None,
+                 warmup_epochs=0, lam_floor=0.02, step_floor=0.05, step_grow=1.2,
+                 name="unet", protected_boil=False, waste_ceiling=1.0, verbose=True):
+        self.layers = list(layers)
+        self.lr = float(lr)
+        self.epoch_steps = max(1, int(epoch_steps))
+        self._baseline_frac = max(1, self.epoch_steps // 2)  # half-epoch early-baseline mark (fresh start)
+        self.climb_rate = float(climb_rate)
+        self.boil_ceiling = float(boil_ceiling)
+        self.memgap_rel_floor = float(memgap_rel_floor)
+        self.beta1_on = float(beta1_on)
+        self.beta1_coh_floor = float(beta1_coh_floor)
+        self.warmup_epochs = int(warmup_epochs)
+        self.verbose = bool(verbose)
+        self.name = str(name)              # "unet" / "te1" / "te2" -- for per-group logging + sidecar
+        self.step_floor = float(step_floor)   # Rprop: per-layer step floor (a settled layer keeps tracking)
+        self.step_grow = float(step_grow)     # Rprop: step grows x this on a consistent run, capped at climb_rate
+        self.protected_boil = bool(protected_boil)   # #1 fix: earn-gate on cf-discounted boil ([3]/[1]) not coh_raw boil ([0]/[1])
+        self.waste_ceiling = float(waste_ceiling)    # climb-freeze: stop adding kappa once per-layer waste exceeds this (>=1 disables)
+        # Linear stability: the evap recursion is u <- u - lr*kappa*(1-coh)*u,
+        # so lr*kappa < 2. Cap with margin.
+        self.kappa_cap = float(kappa_cap) if kappa_cap is not None \
+            else (1.9 / max(self.lr, 1e-12))
+        # Descend floor: lr-RELATIVE (a lam floor, not absolute), well below the Wiener point lam=1,
+        # so a backed-off layer keeps a small nonzero Wiener skim and never reaches 0. Clamped under
+        # half the cap defensively.
+        self.kappa_floor = min(float(lam_floor) / max(self.lr, 1e-12), 0.5 * self.kappa_cap)
+        seed_kappa = min(float(seed_kappa), self.kappa_cap)
+        self._kappa = {}
+        self._last_memgap = {}
+        self._step = {}        # Rprop per-layer step size (log-kappa move magnitude); init = climb_rate
+        self._last_dir = {}    # last ACTUAL move: +1 climb / -1 descend / 0 none (a hold doesn't change it)
+        self._epoch = 0
+        self._last_step_t = 0   # idempotency: before_step ticks per micro-batch; act once per t
+        # Last-epoch GLOBAL aggregate (sum over layers), refreshed each epoch as the
+        # servo reads the per-layer meters. The controller's health log reads this
+        # when the servo is active, since the kernel then routes boil/memgap to the
+        # per-layer buffers (the shared per-device accumulators read ~empty) and the
+        # servo owns the per-epoch reset.
+        self._agg_boil = (0.0, 0.0, 0.0)
+        self._agg_memgap = 0.0
+        for m in self.layers:
+            dev = m.packed_w.device
+            if getattr(m, "_boil_meter", None) is None:
+                m._boil_meter = torch.zeros(6, dtype=torch.float32, device=dev)   # [0..3] boil/waste; [4],[5] = M6a diversity meter (num, denom)
+            if getattr(m, "_memgap_meter", None) is None:
+                m._memgap_meter = torch.zeros(1, dtype=torch.float32, device=dev)
+            m._boil_meter.zero_()
+            m._memgap_meter.zero_()
+            register_layer_meters(m.packed_w, m._boil_meter, m._memgap_meter)
+            self._kappa[id(m)] = seed_kappa
+            self._last_memgap[id(m)] = None
+            self._step[id(m)] = self.climb_rate
+            self._last_dir[id(m)] = 0
+            m.gf_consol = seed_kappa     # property setter -> fills _gf_consol_buf
+            m.beta1 = 0.0
+        if self.verbose:
+            print(f"[concord] servo[{self.name}]: {len(self.layers)} per-layer, "
+                  f"seed kappa={seed_kappa:.1f} (lam={seed_kappa*self.lr:.3f}), "
+                  f"two-sided +/-{self.climb_rate:g}/epoch: climb when earning "
+                  f"(boil<{self.boil_ceiling:g} AND memgap shrinking), descend when memgap GROWING "
+                  f"(deploy-loss regressing); kappa in "
+                  f"[{self.kappa_floor:.0f}(lam{self.kappa_floor*self.lr:.3f}),{self.kappa_cap:.0f}], "
+                  f"epoch={self.epoch_steps} steps, "
+                  f"beta1_on={self.beta1_on:g}@coh>={self.beta1_coh_floor:g}; "
+                  f"Rprop step={self.climb_rate:g} (halve@flip, x{self.step_grow:g}@run, floor {self.step_floor:g})",
+                  flush=True)
+
+    @property
+    def committed(self):
+        """Representative scalar kappa (median across layers). Back-compat for
+        the gamma-SNR hook's base; the real friction is per-layer."""
+        if not self._kappa:
+            return 0.0
+        ks = sorted(self._kappa.values())
+        return ks[len(ks) // 2]
+
+    def step(self, t):
+        """Call once per optimizer step (before the step). Acts only at an epoch
+        boundary: reads each managed layer's epoch-accumulated boil + memgap and
+        climbs kappa one-sided where the layer is earning."""
+        if t <= 0:
+            return None
+        is_boundary = (t % self.epoch_steps) == 0
+        # One-time early baseline (fresh start only): if we're past the mid-epoch mark and STILL have
+        # no memgap baseline for some layer, fire a read now to seed `prev` -- so the epoch-1 boundary
+        # can act on a rough half-epoch trend instead of burning a whole epoch as a pure baseline.
+        # Keyed off _last_memgap (already persisted in the sidecar) -> no new resume state; on resume
+        # prev is restored so need_baseline is False and this is inert.
+        need_baseline = any(self._last_memgap.get(id(m)) is None for m in self.layers)
+        is_baseline = need_baseline and (not is_boundary) and (t % self.epoch_steps) >= self._baseline_frac
+        if not (is_boundary or is_baseline):
+            return None
+        # before_step is the PER-MICRO-BATCH pre-forward hook, so this is invoked `accum` times with
+        # the SAME update-step t across one gradient-accumulation cycle. Act ONCE per boundary t --
+        # otherwise the once-per-epoch climb fires `accum`x per epoch, racing kappa to the cap in a
+        # single real epoch and burning the warmup in one micro-step.
+        if t == self._last_step_t:
+            return None
+        self._last_step_t = t
+        # Read every layer's epoch-accumulated meters FIRST (read_layer_* also ZEROS them), so an
+        # empty (zero-accumulation) boundary can be detected before we act on it. beta1 depends only
+        # on coherence, so set it here regardless of the guard below.
+        reads = []
+        agg_a = agg_b = agg_c = agg_mg = abs_mg = 0.0
+        for m in self.layers:
+            a, b, c, d = read_layer_boil(m)      # reads + zeros the per-layer meter ([3]=cf-discounted kill)
+            mg_signed = read_layer_memgap(m)
+            mg = abs(mg_signed)
+            reads.append((m, a, b, c, d, mg))
+            agg_a += a; agg_b += b; agg_c += c; agg_mg += mg_signed; abs_mg += mg
+            if self.beta1_on > 0.0:
+                m.beta1 = (self.beta1_on
+                           if measure_coherence(m) >= self.beta1_coh_floor else 0.0)
+        # EMPTY-METER GUARD: a relaunch that resumes EXACTLY on an epoch boundary fires this step at
+        # the first before_step -- before any backward has accumulated into the freshly-rebuilt
+        # meters -- so every layer reads memgap=0 (= "shrinking" vs its restored prev) and boil=0, and
+        # the WHOLE model spuriously climbs x1.5 at once (then a synchronized boil-off, waste ~0.8).
+        # Skip the zero-accumulation epoch; the next real boundary fires normally. (t is recorded
+        # above, so a re-resume won't re-fire it; _epoch / _last_memgap are left untouched.)
+        if abs_mg < 1e-30 and agg_b < 1e-30:
+            if self.verbose:
+                print(f"[concord] servo[{self.name}] boundary t={t}: empty meters "
+                      f"(resume landed on a boundary) -> skipped, no climb/descend", flush=True)
+            return None
+        # Half-epoch baseline seed (fresh start only): past the mid-epoch mark with no memgap baseline
+        # yet -> record prev for every layer and return WITHOUT acting or counting an epoch, so the
+        # epoch-1 boundary has a (rough, half-window) trend to act on. On resume prev is restored from
+        # the sidecar, so need_baseline is False and this branch never runs.
+        if is_baseline:
+            for (m, a, b, c, d, mg) in reads:
+                self._last_memgap[id(m)] = mg
+            if self.verbose:
+                print(f"[concord] servo[{self.name}] half-epoch baseline t={t}: seeded memgap prev "
+                      f"({len(reads)} layers); first climb/descend at the epoch-1 boundary", flush=True)
+            return None
+        self._epoch += 1
+        warm = self._epoch <= self.warmup_epochs
+        n_climb = n_descend = 0
+        for (m, a, b, c, d, mg) in reads:
+            boil = (a / b) if b > 1e-30 else 0.0
+            boil_cf = (d / b) if b > 1e-30 else 0.0   # cf-discounted boil: rises when the kill eats cf-PROTECTED mass
+            gate_boil = boil_cf if self.protected_boil else boil
+            waste_layer = (b / (b + c)) if (b + c) > 1e-30 else 0.0   # killed/(killed+carried) for THIS layer
+            prev = self._last_memgap[id(m)]
+            # memgap trend with a +/- memgap_rel_floor deadband: flat -> hold (no flip-flop).
+            shrinking = (prev is None) or (mg < prev * (1.0 - self.memgap_rel_floor))
+            growing = (prev is not None) and (mg > prev * (1.0 + self.memgap_rel_floor))
+            # Under protected_boil the servo is TWO-SIDED and boil-aware. CLIMB (add dissipation)
+            # whenever it is SAFE: boil_cf below the ceiling AND waste below its ceiling AND the deploy
+            # is NOT regressing (memgap not growing). The strict "memgap shrinking" trigger stalls the
+            # climb in the converged/flat-memgap regime (the model can be done improving yet still want
+            # more dissipation), so protected_boil relaxes shrinking -> not-growing. DESCEND if the
+            # deploy regresses (growing memgap) OR boil_cf runs at/over the ceiling (eating too much
+            # cf-coherent mass -> back off = the boil-descend). Non-protected keeps the original
+            # shrinking-gated, memgap-only-descend behavior (bit-identical).
+            climb_ok = ((not growing) if self.protected_boil else shrinking)
+            # CF CEILING REMOVED for protected_boil (2026-06-29): boil_cf rode an inflated cf-coh
+            # meter (coh->1 on high-drift / high-memgap coords, see the cf-modulation guard ~:1011)
+            # and pinned the protected servo in a permanent one-way descend (live: boil_cf~0.75 >>
+            # 0.50 ceiling -> last_dir=-1 everywhere, 96% at the kappa floor). Protected mode now
+            # regulates on the TRUSTWORTHY signals only -- waste_ceiling + memgap -- plus the hard
+            # lr*kappa<2 stability cap and the kappa_floor; it no longer climb-freezes or descends on
+            # boil_cf. Non-protected (legacy) path keeps the raw-boil ceiling, BIT-IDENTICAL.
+            boil_ok = True if self.protected_boil else (gate_boil < self.boil_ceiling)
+            over_boil = False   # cf-boil descend removed (protected); the legacy path never set it True
+            earning = boil_ok and (waste_layer < self.waste_ceiling) and climb_ok
+            # actuate only with a real baseline -- never climb on prev=None (the documented
+            # synchronized mass-climb). The half-epoch seed gives the epoch-1 boundary its baseline.
+            if (not warm) and (prev is not None):
+                # Rprop step adaptation: the per-layer step starts at climb_rate, HALVES on a sign flip
+                # (the layer is straddling its optimum -> settle), GROWS x step_grow on a consistent run
+                # (still moving toward its level -> accelerate), floored at step_floor. A noise-driven
+                # flip-flop self-extinguishes to the floor; a real, consistent gradient keeps moving fast.
+                if earning:                  # consolidating + not boiling -> add friction
+                    st = self._step[id(m)]
+                    if self._last_dir[id(m)] < 0:        # was descending -> sign flip
+                        st = max(st * 0.5, self.step_floor)
+                    elif self._last_dir[id(m)] > 0:      # consistent climb
+                        st = min(st * self.step_grow, self.climb_rate)
+                    k = min(self._kappa[id(m)] * (1.0 + st), self.kappa_cap)
+                    if k > self._kappa[id(m)] + 1e-9:
+                        self._kappa[id(m)] = k; m.gf_consol = k; n_climb += 1
+                    self._step[id(m)] = st; self._last_dir[id(m)] = 1
+                elif growing or over_boil:   # deploy regressing OR boil_cf at/over ceiling -> back off
+                    st = self._step[id(m)]
+                    if self._last_dir[id(m)] > 0:        # was climbing -> sign flip
+                        st = max(st * 0.5, self.step_floor)
+                    elif self._last_dir[id(m)] < 0:      # consistent descend
+                        st = min(st * self.step_grow, self.climb_rate)
+                    k = max(self._kappa[id(m)] / (1.0 + st), self.kappa_floor)
+                    if k < self._kappa[id(m)] - 1e-9:
+                        self._kappa[id(m)] = k; m.gf_consol = k; n_descend += 1
+                    self._step[id(m)] = st; self._last_dir[id(m)] = -1
+                # else hold (deadband): _step and _last_dir unchanged -> a no-move is not a flip
+            self._last_memgap[id(m)] = mg
+        self._agg_boil = (agg_a, agg_b, agg_c)   # cache for the controller health log
+        self._agg_memgap = agg_mg
+        if self.verbose:
+            ks = sorted(self._kappa.values())
+            sts = sorted(self._step.values())
+            print(f"[concord] servo[{self.name}] epoch {self._epoch}: +{n_climb}/-{n_descend} of "
+                  f"{len(self.layers)}{' (warmup hold)' if warm else ''}; "
+                  f"kappa min/med/max={ks[0]:.0f}/{ks[len(ks)//2]:.0f}/{ks[-1]:.0f}; "
+                  f"step med={sts[len(sts)//2]:.3f}",
+                  flush=True)
+        return n_climb
+
+    def export_state(self):
+        """Per-layer servo state for the backup sidecar, ordered by self.layers (the deterministic
+        swap order). The per-epoch exit-42 relaunch rebuilds the servo from the SCALAR seed, which
+        discards the climb; persisting this keeps per-layer kappa + warmup + the memgap-shrink
+        baseline + the boundary-idempotency cursor across segments."""
+        return {
+            "n": len(self.layers),
+            "kappa": [float(self._kappa[id(m)]) for m in self.layers],
+            "last_memgap": [(None if self._last_memgap.get(id(m)) is None
+                             else float(self._last_memgap[id(m)])) for m in self.layers],
+            "epoch": int(self._epoch),
+            "last_step_t": int(self._last_step_t),
+            "epoch_steps": int(self.epoch_steps),
+            "step": [float(self._step[id(m)]) for m in self.layers],
+            "last_dir": [int(self._last_dir[id(m)]) for m in self.layers],
+            "names": [getattr(m, "_concord_name", "") for m in self.layers],
+        }
+
+    def import_state(self, st):
+        """Restore export_state() onto the freshly-built layers IFF the layer count matches (a
+        config/model change is not resumable -> keep the scalar seeds). kappa is re-clamped to the
+        (possibly lr-changed) stability cap. Returns True on a successful restore."""
+        if not st or int(st.get("n", -1)) != len(self.layers):
+            return False
+        ks = st.get("kappa") or []
+        mg = st.get("last_memgap") or []
+        if len(ks) != len(self.layers):
+            return False
+        for i, m in enumerate(self.layers):
+            k = min(max(float(ks[i]), self.kappa_floor), self.kappa_cap)   # clamp into [floor, cap]
+            self._kappa[id(m)] = k
+            m.gf_consol = k                       # property setter -> fills _gf_consol_value/_buf
+            if i < len(mg) and mg[i] is not None:
+                self._last_memgap[id(m)] = float(mg[i])
+        sts = st.get("step") or []        # back-compat: old sidecars lack these -> keep the init step/dir
+        lds = st.get("last_dir") or []
+        for i, m in enumerate(self.layers):
+            if i < len(sts):
+                self._step[id(m)] = min(max(float(sts[i]), self.step_floor), self.climb_rate)
+            if i < len(lds):
+                self._last_dir[id(m)] = int(lds[i])
+        self._epoch = int(st.get("epoch", self._epoch))
+        # _last_step_t is a multiple of the epoch_steps in force at export; only honor it when the
+        # cadence is unchanged. On an accum-change resume (epoch_steps differs) a stale cursor could
+        # land on a NEW boundary and suppress one legitimate climb -- reset to 0 (the new boundaries
+        # don't coincide with the old, so there is no double-climb to guard against).
+        if int(st.get("epoch_steps", -1)) == int(self.epoch_steps):
+            self._last_step_t = int(st.get("last_step_t", self._last_step_t))
+        else:
+            self._last_step_t = 0
+        return True
 
 
 # ============================================================

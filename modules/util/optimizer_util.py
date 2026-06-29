@@ -423,9 +423,10 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
     # swapped UNet layers self-step in backward. lr comes from the main learning_rate field.
     # The winner knobs default to the validated sf_060 configuration.
     # The panel shows only the live physical knobs. gf_consol (kappa, subsumed by
-    # the dimensionless dissipation), ratio_coh (the gate IS the mechanism; off is
-    # a debug state), and the probe-gated beta1 pair (one-task-validated, off)
-    # remain config-file keys with engine defaults, not panel entries.
+    # the dimensionless dissipation) and ratio_coh (the gate IS the mechanism; off
+    # is a debug state) remain config-file keys with engine defaults, not panel
+    # entries. The probe-gated beta1 pair (autotune_beta1_on / _coh) IS now a panel
+    # entry -- experimental, off by default, autotuner-mediated.
     Optimizer.CONCORD: {
         "momentum": 0.9,
         "weight_decay": 0,
@@ -439,6 +440,15 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
         "gf_trust_delta_sq": 1.0,
         "min_leak": 0.1,
         "evap_build_min": 128.0,
+        "lamb_trust": False,
+        "lamb_cap": 0.0025,
+        "lamb_clip": 4.0,
+        "beta2": 0.999,
+        "beta2_epoch_window": True,
+        "vhat_warmstart": True,
+        "bias_correct_v": False,
+        "coh_vhat": True,
+        "coh_kappa": 1.0,
         "dissipation_fill_ramp": True,
         "telescope_epoch_window": True,
         # Dimensionless mode ON by default: lam = lr*kappa = 0.025 (the nanoGPT
@@ -453,7 +463,22 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
         "dissipation": 0.025,
         "autotune_table": "[[0.387,0],[0.314,0.1],[0.288,0.2],[0.274,0.4],[0.256,0.4]]",
         "autotune_reprobe_band": 0.02,
+        "autotune_gamma_snr_on": True,
         "autotune_gamma_snr": None,
+        # Coherence-gated momentum (beta1), probe-selected -- experimental, off by
+        # default. Surfaced as panel knobs so the gated-beta1 A/B doesn't need a
+        # hand-edited config. Only fires with a non-empty Autotune Table (the tuner
+        # must be built) and only on layers whose probed coherence clears the threshold.
+        "autotune_beta1_on": 0.0,
+        "autotune_beta1_coh": 0.35,
+        # Per-layer epoch dissipation servo (table-free replacement for the
+        # autotune table). True => seed each UNet layer's kappa from
+        # dissipation/lr and climb ONE-SIDED per epoch while that layer earns
+        # (per-layer boil < ceiling AND per-layer memgap still shrinking).
+        # Needs dissipation > 0; honours the gated-beta1 pair above.
+        "autotune_servo": False,
+        "autotune_climb_rate": 0.5,
+        "autotune_boil_ceiling": 0.05,
     },
     Optimizer.LION: {
         "beta1": 0.9,

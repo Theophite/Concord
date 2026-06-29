@@ -36,7 +36,8 @@ import prototype_packed_b as ppb
 from prototype_packed_b import (
     ConcordLinearPackedB, ConcordConv2dPackedB,
     set_ratio_coh, set_ratio_coh_floors, set_fixed_coh,
-    set_lazy_gate, set_lazy_thresh, set_min_leak, set_evap_build_min,
+    set_lazy_gate, set_lazy_thresh, set_min_leak, set_evap_build_min, set_lamb_trust,
+    set_coh_vhat, set_coh_kappa, set_evap_slack,
     set_sigmag_noise, set_sigmag_sigma,
 )
 
@@ -76,12 +77,40 @@ class ConcordConfig:
     v_scale: float = 0.0
     precond_p: float = 0.5
     gf_trust_delta_sq: float = 1.0
+    lamb_trust: bool = False  # per-layer LAMB trust ratio: NORMALIZE each layer's per-step relative
+                              # move toward lamb_cap (two-sided -- brakes the small-norm 128²
+                              # texture-conv overcook, boosts under-movers). Graph-safe. Off = legacy.
+    lamb_cap: float = 0.0025  # TARGET per-step relative move ||update||/||W|| (set ~ native median)
+    lamb_clip: float = 4.0    # bound per-layer scaling to [1/clip, clip]; caps miscalibration damage
+    beta2: float = 0.999      # v_hat (Adafactor rank-1) second-moment EMA decay
+    beta2_epoch_window: bool = True   # pin beta2 = 1 - 1/steps_per_epoch at train start (mirrors
+                                      # telescope_epoch_window). PAIRS with vhat_warmstart -- a shorter
+                                      # beta2 only helps when v_hat is warm-started (toy-confirmed).
+    vhat_warmstart: bool = True       # init v_row/v_col from the FIRST batch g^2 (kills the cold-start
+                                      # bias without an LR warmup / bias-correction driver)
+    bias_correct_v: bool = False      # Adam bias-correction 1/(1-b2^t) on the rank-1 v_hat: the principled
+                                      # cold-start fix. Corrects BOTH the preconditioned step AND cf=d_sv^2/v_hat
+                                      # (both read v_hat at prototype :807-808). MUTUALLY EXCLUSIVE with
+                                      # vhat_warmstart (auto-suppresses it; both -> double-correction/over-damp).
+    coh_vhat: bool = True     # cf-modulated coherence: discount the Wiener residual by kappa/(cf+kappa) with
+                               # cf = d_sv^2/v_hat = the COHERENT FRACTION of the admission (how much gradient
+                               # energy became NET established drift vs cancelled as scatter; 1-cf = the
+                               # normalized admission variance). Protects diverse-concept residual, kills noise
+                               # -- v_hat (energy) alone is anti-predictive. Knee = coh_kappa. Off = legacy coh.
+    coh_kappa: float = 1.0    # dimensionless coherence knee for coh_vhat: discount = kappa/(cf+kappa). cf is
+                               # ~bounded by the timescale ratio, so ~1 is the natural default; larger protects
+                               # only the most coherent coords, smaller protects more. Nudge watching samples.
     min_leak: float = 0.1     # servo floor: min per-step survival fraction of accumulated
                               # s_fast under the gf evaporation -- the valve never fully
                               # shuts (slam-shut guard for lam -> 1; no-op at lam <= 0.9)
-    evap_build_min: float = 128.0  # hypothesis-infancy guard: dissipation fires only at
-                                   # |s_fast| >= this many mantissa units (128 = one s_slow
-                                   # LSB = one deploy tick = first committable size). 0 = off
+    evap_build_min: float = 128.0  # soft spatial infancy SCALE (one deploy tick). The kernel
+                                   # drains a sub-LSB velocity with probability |s_fast|/this and
+                                   # saturates to full at >= this -- size-proportional, not a cliff.
+                                   # (Was 0.0 = all-pass: the OLD hard >= gate closed evaporation
+                                   # permanently because the chase pins |s_fast| BELOW 128 ->
+                                   # washout, so 0 was the only usable value. The stochastic gate
+                                   # removes that, so 128 protects infancy spatially without closing
+                                   # the valve. 0 = all-pass; composes with dissipation_fill_ramp.)
     dissipation_fill_ramp: bool = True  # run-level infancy: scale the friction by the
                                         # anchor-fill fraction 1 - exp(-2*alpha_v_fast*t) --
                                         # don't boil weight off while the pretrained mass is
@@ -130,10 +159,23 @@ class ConcordConfig:
                                       # Plays min-SNR-gamma's role on the DISSIPATION side
                                       # (run the loss unweighted); base = the autotune commit,
                                       # or gf_consol when autotune is off. None = off.
+    autotune_gamma_snr_on: bool = True   # master selector for the gamma-SNR modulation above.
+                                         # False (or knee None / <= 0) -> NO modulation: the base/
+                                         # servo lam applies directly (via before_step's fill-ramp),
+                                         # NOT scaled by SNR and NOT clamped to the lam=1 cap.
     autotune_reprobe_band: float = None  # exp-11d live mode: one-sided coherence-drop
                                           # band that triggers a re-probe; None = one-commit
     autotune_beta1_on: float = 0.0
     autotune_beta1_coh: float = 0.35
+    # Per-layer epoch dissipation servo (EpochDissipationServo): the table-free
+    # replacement for autotune_table. Seeds each layer's kappa from gf_consol
+    # (= dissipation/lr) and climbs ONE-SIDED per epoch while the layer earns
+    # (per-layer boil < ceiling AND per-layer memgap still shrinking). beta1 stays
+    # coherence-gated via autotune_beta1_on/_coh. False = off (legacy table path
+    # via autotune_table still available).
+    autotune_servo: bool = False
+    autotune_climb_rate: float = 0.5      # per-epoch one-sided kappa multiplier step
+    autotune_boil_ceiling: float = 0.05   # halt climb when coherent-waste exceeds this
     # fluctuation (the noise)
     noise: bool = True
     sigmag_iso: bool = True
@@ -159,7 +201,8 @@ def _scalar(v, what):
 
 
 def swap_unet_to_winner(unet, device, lr, gf_consol=None, step_cap=None,
-                        gf_trust_delta_sq=None, verbose=True, module_filters=None):
+                        gf_trust_delta_sq=None, verbose=True, module_filters=None,
+                        train_cond_embed=False, conv_full_vhat=False):
     """Swap every nn.Linear / nn.Conv2d in `unet` (in place) to
     Concord{Linear,Conv2d}PackedB with the validated recipe + dissipation, load
     the pretrained weights, and engage the global winner flags (ratio_coh,
@@ -174,19 +217,41 @@ def swap_unet_to_winner(unet, device, lr, gf_consol=None, step_cap=None,
         step_cap = WINNER["step_cap"]
     if gf_trust_delta_sq is None:
         gf_trust_delta_sq = WINNER["gf_trust_delta_sq"]
-    layers, n_lin, n_conv, n_skipped = [], 0, 0, 0
+    # The timestep / added-conditioning embeddings (time_embedding, add_embedding) are NOT
+    # trained by default -- nothing touches them unless config.concord_train_cond_embed=True.
+    # Default-frozen avoids the embedding norm over-cook (the free-run-collapse driver); the
+    # base already encodes noise-level + size conditioning, so a subject/style fine-tune gains
+    # nothing from training them. Opt IN to train them with concord_train_cond_embed=True.
+    _freeze_cond = not bool(train_cond_embed)
+    layers, n_lin, n_conv, n_skipped, n_frozen = [], 0, 0, 0, 0
     # Honor OneTrainer's layer_filter (the GUI "Layer Filter" dropdown): only layers the
     # filter SELECTS get swapped to Concord; unmatched layers stay standard nn.Linear/Conv2d
     # and are frozen by the normal param-setup path (no packed state, no grads). An empty
     # filter (preset "full") matches everything -> swap all (the original behaviour). Filter
     # patterns are path-based, so map each module to its full UNet-relative name.
-    name_of = {id(m): n for n, m in unet.named_modules()} if module_filters else {}
+    name_of = {id(m): n for n, m in unet.named_modules()}   # filter match + servo-sidecar tagging
     for parent in list(unet.modules()):
         for name, child in list(parent.named_children()):
             c, W2d = None, None
-            if module_filters and isinstance(child, (nn.Linear, nn.Conv2d)):
+            if isinstance(child, (nn.Linear, nn.Conv2d)):
                 full = name_of.get(id(child), name)
-                if not any(f.matches(full) for f in module_filters):
+                # FREEZE the timestep + added-conditioning embedding MLPs (time_embedding,
+                # add_embedding). The base already encodes noise-level + size conditioning; a
+                # subject/style fine-tune gains nothing from retraining them, and leaving them
+                # trainable let Concord's coherence-gated, UN-DECAYED consolidation inflate their
+                # norms -- the dominant free-running over-cook driver (the UNet co-adapts to the
+                # drift and cannot be un-baked afterwards; see the 2026-06 free-run-collapse
+                # autopsy). Leave them standard nn.* and hard-freeze -- the SAME path the
+                # layer_filter uses for unmatched layers. Matches "time_embedding"/"add_embedding"
+                # ONLY -- the per-resnet "time_emb_proj" (different string) stays trainable.
+                # Gated by config.concord_train_cond_embed (default False = NOT trained; set True to train).
+                if _freeze_cond and ("time_embedding" in full or "add_embedding" in full):
+                    child.weight.requires_grad_(False)
+                    if getattr(child, "bias", None) is not None:
+                        child.bias.requires_grad_(False)
+                    n_frozen += 1
+                    continue
+                if module_filters and not any(f.matches(full) for f in module_filters):
                     n_skipped += 1
                     continue   # not selected by layer_filter -> leave standard/frozen
             if isinstance(child, nn.Linear):
@@ -204,6 +269,7 @@ def swap_unet_to_winner(unet, device, lr, gf_consol=None, step_cap=None,
                     padding=_scalar(child.padding, "padding"),
                     bias=child.bias is not None, device=device,
                     alpha=WINNER["alpha"], lr=lr)
+                c.use_full_v = conv_full_vhat   # per-element v_hat (default OFF; config.concord_conv_full_vhat)
                 W2d = child.weight.data.reshape(
                     child.out_channels, child.in_channels * k * k)
                 n_conv += 1
@@ -224,6 +290,7 @@ def swap_unet_to_winner(unet, device, lr, gf_consol=None, step_cap=None,
                     c.bias.data.copy_(child.bias.data.to(c.bias.dtype))
             c.disable_cohpre()                 # ratio-coh: drop coh_pre -> 32 b/param
             setattr(parent, name, c)
+            c._concord_name = name_of.get(id(child), name)   # UNet-relative name for the servo sidecar
             layers.append(c)
     # Global winner flags (module-level switches in prototype_packed_b).
     set_fixed_coh(True)                        # Wiener coherence gate
@@ -231,12 +298,14 @@ def swap_unet_to_winner(unet, device, lr, gf_consol=None, step_cap=None,
     set_sigmag_noise(True, isotropic=WINNER["sigmag_iso"])  # fluctuation
     if verbose:
         extra = f"; left {n_skipped} layers standard/frozen (layer_filter)" if n_skipped else ""
+        froz = f"; FROZE {n_frozen} time/add-embedding layers (not fine-tuned)" if n_frozen else ""
         print(f"[winner] swapped {n_lin} Linear + {n_conv} Conv2d -> Concord "
-              f"(gf_consol={gf_consol}, ratio_coh ON, isotropic noise ON){extra}")
+              f"(gf_consol={gf_consol}, ratio_coh ON, isotropic noise ON){extra}{froz}")
     return layers
 
 
-def swap_text_encoder_to_anchor(te, device, lr, wd_anchor, verbose=True):
+def swap_text_encoder_to_anchor(te, device, lr, wd_anchor, alpha=None, verbose=True,
+                                creep_alpha_v=None, creep_gf_consol=0.0):
     """Swap every nn.Linear in `te` (a CLIP text encoder) to ConcordLinearPackedB in
     FROZEN-V_SLOW ANCHOR mode, for low-drift TE fine-tuning (validated in
     te_frozen_vslow.py [A]-[F]):
@@ -253,7 +322,90 @@ def swap_text_encoder_to_anchor(te, device, lr, wd_anchor, verbose=True):
     s_fast), NOT consolidated_weight. CLIP TEs are all-Linear (no Conv). Returns the layers.
     """
     import torch.nn as nn
+    from prototype_packed_b import ConcordLinearPackedB, compute_drift_cancel_C
+    layers, n = [], 0
+    # Chase rate (s_fast -> s_slow consolidation). None -> the shared WINNER default; a
+    # TE-specific override lets the anchored TE keep small excursions in the fine int16 s_fast
+    # (deploy keeps s_fast, so this trades the coarse-s_slow / fine-s_fast split, not the weight).
+    _alpha = WINNER["alpha"] if alpha is None else float(alpha)
+    for parent in list(te.modules()):
+        for name, child in list(parent.named_children()):
+            if not isinstance(child, nn.Linear):
+                continue
+            c = ConcordLinearPackedB(child.in_features, child.out_features,
+                                     bias=child.bias is not None, device=device,
+                                     alpha=_alpha, lr=lr)
+            c.set_optimizer_kind('adamw', weight_decay=WINNER["weight_decay"],
+                                 eps=WINNER["eps"], step_cap=WINNER["step_cap"])
+            c.precond_p = WINNER["precond_p"]
+            c.v_scale = WINNER["v_scale"]
+            c.gf_trust_delta_sq = WINNER["gf_trust_delta_sq"]
+            c.wd_sv = 0.0
+            c.wd_sf = 0.0
+            c.wd_anchor = float(wd_anchor)  # elastic pull of the delta toward the anchor
+            if creep_alpha_v is None:
+                # FROZEN anchor (validated low-drift mode): v_slow pinned, coherence inert.
+                c.gf_consol = 0.0           # no gf-evap: with coh->0 it would drain s_fast
+                c.alpha_v_fast = 0.0        # pin v_slow (the frozen pretrained anchor)
+                c.drift_cancel_C = 0.0
+                _load = c.load_weights_anchor
+            else:
+                # CREEP anchor (experimental): gap-zero init so d_sv = (s_slow - v_slow) carries the
+                # RECENT drift (no -W DC contamination), and a TINY alpha_v_fast lets v_slow creep
+                # (lag s_slow) so C* = compute_drift_cancel_C(alpha, alpha_v_fast) > 0 and the
+                # coherence gate is LIVE and selective -- it moves the weight on coherent signal and
+                # rejects noise, while the slowness + wd_anchor keep the change bounded near the
+                # pretrained. CPU sim (anchor_sim.py): at alpha_v_fast=1e-3, coh_signal~0.77 vs
+                # coh_noise~0.08, anchor drift ~0.10*||W||. gf_consol>0 gives the gate teeth (evap).
+                c.alpha_v_fast = float(creep_alpha_v)
+                c.drift_cancel_C = compute_drift_cancel_C(
+                    _alpha, c.alpha_v_fast,
+                    mass_preserve=bool(getattr(c, "mass_preserve_v", True)))
+                c.gf_consol = float(creep_gf_consol)
+                _load = c.load_weights      # gap-zero split: pretrained in the protected slow path
+            with torch.no_grad():
+                _load(child.weight.data.float())
+                if child.bias is not None:
+                    c.bias.data.copy_(child.bias.data.to(c.bias.dtype))
+            c.disable_cohpre()
+            setattr(parent, name, c)
+            layers.append(c)
+            n += 1
+    if verbose:
+        _mode = ("frozen-anchor" if creep_alpha_v is None
+                 else f"CREEP-anchor (alpha_v={creep_alpha_v:g}, C*={compute_drift_cancel_C(_alpha, creep_alpha_v):.4f}, gf_consol={creep_gf_consol:g})")
+        print(f"[concord] text encoder: swapped {n} Linear layers to {_mode} packed "
+              f"(lr={lr}, wd_anchor={wd_anchor}, chase_alpha={_alpha:g})")
+    return layers
+
+
+def swap_text_encoder_to_winner(te, device, lr, gf_consol=None, step_cap=None,
+                                gf_trust_delta_sq=None, verbose=True):
+    """Swap every nn.Linear in `te` (a CLIP text encoder) to ConcordLinearPackedB with the
+    SAME WINNER recipe as the UNet (swap_unet_to_winner) -- the "train the TE like the UNet"
+    mode (the default since 2026-06-18). Per layer:
+      - EVEN split via load_weights (s_slow==v_slow==coarse/2, d_sv~=0) -- the live gate gets a
+        clean drift reference, NOT load_weights_anchor's whole-weight-in-v_slow (-W) frozen split;
+      - live coherence gate (alpha_v_fast=0.001>0 default -> drift_cancel_C=C*>0), telescoped to
+        1/(2*steps_per_epoch) by the controller's apply_epoch_window (the alpha_v_fast>0 guard there
+        self-selects winner TEs; frozen anchors with alpha_v_fast==0 are skipped);
+      - evaporation (gf_consol>0) -> the dissipation defends against the incoherent bleed;
+      - NO wd_anchor, NO wd_sv/wd_sf, NO pinned v_slow (the anchor's pull-to-pretrained is GONE;
+        restraint is the gate + evaporation only -- the unanchored-CLIP risk the frozen anchor
+        guarded against, accepted by the user as the default).
+    Call AFTER swap_unet_to_winner: the global coh/noise flags (set_fixed_coh / ratio_coh / sigmag)
+    are module-wide and already set by the UNet swap; this swap does NOT re-set them. CLIP TEs are
+    all-Linear (no Conv). DEPLOY via get_weight (keeps s_fast) through the same TE bridge as the
+    anchor mode -> serializes as a standard CLIPTextModel. Returns the created layers.
+    """
+    import torch.nn as nn
     from prototype_packed_b import ConcordLinearPackedB
+    if gf_consol is None:
+        gf_consol = WINNER["gf_consol"]
+    if step_cap is None:
+        step_cap = WINNER["step_cap"]
+    if gf_trust_delta_sq is None:
+        gf_trust_delta_sq = WINNER["gf_trust_delta_sq"]
     layers, n = [], 0
     for parent in list(te.modules()):
         for name, child in list(parent.named_children()):
@@ -262,28 +414,29 @@ def swap_text_encoder_to_anchor(te, device, lr, wd_anchor, verbose=True):
             c = ConcordLinearPackedB(child.in_features, child.out_features,
                                      bias=child.bias is not None, device=device,
                                      alpha=WINNER["alpha"], lr=lr)
+            # Validated UNet recipe (alpha_v_fast=0.001 + drift_cancel_C=C* come from __init__,
+            # same as the UNet swap; apply_epoch_window telescopes alpha_v_fast at train start).
             c.set_optimizer_kind('adamw', weight_decay=WINNER["weight_decay"],
-                                 eps=WINNER["eps"], step_cap=WINNER["step_cap"])
+                                 eps=WINNER["eps"], step_cap=step_cap)
             c.precond_p = WINNER["precond_p"]
             c.v_scale = WINNER["v_scale"]
-            c.gf_trust_delta_sq = WINNER["gf_trust_delta_sq"]
-            c.gf_consol = 0.0               # no gf-evap: with coh->0 it would drain s_fast
-            c.alpha_v_fast = 0.0            # pin v_slow (the frozen pretrained anchor)
-            c.drift_cancel_C = 0.0
-            c.wd_sv = 0.0
-            c.wd_sf = 0.0
-            c.wd_anchor = float(wd_anchor)  # elastic pull of the delta toward the anchor
+            c.gf_trust_delta_sq = gf_trust_delta_sq
+            c.gf_consol = gf_consol             # dissipation (live gate -> selective evap)
+            c.wd_sv = 0.0                        # NO anchor pull: this is the UNet recipe, not the
+            c.wd_sf = 0.0                        # frozen anchor. v_slow creeps (adaptive), it is
+            c.wd_anchor = 0.0                    # not pinned, and nothing decays toward pretrained.
             with torch.no_grad():
-                c.load_weights_anchor(child.weight.data.float())
+                c.load_weights(child.weight.data.float())     # EVEN split (gap-zero d_sv)
                 if child.bias is not None:
                     c.bias.data.copy_(child.bias.data.to(c.bias.dtype))
-            c.disable_cohpre()
+            c.disable_cohpre()                  # ratio-coh: drop coh_pre (32 b/param), like the UNet
             setattr(parent, name, c)
             layers.append(c)
             n += 1
     if verbose:
-        print(f"[concord] text encoder: swapped {n} Linear layers to frozen-anchor packed "
-              f"(lr={lr}, wd_anchor={wd_anchor})")
+        print(f"[concord] text encoder: swapped {n} Linear layers to WINNER recipe "
+              f"(like the UNet -- even-split, live gate alpha_v={WINNER['alpha_v_fast']:g}, "
+              f"gf_consol={gf_consol:g}, NO anchor) packed (lr={lr})")
     return layers
 
 
@@ -436,6 +589,8 @@ def configure_optimizer(unet, device, config):
         m.alpha_v_fast = config.alpha_v_fast
     ppb.set_ratio_coh(config.ratio_coh)                # global flags from the config
     ppb.set_sigmag_noise(config.noise, isotropic=config.sigmag_iso)
+    ppb.set_coh_vhat(config.coh_vhat)                  # cf-modulated coherence (discount = kappa/(cf+kappa))
+    ppb.set_coh_kappa(config.coh_kappa)                # coherence knee; mirrors ConcordController (concord_ot.py:238-239)
     ppb.set_lazy_gate(config.lazy_gate)
     ppb.set_lazy_thresh(config.lazy_active_thresh)
     ppb.set_min_leak(config.min_leak)
@@ -453,6 +608,8 @@ def active_config():
     return dict(
         ratio_coh=ppb._RATIO_COH,
         fixed_coh=ppb._USE_FIXED_COH,
+        coh_vhat=ppb._USE_COH_VHAT,                    # cf-discount engaged? (set by ConcordController / configure_optimizer)
+        coh_kappa=round(ppb._COH_KAPPA, 4),            # coherence knee in force
         lazy_gate=ppb._LAZY_GATE,
         lazy_thresh=ppb._LAZY_THRESH,
         noise_on=ppb._SIGMAG_NOISE,

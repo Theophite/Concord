@@ -36,8 +36,16 @@ class StableDiffusionXLFineTuneSetup(
     ) -> NamedParameterGroupCollection:
         parameter_group_collection = NamedParameterGroupCollection()
 
-        self._create_model_part_parameters(parameter_group_collection, "text_encoder_1", model.text_encoder_1, config.text_encoder)
-        self._create_model_part_parameters(parameter_group_collection, "text_encoder_2", model.text_encoder_2, config.text_encoder_2)
+        # ANY Concord-trained TE (winner-recipe default OR frozen-anchor opt-in) self-steps in the
+        # captured backward (like the packed embeddings below), so its params must NOT go to the SGD
+        # aux optimizer -- its weight_decay would decay the one live Parameter (the bias) off the
+        # kernel's discipline. Skip on Concord + TE-train, regardless of the anchor-mode flag (the
+        # flag now selects the MODE, not whether the TE is Concord-trained). Non-Concord: unchanged.
+        _concord = config.optimizer.optimizer == Optimizer.CONCORD
+        if not (_concord and config.text_encoder.train):
+            self._create_model_part_parameters(parameter_group_collection, "text_encoder_1", model.text_encoder_1, config.text_encoder)
+        if not (_concord and config.text_encoder_2.train):
+            self._create_model_part_parameters(parameter_group_collection, "text_encoder_2", model.text_encoder_2, config.text_encoder_2)
 
         # Concord packed embeddings self-step inside the backward (no optimizer.step), so they
         # must NOT be handed to the SGD optimizer -- skip the embedding param groups entirely.
@@ -152,21 +160,31 @@ class StableDiffusionXLFineTuneSetup(
             # so the Concord swap only packs the SELECTED layers -- e.g. preset "attn-mlp"
             # (["attentions"]) trains attn+MLP and leaves the conv resnets frozen, dropping
             # their packed state. Empty filter (preset "full") swaps everything as before.
-            # On by default when Concord trains TE1 (text_encoder.train); concord_te_anchor=False
-            # opts out. lr comes from the text_encoder LR field (controller falls back to the
-            # UNet lr if it's unset).
-            te_anchor = config.text_encoder.train and getattr(config, "concord_te_anchor", True)
-            te2_anchor = config.text_encoder_2.train and getattr(config, "concord_te2_anchor", False)
-            te_lr = config.text_encoder.learning_rate if te_anchor else None
-            te2_lr = config.text_encoder_2.learning_rate if te2_anchor else None
+            # TE training under Concord (whenever text_encoder.train): WINNER recipe by DEFAULT
+            # (train like the UNet), frozen ANCHOR opt-in via concord_te_anchor / concord_te2_anchor
+            # (default False = winner). The flag now selects MODE, not whether the TE trains. lr from
+            # the text_encoder LR field (controller falls back to the UNet lr if unset).
+            te_train = config.text_encoder.train
+            te2_train = config.text_encoder_2.train
+            te_use_anchor = getattr(config, "concord_te_anchor", False)
+            te2_use_anchor = getattr(config, "concord_te2_anchor", False)
+            te_lr = config.text_encoder.learning_rate if te_train else None
+            te2_lr = config.text_encoder_2.learning_rate if te2_train else None
+            # UNet per-component LR override, parity with the TE LR fields above: the GUI's
+            # "UNet Learning Rate" maps to config.unet.learning_rate. Concord bypasses torch
+            # param groups, so unless it is threaded in explicitly the field is dead and the UNet
+            # always rides the base lr. Fall back to the base lr when the override is unset.
+            unet_lr = config.unet.learning_rate or config.learning_rate
             model.concord_controller = ConcordController(
-                model.unet, self.train_device, config.learning_rate, total_steps=1,
+                model.unet, self.train_device, unet_lr, total_steps=1,
                 optimizer_config=config.optimizer,
                 module_filters=ModuleFilter.create(config),
-                text_encoder=(model.text_encoder_1 if te_anchor else None),
-                text_encoder_2=(model.text_encoder_2 if te2_anchor else None),
+                text_encoder=(model.text_encoder_1 if te_train else None),
+                text_encoder_2=(model.text_encoder_2 if te2_train else None),
                 te_lr=te_lr, te2_lr=te2_lr,
-                te_wd_anchor=getattr(config, "concord_te_wd_anchor", 0.5))
+                te_use_anchor=te_use_anchor, te2_use_anchor=te2_use_anchor,
+                te_wd_anchor=getattr(config, "concord_te_wd_anchor", 0.5),
+                te_chase_alpha=getattr(config, "concord_te_chase_alpha", 0.1))
             # RESUME: __load_internal rebuilt a STANDARD UNet, so the saved packed_w buffers were
             # dropped and the swap above just packed RANDOM weights. Re-load the backup's packed
             # UNet state into the now-swapped layers to restore the exact Concord state (packed_w
@@ -290,13 +308,15 @@ class StableDiffusionXLFineTuneSetup(
               f"re-materialized {n_resync} weight buffers from restored packed_w")
 
     def __restore_concord_te(self, model, config):
-        # Mirror of __restore_concord_unet for the frozen-anchor TE (CLIP-L). The INTERNAL
-        # backup dumped the swapped TE's packed state under <backup>/text_encoder/*.safetensors,
-        # but __load_internal rebuilt a standard CLIPTextModel (keys discarded -> meta),
-        # setup_train_device to_empty'd it (garbage), and the swap then packed garbage. Reload the
-        # backup's packed_w (incl. the ORIGINAL v_slow anchor) so resume continues from the exact
-        # pre-backup state -- a naive re-pack would re-anchor to current weights and lose the
-        # anti-drift.
+        # Mirror of __restore_concord_unet for the frozen-anchor TEs. The INTERNAL backup
+        # (diffusers layout) dumped each swapped TE's packed state (packed_w + s_fast/s_slow/
+        # v_slow) under <backup>/<subdir>/*.safetensors, but __load_internal rebuilt standard
+        # CLIPTextModels (those keys discarded -> meta; setup_train_device to_empty'd them to
+        # garbage) and the swap then packed garbage. Reload each anchored encoder's packed_w
+        # (incl. the ORIGINAL v_slow anchor) so resume continues from the exact pre-backup state
+        # -- a naive re-pack would re-anchor to current weights and lose the anti-drift. Covers
+        # BOTH CLIP-L (text_encoder) and CLIP-G (text_encoder_2): a TE2-only omission here left
+        # CLIP-G as to_empty garbage on resume.
         import glob
         import os
 
@@ -309,23 +329,72 @@ class StableDiffusionXLFineTuneSetup(
             print("[concord] resume: CONCORD_NO_RESTORE set -> NOT restoring TE")
             return
         backup = config.get_last_backup_path()
-        files = sorted(glob.glob(os.path.join(backup, "text_encoder", "*.safetensors"))) if backup else []
-        if not files:
-            print("[concord] resume: no backup text-encoder state found; continuing from loaded weights")
+        if not backup:
+            print("[concord] resume: no backup path; continuing TE from loaded weights")
             return
-        sd = {}
-        for f in files:
-            sd.update(load_file(f))
-        model.text_encoder_1.load_state_dict(sd, strict=False)
-        n_resync = 0
-        for m in model.text_encoder_1.modules():
-            if hasattr(m, "_resync_weight_buf"):
-                m._resync_weight_buf()
-                n_resync += 1
-        n_packed = sum(1 for k in sd if k.endswith("packed_w"))
-        print(f"[concord] resume: restored TE Concord state from backup "
-              f"({n_packed} packed layers, {len(sd)} tensors); "
-              f"re-materialized {n_resync} weight buffers from restored packed_w")
+        # Restore each encoder that the controller actually anchored (same gating as the
+        # constructor swap + the setup_train_device to_empty), from its diffusers subdir.
+        encoders = []
+        if config.text_encoder.train:                       # any Concord-trained TE (winner or anchor)
+            encoders.append((model.text_encoder_1, "text_encoder"))
+        if config.text_encoder_2.train:
+            encoders.append((model.text_encoder_2, "text_encoder_2"))
+        for encoder, subdir in encoders:
+            files = sorted(glob.glob(os.path.join(backup, subdir, "*.safetensors")))
+            if not files:
+                print(f"[concord] resume: no backup {subdir} state found; "
+                      f"continuing from loaded weights")
+                continue
+            sd = {}
+            for f in files:
+                sd.update(load_file(f))
+            encoder.load_state_dict(sd, strict=False)
+            n_resync = 0
+            n_posid = 0
+            n_resplit = 0
+            for m in encoder.modules():
+                if hasattr(m, "_resync_weight_buf"):
+                    m._resync_weight_buf()
+                    n_resync += 1
+                    # DECONTAMINATE a frozen-era anchor backup resumed under the CREEP default.
+                    # The restore above faithfully reloads the backup's packed state -- which, for
+                    # a backup written in frozen-anchor mode (load_weights_anchor: whole weight in
+                    # v_slow, s_slow=0), means d_sv = (s_slow - v_slow) ~= -W. Frozen (alpha_v=0)
+                    # that is pinned and harmless; but under the creep default (alpha_v_fast>0) the
+                    # live leak drags that fixed -W through the coherence gate as fake "signal" and
+                    # drains the anchor -> TE deploy-norm washout (decode_dsv.py: cos(d_sv,deploy)
+                    # ~= -0.7 on both TEs, vs +0.01 on the cleanly even-split UNet). Re-split the
+                    # slow channel to even (d_sv~=0), mass-preserving: deploy + s_fast are exact,
+                    # only s_slow<->v_slow moves. No-op on a clean creep state (||d_sv||/||deploy||
+                    # small) and never invoked on a frozen anchor (gated on alpha_v_fast>0).
+                    if getattr(m, "alpha_v_fast", 0.0) > 0.0 \
+                            and hasattr(m, "resplit_anchor_to_even") \
+                            and not os.environ.get("CONCORD_NO_RESPLIT"):
+                        if m.resplit_anchor_to_even():
+                            n_resplit += 1
+                # THE RESUME BUG. setup_train_device.to_empty() re-allocated EVERY buffer as
+                # uninitialized garbage -- including CLIP's position_ids, which transformers
+                # registers persistent=False (modeling_clip.py:224). Non-persistent => absent from
+                # the saved state_dict => the load_state_dict above could NOT restore it, so it kept
+                # to_empty's garbage. Garbage position_ids -> garbage positional embeddings -> the TE
+                # emits noise -> the UNet runs effectively unconditional -> brown/flat samples on
+                # resume. (UNet-only training never hits this: the TE is never swapped/to_empty'd, so
+                # its position_ids stays the arange from __init__. The packed weights restore fine --
+                # this is a separate buffer the packed proofs never touched.) Re-seed it to arange,
+                # exactly what transformers' __init__ set.
+                _pid = getattr(m, "position_ids", None)
+                if _pid is not None and torch.is_tensor(_pid) and _pid.dim() == 2 \
+                        and not os.environ.get("CONCORD_NO_POSID_RESEED"):  # A/B kill-switch: prove the re-seed is load-bearing
+                    with torch.no_grad():
+                        _pid.copy_(torch.arange(_pid.shape[-1], device=_pid.device,
+                                                dtype=_pid.dtype).unsqueeze(0))
+                    n_posid += 1
+            n_packed = sum(1 for k in sd if k.endswith("packed_w"))
+            print(f"[concord] resume: restored {subdir} Concord state from backup "
+                  f"({n_packed} packed layers, {len(sd)} tensors); "
+                  f"re-materialized {n_resync} weight buffers from restored packed_w; "
+                  f"re-split {n_resplit} live-leak TE layers v_slow->even (frozen-era -W d_sv decontamination); "
+                  f"re-seeded {n_posid} position_ids (to_empty garbages this persistent=False buffer)")
 
     def setup_train_device(
             self,
@@ -344,9 +413,15 @@ class StableDiffusionXLFineTuneSetup(
         # backup (only packed_w), so from_pretrained left them meta -> materialize before the move
         # + swap; __restore_concord_te reloads the real packed state in setup_model.
         if config.continue_last_backup and config.optimizer.optimizer == Optimizer.CONCORD \
-                and config.text_encoder.train and getattr(config, "concord_te_anchor", True) \
+                and config.text_encoder.train \
                 and any(p.is_meta for p in model.text_encoder_1.parameters()):
             model.text_encoder_1.to_empty(device=self.train_device)
+        # Same for CLIP-G (text_encoder_2) under concord_te2_anchor -- exact mirror of the TE1
+        # block above; its omission left CLIP-G on meta and crashed the move-to-device on resume.
+        if config.continue_last_backup and config.optimizer.optimizer == Optimizer.CONCORD \
+                and config.text_encoder_2.train \
+                and any(p.is_meta for p in model.text_encoder_2.parameters()):
+            model.text_encoder_2.to_empty(device=self.train_device)
 
         vae_on_train_device = not config.latent_caching
         text_encoder_1_on_train_device = \

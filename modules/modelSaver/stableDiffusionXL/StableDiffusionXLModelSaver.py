@@ -90,7 +90,7 @@ class StableDiffusionXLModelSaver(
             model.concord_controller.consolidate_into_unet(model.unet)
 
         # Reversible TE deploy (frozen-anchor CLIP-L): materialize the packed TE Linears to temp
-        # nn.Linear (get_weight, keeps s_fast) for the DEPLOYABLE formats so the TE serializes as
+        # nn.Linear (consolidated_weight, DROPS s_fast -- matching the UNet deploy) for the DEPLOYABLE formats so the TE serializes as
         # a standard CLIPTextModel; restored in finally so training continues. Unlike the UNet's
         # destructive consolidate this is REVERSIBLE. No-op for INTERNAL backups -> the packed TE
         # is raw-dumped and resume reloads it (preserving the original v_slow anchor).
