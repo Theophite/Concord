@@ -32,11 +32,13 @@ RESPONSIBILITY
     concord_embedding_packed.py:21-22 reads them off the class. Do NOT collapse to
     module constants.
 
-MIGRATES FROM prototype_packed_b.py (PB) — DO NOT MOVE CODE YET; line-range map only:
-    PB:2233-2459  FusedConcordLinearPackedB
-    PB:2462-3186  ConcordLinearPackedB   (class consts at 2479-2482 — KEEP)
-    PB:3192-3397  FusedConcordConv2dPackedB
-    PB:3400-3449  ConcordConv2dPackedB
+MIGRATES FROM prototype_packed_b.py (PB) — see **REFACTOR_PLAN.md §3** for the
+    AUTHORITATIVE, reconciled PB line-range map (single source of truth). The per-line
+    ranges that used to be duplicated here were the original setup-task numbers against a
+    4150-line PB and are SUPERSEDED — the source is now 4176 lines after the 2026-06-29
+    M6a / 6-wide-boil / servo-ceiling drift. Any ``PB:NNN`` still cited elsewhere in this
+    docstring (the SF2 live-read sites, the class-const re-declaration) is ILLUSTRATIVE
+    only; re-verify against §3 before moving. DO NOT MOVE CODE YET.
 
 RE-EXPORT (shim must expose): ConcordLinearPackedB, ConcordConv2dPackedB
     (the two non-fused classes are read by concord_embedding_packed + concord_ot
@@ -45,5 +47,6 @@ RE-EXPORT (shim must expose): ConcordLinearPackedB, ConcordConv2dPackedB
 MIGRATION: STEP 8 (after kernels.py — layers imports kernels).
     ``import state as S; from kernels import *; from constants import *``.
     Gate: L0 + L1 (G4-CPU load/deploy math, test_doc_deploy/format) + L3
-    (G4-construct + G2 re-run).
+    (G4-construct + G2 re-run, NEAR-bit-exact within the per-field envelope — the kernel
+    is not bit-reproducible; see REFACTOR_PLAN.md §7).
 """

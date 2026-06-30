@@ -15,9 +15,14 @@ RESPONSIBILITY
     Also drop the now-unused top-level ``import sys`` / ``import time`` from the
     monolith IF (verify first) only the smoke code used them.
 
-MIGRATES FROM prototype_packed_b.py (PB) — DO NOT MOVE CODE YET; line-range map only:
-    PB:3948-4150  _run_one, _packed_b_mlp*, _torch_mlp*, diagnose, smoke_test, main
-                  (+ ADD the missing ``if __name__ == "__main__": main()`` guard)
+MIGRATES FROM prototype_packed_b.py (PB) — see **REFACTOR_PLAN.md §3** for the
+    AUTHORITATIVE, reconciled PB line-range map (single source of truth). The per-line
+    ranges that used to be duplicated here were the original setup-task numbers against a
+    4150-line PB and are SUPERSEDED — the source is now 4176 lines after the 2026-06-29
+    M6a / 6-wide-boil / servo-ceiling drift (the smoke block + the missing
+    ``if __name__ == "__main__": main()`` guard are now near the file tail ~4166+). Any
+    ``PB:NNN`` still cited elsewhere in this docstring is ILLUSTRATIVE only; re-verify
+    against §3 before moving. DO NOT MOVE CODE YET.
 
 RE-EXPORT: none (no external consumer; not re-exported by the shim).
 

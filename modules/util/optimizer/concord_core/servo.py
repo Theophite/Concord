@@ -12,9 +12,14 @@ CAUTION (D5 — table-vs-servo redundancy is currently AMBIGUOUS; do NOT resolve
     this pass): doc says servo replaces the table; shipped defaults activate the
     table. NOT a clean removal — second pass must decide which supersedes which.
 
-MIGRATES FROM prototype_packed_b.py (PB) — DO NOT MOVE CODE YET; line-range map only:
-    PB:3493-3649  DissipationAutoTuner
-    PB:3652-3945  EpochDissipationServo
+MIGRATES FROM prototype_packed_b.py (PB) — see **REFACTOR_PLAN.md §3** for the
+    AUTHORITATIVE, reconciled PB line-range map (single source of truth). The per-line
+    ranges that used to be duplicated here were the original setup-task numbers against a
+    4150-line PB and are SUPERSEDED — the source is now 4176 lines after the 2026-06-29
+    M6a / 6-wide-boil / servo-ceiling drift (EpochDissipationServo.step changed: the
+    cf-ceiling was removed for protected_boil — see §3). Any ``PB:NNN`` still cited
+    elsewhere in this docstring is ILLUSTRATIVE only; re-verify against §3 before moving.
+    DO NOT MOVE CODE YET.
 
 RE-EXPORT (shim must expose): DissipationAutoTuner, EpochDissipationServo
     (both have external consumers).

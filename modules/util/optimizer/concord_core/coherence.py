@@ -22,8 +22,12 @@ CAUTION (INV-B / D1 — multiple coherence definitions must stay numerically loc
         shim resolving those live; do NOT touch the constants without auditing that
         host re-derivation (it has no golden -> it drifts silently). See D1 (D2nd-pass).
 
-MIGRATES FROM prototype_packed_b.py (PB) — DO NOT MOVE CODE YET; line-range map only:
-    PB:3465-3490  gate_coherence_from_fields, measure_coherence
+MIGRATES FROM prototype_packed_b.py (PB) — see **REFACTOR_PLAN.md §3** for the
+    AUTHORITATIVE, reconciled PB line-range map (single source of truth). The per-line
+    ranges that used to be duplicated here were the original setup-task numbers against a
+    4150-line PB and are SUPERSEDED — the source is now 4176 lines after the 2026-06-29
+    M6a / 6-wide-boil / servo-ceiling drift. Any ``PB:NNN`` still cited elsewhere in this
+    docstring is ILLUSTRATIVE only; re-verify against §3 before moving. DO NOT MOVE CODE YET.
 
 RE-EXPORT (shim must expose): gate_coherence_from_fields, measure_coherence
     (servo imports measure_coherence).

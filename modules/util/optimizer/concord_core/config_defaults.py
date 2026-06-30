@@ -45,11 +45,17 @@ PANEL_KEYS = (
     "autotune_boil_ceiling",
 )
 
-# INTENTIONAL per-surface overrides (the four real differences, NOT garbage):
-#   - momentum: the AUX-SGD momentum (norms/biases); NOT a ConcordConfig field -> panel-only.
-#   - dissipation/autotune_table/autotune_reprobe_band: the LIVE shipped recipe ENABLES
-#     dimensionless dissipation (lam=0.025) + the CPU-calibrated autotune table + the exp-11d
-#     reprobe watchdog by default; the bare ConcordConfig() picker leaves them OFF (None). See O7.
+# INTENTIONAL per-surface overrides (NOT garbage) -- TWO structurally distinct kinds:
+#   (a) NET-NEW (not a ConcordConfig field at all, so there is nothing to project from):
+#         - momentum=0.9 -- the AUX-SGD momentum for the norm/bias params, not a Concord-core knob.
+#   (b) SHADOW a projected key (the field IS in PANEL_KEYS, so it is first read off cfg as None,
+#       then deliberately OVERWRITTEN here because the LIVE shipped recipe turns it ON while the
+#       bare ConcordConfig() picker leaves it OFF -- see O7):
+#         - dissipation=0.025          (dimensionless lam = lr*kappa)
+#         - autotune_table="[[...]]"   (the CPU-calibrated lam-units curve)
+#         - autotune_reprobe_band=0.02 (the exp-11d reprobe watchdog)
+# concord_defaults_from() applies these via .update() AFTER projecting PANEL_KEYS, so kind (b)
+# overwrites the projected None and kind (a) is added net-new.
 PANEL_OVERRIDES = {
     "momentum": 0.9,
     "dissipation": 0.025,

@@ -270,15 +270,14 @@ def _recapture_g2_with_rng(cfg, device, gold_g2, sub_key):
     GC.ppb._FUSED_MATMUL = bool(fused)
     if not noise_on:
         return GC._drive_g2(cfg, device, sub["n_steps"], noise_on=False, seed=sub["seed"])
-    # noise-ON: the golden captured the RNG state right before stepping. _drive_g2
-    # re-seeds internally (seed+1) before _record_rng_state, so as long as the
-    # capture and compare use the SAME seed + the SAME torch version, the draws
-    # match. As a belt-and-suspenders guard we additionally verify the recorded
-    # draw probe matches; if it doesn't, the run uses the SAVED state directly.
+    # noise-ON: the golden captured the cpu+cuda RNG state right before stepping. We
+    # RESTORE that exact state and run a variant of _drive_g2 that does NOT re-seed (so
+    # the restore stands), reproducing the randn draw order bit-for-bit.
+    # NOTE: the golden also stores a `draw_probe` fingerprint, but it is NOT cross-checked
+    # here -- an earlier draft described a "verify the probe, else fall back to the saved
+    # state" guard that was never implemented. TODO: either add the probe assert or drop
+    # draw_probe from the capture so the comment and code agree.
     fp = sub["rng_fingerprint"]
-    # Restore the exact captured state, THEN run a variant of _drive_g2 that does
-    # NOT re-seed (so our restore stands). We monkeypatch by pre-restoring and
-    # calling the internal stepping with noise on.
     return _drive_g2_from_state(cfg, device, sub["n_steps"], fp, seed=sub["seed"])
 
 
@@ -393,7 +392,7 @@ def main():
         # Fall back to whichever manifest exists, so a CPU compare still works off a
         # full-run capture (and vice-versa for the shared G5/G3 goldens).
         alt = GOLDENS_DIR / ("manifest.json" if args.cpu else "manifest_cpu.json")
-        if man_path.exists() is False and alt.exists():
+        if alt.exists():
             man_path = alt
         else:
             raise SystemExit(f"no goldens found at {GOLDENS_DIR} "

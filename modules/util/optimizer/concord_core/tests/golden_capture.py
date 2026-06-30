@@ -8,27 +8,39 @@ kernels can crash it. Do NOT run this while a training run is active. There is
 also a per-process module-global state surface (set_*/_FUSED_MATMUL) that this
 script mutates -- another reason it must own the GPU alone.
 
-It captures BIT-EXACT golden snapshots from the CURRENT code at
+It captures golden snapshots from the CURRENT code at
   modules/util/optimizer/concord/prototype_packed_b.py  (+ concord_winner / concord_ot)
 so the upcoming reorg into concord_core/ can be proven behavior-preserving by
-golden_compare.py (re-run the same cases, diff at atol=0).
+golden_compare.py (re-run the same cases, diff against the goldens).
+
+GATE MODEL (read first -- the older "BIT-EXACT / atol=0" phrasing further down predates
+this finding and is superseded for the GPU gates): the apply KERNEL is NOT
+bit-reproducible -- a single step from identical inputs/state diverges ~70/2048 ints,
+EVEN under CUDA-graph replay (HW float-reduction order; verified 2026-06-29). So the GPU
+gates (G1/G2/G3c) are NEAR-bit-exact: refactored must stay within the baseline's measured
+per-field self-jitter envelope (x a margin) -- the DEPLOY fields (s_slow/v_slow/weight_buf)
+tight, the dropped s_fast velocity loose. Only the HOST gates (G5 config dict, G3a/G3b
+servo/autotuner -- no kernel launched) are truly atol=0.
 
 AUTHORED BLIND (the GPU was busy with a live run when this was written). It has
-NOT been executed. Treat the FIRST run as the validation run: expect to fix
-small API/attr mismatches, NOT to trust the numbers until a clean PASS of a
-self-consistency check (capture twice -> identical) is observed. The
-self-consistency guard at the end of each capture flags non-determinism.
+NOT been executed. Treat the FIRST run as the validation run: expect to fix small
+API/attr mismatches. NOTE: the capture-twice-must-be-identical guard (_self_consistency)
+covers the HOST captures only (G5/G3a/G3b); the GPU captures are not bit-reproducible
+(see GATE MODEL) and instead use _capture_envelope to measure the per-field self-jitter
+the compare then tolerates.
 
 What it captures (see the approved plan .result.plan.golden_gate + .stress):
 
-  G1  KERNEL-OUTPUT (bit-exact, atol=0): a fixed N=32,K=64 ConcordLinearPackedB,
-      torch.manual_seed(0), fixed loaded W, a FIXED grad sequence; the FULL int32
-      packed_w + bf16 weight_buf + row_exp/col_exp + v_row/v_col/_sum_v_inv after
-      EACH step, across a CONFIG MATRIX that exercises every kernel constexpr
-      branch. Determinism comes from step_salt == _get_step_counter (reset per
-      case) + the kernel's fixed XOR salts; no torch.randn in this path.
+  G1  KERNEL-OUTPUT (GPU, NEAR-bit-exact within the envelope): a fixed N=32,K=64
+      ConcordLinearPackedB, torch.manual_seed(0), fixed loaded W, a FIXED grad sequence;
+      the FULL int32 packed_w (decomposed into s_fast/s_slow/v_slow) + bf16 weight_buf +
+      row_exp/col_exp + v_row/v_col/_sum_v_inv + the 6-wide boil buffer after EACH step,
+      across a CONFIG MATRIX that exercises every kernel constexpr branch. The SR salt is
+      deterministic (step_salt == _get_step_counter, reset per case; fixed XOR salts; no
+      torch.randn in this path) -- but that does NOT make the kernel bit-reproducible: the
+      float-reduction-order jitter still applies, so G1 is enveloped, not atol=0.
 
-  G2  SHIPPED-DEFAULT TRAJECTORY (bit-exact): the EXACT shipped config via
+  G2  SHIPPED-DEFAULT TRAJECTORY (GPU, near-bit-exact; noise-ON RNG-restored): the EXACT shipped config via
       make_concord_config(lr, None) -> ConcordController-style setup over a tiny
       synthetic UNet (a few Linear + one Conv2d). Driven N steps via the real
       autograd forward/backward. Snapshots every layer's packed_w + device
@@ -1026,10 +1038,10 @@ def main():
     torch.save(gpu_env, GOLDENS_DIR / "gpu_envelope.pt")
 
     print("[golden_capture] G2 shipped-default trajectory ...")
-    # G2 noise-OFF must be bit-reproducible; noise-ON is NOT (it draws randn) and
-    # is only reproducible via the captured RNG state -> we do NOT run the
-    # double-capture determinism check on the combined G2 (it would flag noise-on).
-    # Instead capture once; golden_compare validates noise-on via the RNG restore.
+    # Neither G2 variant is bit-reproducible on GPU (float-reduction jitter); noise-ON
+    # ALSO draws randn, reproduced only via the captured RNG state. Either way we do NOT
+    # run a double-capture determinism check on G2 -- the envelope gate handles the
+    # jitter, and golden_compare validates noise-ON via the RNG restore.
     g2 = capture_g2(device, n_steps=6)
     torch.save(g2, GOLDENS_DIR / "g2_shipped_trajectory.pt")
     # NOTE: no determinism re-check here -- the kernel is known nondeterministic

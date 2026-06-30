@@ -12,10 +12,12 @@ DOC-CONTRACT (do not silently change — gated by L2 / G7):
     by VALUE in the doc tests and CONCORD.md. compute_drift_cancel_C is doc-tested
     by value. A variable rename or value change here is a CONTRACT BREAK.
 
-MIGRATES FROM prototype_packed_b.py (PB) — DO NOT MOVE CODE YET; line-range map only:
-    PB:45-49    MANTISSA_BIAS, INT8_MIN/INT8_MAX, INT16_MIN/INT16_MAX,
-                S_SLOW_FACTOR, V_SLOW_FACTOR
-    PB:52-102   compute_drift_cancel_C
+MIGRATES FROM prototype_packed_b.py (PB) — see **REFACTOR_PLAN.md §3** for the
+    AUTHORITATIVE, reconciled PB line-range map (single source of truth). The per-line
+    ranges that used to be duplicated here were the original setup-task numbers against a
+    4150-line PB and are SUPERSEDED — the source is now 4176 lines after the 2026-06-29
+    M6a / 6-wide-boil / servo-ceiling drift. Any ``PB:NNN`` still cited elsewhere in this
+    docstring is ILLUSTRATIVE only; re-verify against §3 before moving. DO NOT MOVE CODE YET.
 
 RE-EXPORT (the shim + concord_winner + concord_embedding_packed must see these):
     MANTISSA_BIAS, INT16_MIN, INT16_MAX, S_SLOW_FACTOR, V_SLOW_FACTOR,
