@@ -352,6 +352,22 @@ grouped for readability, flat at runtime. Derive `WINNER` = recipe-key projectio
 `CONCORD_DEFAULTS` = panel-key projection so `swap_unet_to_winner` and `optimizer_util` read the SAME
 source.
 
+> **✅ STEP 1 DONE (2026-06-29) — projection CONTRACT established (additive, zero behavior change).**
+> `config_defaults.py` now holds `WINNER_KEYS` / `PANEL_KEYS` / `PANEL_OVERRIDES` + `winner_from(cfg)` /
+> `concord_defaults_from(cfg)`, and `tests/test_config_projection.py` asserts (PASS) that the LIVE
+> `concord_winner.WINNER` and the `OPTIMIZER_DEFAULT_PARAMETERS[CONCORD]` literal EQUAL the projections of
+> `concord_winner.ConcordConfig()`. **WINNER is a pure projection (16 keys, no overrides).** CONCORD_DEFAULTS
+> is a projection + **4 INTENTIONAL overrides** (NOT garbage): `momentum=0.9` (aux-SGD, not a Concord field),
+> and `dissipation=0.025` / `autotune_table=...` / `autotune_reprobe_band=0.02` (the LIVE recipe enables
+> dissipation+autotune; the bare `ConcordConfig()` picker leaves them None — O7). The panel test reads the
+> dict from SOURCE via `ast` (importing `optimizer_util` trips the create↔modelSetup circular import — same
+> technique as `test_autotuner_cpu.py:196`); NOTE there is **no `test_doc_config.py` in the tree** (the
+> plan's repeated references to it are stale — this new test is the `literal==projection` backstop O5 wanted).
+> NEXT (deferred, needs the concord_core import plumbing from the code-motion cut-over): physically move
+> `ConcordConfig` into `config_defaults.py` + have `concord_winner` re-export it, then rewire `WINNER` /
+> `CONCORD_DEFAULTS` to BE the projections (each gated by this test). Until the plumbing exists, the literals
+> stay the source and this test guards the drift.
+
 **Doc-test constraints (Hole 6 / O5 — do NOT make CONCORD_DEFAULTS a computed expression):**
 `test_doc_config.py` loads `ConcordConfig` via `from concord_winner import ConcordConfig` and AST-parses
 `optimizer_util.OPTIMIZER_DEFAULT_PARAMETERS` with ONLY `{'Optimizer': Optimizer}` in scope.
