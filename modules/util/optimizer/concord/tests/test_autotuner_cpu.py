@@ -396,7 +396,15 @@ check("13e lag-tax signature: high waste, boil ~ 0",
 # ---- 14. telescope epoch window ----------------------------------------------
 def ew_rig(flag=True, av=0.001):
     return SimpleNamespace(
-        config=SimpleNamespace(telescope_epoch_window=flag, alpha_v_fast=av),
+        # beta2_epoch_window/beta2/vhat_warmstart/bias_correct_v: apply_epoch_window's
+        # v_hat-window block (concord_ot.py:747-771) reads these unconditionally when
+        # steps_per_epoch > 0; the rig predated them (2026-06-29 audit G1: AttributeError
+        # at the 14a call killed checks 14a-14g and §15+). Neutral values -> the block
+        # no-ops (rig layers lack track_adafactor_v), so 14a-14g still test ONLY the
+        # telescope re-pinning they were written for.
+        config=SimpleNamespace(telescope_epoch_window=flag, alpha_v_fast=av,
+                               beta2_epoch_window=False, beta2=0.999,
+                               vhat_warmstart=False, bias_correct_v=False),
         emb_cores=[], emb_delay_epochs=0.0, emb_delay_steps=0, steps_per_epoch=0.0,
         te_layers=[], te_groups=[],          # per-group servo: apply_epoch_window telescopes winner TEs
         layers=[SimpleNamespace(alpha=0.1, alpha_v_fast=av, drift_cancel_C=0.0,
@@ -518,9 +526,14 @@ check("17c released on a shifted clock: fresh warmup, cosine ends at horizon",
 
 # 17d: delay epochs -> steps resolution at horizon finalize (store happens
 # BEFORE the telescope gate, so it works with the epoch window off)
-rig17 = SimpleNamespace(config=SimpleNamespace(telescope_epoch_window=False),
+rig17 = SimpleNamespace(config=SimpleNamespace(telescope_epoch_window=False,
+                                               # v_hat-window block reads these even with the
+                                               # telescope flag off (see ew_rig note above)
+                                               beta2_epoch_window=False, beta2=0.999,
+                                               vhat_warmstart=False, bias_correct_v=False),
                         emb_cores=[object()], emb_delay_epochs=1.0,
-                        emb_delay_steps=0, steps_per_epoch=0.0, layers=[])
+                        emb_delay_steps=0, steps_per_epoch=0.0, layers=[],
+                        te_layers=[])   # v_hat loop iterates layers + te_layers
 ConcordController.apply_epoch_window(rig17, 943)
 check("17d delay resolved at finalize even with epoch window off",
       rig17.emb_delay_steps == 943 and rig17.steps_per_epoch == 943.0)
