@@ -94,7 +94,7 @@ the targets for the golden-gated moves.
 > - **`boil_ptr[3]` is now weighted by `coh_evap`** (PB:993 — the clamped `min(coh,
 >   coh_raw+evap_slack)`, matching the actuator), not raw `coh`. Meter/actuator mismatch
 >   fix.
-> - **M6a meter (PB:994–996)** is **LOG-ONLY, bit-irrelevant to the weight update**: `[4]`
+> - **M6a meter (PB:994–1002)** is **LOG-ONLY, bit-irrelevant to the weight update**: `[4]`
 >   = killed coherent mass in the hypothesis-infancy band (`|s_fast| < evap_build_min`),
 >   `[5]` = consolidated `s_slow` energy; M6a = `[4]/[5]`. Written by the adamw kernel;
 >   **read by `concord_ot.py` (not by `read_boil`/`read_layer_boil`)** — see the new
@@ -114,7 +114,7 @@ PB:52-107    compute_drift_cancel_C   (start UNCHANGED @52; ends before @triton.
 
 ### state.py  (move LAST — STEP 6)  *(all ranges re-derived 2026-06-29; re-verify exact ends before moving)*
 ```
-PB:183-213   _FUSED_MATMUL env flag (@183), _FUSED_SCRATCH (@188), _get_fused_scratch (@191)  (+ NEW set_fused_matmul, SF1)
+PB:183-201   _FUSED_MATMUL env flag (@183), _FUSED_SCRATCH (@188), _get_fused_scratch (@191)  (+ NEW set_fused_matmul, SF1; ends before _FUSED_AUTOTUNE_CONFIGS @202 — kernels.py)
 PB:469-484   _STEP_COUNTERS (@469), _get_step_counter (@472)         (raw str(device) key — KEEP)
 PB:483-508   _CONSOLIDATE_FLAGS (@483), _dev_key (@486), _get_consolidate_flag (@495), set_consolidate (@502)  (_dev_key key — KEEP asymmetry)
 PB:510-527   _LR_SCALAR_CACHE (@510), _ensure_lr_tensor (@513)
@@ -149,16 +149,16 @@ PB:2145-2172 _REB_STATS (@2145)/reset_reb_stats (@2148)/get_reb_stats (@2154), _
 ### kernels.py  (STEP 7)  *(all ranges re-derived 2026-06-29; re-verify exact ends before moving)*
 ```
 PB:109-117   _hash_uniform (@110)
-PB:120-189   _materialize_packed_bf16_kernel (@121) + materialize_packed_bf16 (@158)
-PB:215-324   _FUSED_AUTOTUNE_CONFIGS, _fused_packed_linear_kernel (@216)/_fused_packed_gradx_kernel (@256)
+PB:120-171   _materialize_packed_bf16_kernel (@121) + materialize_packed_bf16 (@158)  (ends before the state.py fused-scratch globals @183)
+PB:202-324   _FUSED_AUTOTUNE_CONFIGS (@202) + @triton.autotune decorator (@214), _fused_packed_linear_kernel (@216)/_fused_packed_gradx_kernel (@256)
              + fused_packed_linear (@291)/fused_packed_gradx (@309)
-PB:326-470   _apply_packed_sgd_kernel (@327)   (ends before _get_step_counter @472)
+PB:326-466   _apply_packed_sgd_kernel (@327)   (ends before _STEP_COUNTERS @469 — state.py)
 PB:566-624   apply_packed_sgd (@566)
 PB:626-643   _lamb_scale_kernel (@627)
 PB:645-1196  _apply_packed_adamw_kernel (@646)  THE monster. ⚠ doc-asserted kernel strings are matched by CONTENT
              (`assert "<text>" in PPB_SRC` / `PPB_SRC.index`), NOT by line number (test_doc_kernel.py) — so line
              drift does NOT break them; KEEP the strings byte-identical (no renames this pass). Note the M6a /
-             coh_evap boil writes now live at PB:961-996 inside this kernel (log-only [4]/[5]; coh_evap [3]).
+             coh_evap boil writes now live at PB:961-1002 inside this kernel (log-only [4]/[5] @1001-1002; coh_evap [3] @993).
 PB:1198-1284 _DENOM_DIAG (@1198), _denom_diagnostic (@1203)   (gated enabled=False — D6: move with gate intact; ends before _USE_FIXED_COH @1286)
 PB:1794-2002 apply_packed_adamw  (launcher @1794; reads S._COH_KAPPA/_EVAP_SLACK/_MIN_LEAK/_EVAP_BUILD_MIN/
              _GATE_GAIN/_LAZY_THRESH (@1956)/_GAP_*/_USE_FIXED_COH/_USE_COH_VHAT/_RATIO_COH/_GAP_FEEDBACK/
@@ -246,10 +246,10 @@ concord_embedding_packed.py additionally needs INT16_MIN/MAX/S_SLOW_FACTOR/V_SLO
 - [ ] **STEP 2 — constants.py:** move PB:45-102; in the monolith replace those defs with
       `from constants import *`. Gate L0 + L1 + L2 (constants/compute_drift_cancel_C are
       doc-tested BY VALUE → stay green).
-- [ ] **STEP 3 — _smoke.py:** move PB:3948-4150, add `__main__` guard; drop unused top-level
+- [ ] **STEP 3 — _smoke.py:** move PB:3978-4176, add `__main__` guard; drop unused top-level
       `import sys`/`import time` IF only smoke used them (VERIFY first). Gate L0 + L1.
 - [ ] **STEP 4 — coherence.py:** move PB:3465-3490 (leaf). Gate L0 + L1 (test_coherence_cpu).
-- [ ] **STEP 5 — servo.py:** move PB:3493-3945. `import state`, `from coherence import measure_coherence`.
+- [ ] **STEP 5 — servo.py:** move PB:3502-3977. `import state`, `from coherence import measure_coherence`.
       Gate L0 + L1 (test_servo_cpu, test_autotuner_cpu — trajectory-snapshot diff at atol=0).
 - [ ] **STEP 6 — state.py (HIGHEST RISK — snapshot hazard):** move ALL globals/setters/caches/meters.
       The monolith now `from state import *` AND re-exports live-mutable scalars via module `__getattr__`.
@@ -555,7 +555,7 @@ SHA + torch/triton/CUDA versions. Re-baseline if the toolchain moves (Triton cod
 |----|------|-----------|
 | **R1 (HIGHEST)** | MODULE-GLOBAL SNAPSHOT HAZARD: `from state import _COH_KAPPA` captures the import-time value; a later setter rebinds state but the importer keeps the stale value → silent bit drift, invisible to a smoke import. | kernels.py reads launch-baked scalars ONLY as `import state as S; S._COH_KAPPA`. Shim exposes live scalars via PEP-562 `__getattr__`. L0 gate `set_X(v)→assert ppb._X==v` for every launch-baked scalar. Confirmed live reads PB:1947-1986 + backward PB:2382/3069/3311. **Extended by SF1/SF2 + INV-A taxonomy.** |
 | **R2** | DUAL-MODULE-IDENTITY DESYNC: `prototype_packed_b` is loaded as TWO objects (package-qualified vs bare during swap); per-object launch globals desync; setup loops `sys.modules` filtering `rsplit('.',1)[-1]=='prototype_packed_b'` (SDXLFineTuneSetup line 147). | Keep the shim FILE NAMED `prototype_packed_b.py` so the rsplit filter matches; do NOT introduce NEW launch-baked module-global state that can desync across the two identities (concentrate all such state in state.py, single object; shim delegates). If cut-over (b) is ever chosen, repoint the rsplit filter + env-var sync. Collapsing the dual identity is DEFERRED (D13). |
-| **R3** | DOC-TEST SOURCE-STRING GREP BREAKS: `test_doc_kernel.py:116-173` greps `prototype_packed_b.py` text for kernel strings + order; moving the kernel body removes them → test fails. | STEP 9 repoints `PPB_SRC` to the file holding the kernel, in lockstep with the move; grepped strings stay byte-identical (no variable renames this pass). Doc-contract edit, explicitly in scope. |
+| **R3** | DOC-TEST SOURCE-STRING GREP BREAKS: `test_doc_kernel.py` (TO-BE-CREATED — NOTE there is **no `test_doc_kernel.py` in the tree**, same status as `test_doc_config.py`; the `:116-173` layout below is the spec, not an existing file) greps `prototype_packed_b.py` text for kernel strings + order; moving the kernel body removes them → test fails. | STEP 9 repoints `PPB_SRC` to the file holding the kernel, in lockstep with the move; grepped strings stay byte-identical (no variable renames this pass). Doc-contract edit, explicitly in scope. |
 | **R4** | RE-EXPORT CHAIN BREAK: `concord_ot` imports setters FROM `concord_winner` (re-exported FROM `prototype_packed_b`); a setter missing from EITHER list fails `concord_ot.py:124`. | L0 dual-namespace resolution assert every commit; shim does `from <core> import *` + explicit re-export of the full setter list; `concord_winner.py:36-42` unchanged. |
 | **R5** | DEVICE-TENSOR CACHE IDENTITY: `_LR/_EPS/_NAMED` caches, `_CONSOLIDATE_FLAGS`, `_STEP_COUNTERS`, `_REB_SEED_CACHE`, LAMB caches, `_RATIO_*_FLOOR_T`, `_SIGMAG_SIGMA_T`, `_V_BC/_VHAT_MEAN` bufs must each be ONE singleton per (name,device); duplicating a cache dict → kernel reads a different buffer than the setter fills → CUDA-graph desync / stale pointer. | ALL caches live solely in state.py; kernels/layers reach them only via state functions. Preserve the `_dev_key` vs raw `str(device)` keying ASYMMETRY (consolidate flag normalizes cuda↔cuda:0; step counter does not) — do NOT unify (PB:472 vs 486-499). |
 | **R6** | SR-DETERMINISM: splitting SGD/AdamW into modules with separate step counters would desync the salt. | ONE `_STEP_COUNTERS` in state.py shared by both `apply_packed_sgd` and `apply_packed_adamw`; XOR salt constants + draw order + BLOCK_N=32/BLOCK_K=64 untouched. G1 hash catches drift. |
@@ -595,23 +595,43 @@ SHA + torch/triton/CUDA versions. Re-baseline if the toolchain moves (Triton cod
 Each requires proving unreachability under shipped `ConcordConfig` defaults AND clearing the doc/test
 contract before any deletion.
 
+> ⚠ See **§3** for the AUTHORITATIVE, reconciled PB line-range map (single source of truth). Any
+> ``PB:NNN`` cited in this section is ILLUSTRATIVE only; re-verify against §3 before acting on an item.
+
 - **D1 — Multiple coherence definitions (headline defer):** unify `coh_raw` (un-cf-discounted Wiener,
   drives evap/dissipation, PB:805-867,956-962) vs cf-discounted `coh` (drives chase/leak/boil[3]) vs
-  `_COH_WEIGHTED_V` (PB:1631 default False; read 3× backward at PB:2382/3069/3311) vs USE_RATIO_COH
+  `_COH_WEIGHTED_V` (PB:1640 default False; read 3× backward at PB:2391/3078/3320) vs USE_RATIO_COH
   non-FIXED branch (PB:862-865) vs `measure_coherence`/`gate_coherence_from_fields` (host) vs the FIFTH
   host re-derivation in `concord_ot:_metrics` (INV-B). Intentional today (evap on `coh_raw` is the
   anti-lock-in friction floor; the 2026-06-22 cf/beta1 NaN guard PB:1011-1016 gates beta1 momentum on
   `coh_raw`). Unifying risks reintroducing the divergence → NaN. DEFER.
 - **D2 — `_COH_WEIGHTED_V`** (False, `set_coh_weighted_v`, 3 read sites): architect-flagged dead path.
   Prove inert, then remove with its setter + reads.
-- **D3 — `_GAP_FEEDBACK`/`_GAP_SCALE`** (False; USE_GAP_FEEDBACK branches PB:1607,1927,1963): alternate
+  **PROVEN UNREACHABLE under shipped config (2026-06-29 audit, verified): no caller of
+  `set_coh_weighted_v` exists in modules/ or scripts/ outside the harness. Maintainer decision
+  2026-07-01: prune DEFERRED to the second pass** — execute after the module split lands, under the
+  full golden gate, pruning the harness references (`golden_capture.py` G1 globals + golden_compare
+  name lists) in the SAME gated change.
+- **D3 — `_GAP_FEEDBACK`/`_GAP_SCALE`** (False; defaults PB:1616-1617, `gap_inv` read PB:1936,
+  USE_GAP_FEEDBACK constexpr pass PB:1990): alternate
   dissipation split, off by default. *(Distinct from the config-invariant "D3 guard" in §6.)*
-- **D4 — `_LAZY_GATE`/`_LAZY_THRESH`** (False for UNet): embedding-relevant; keep for embeddings, prune
-  only the UNet-dead branch after proving.
+  **PROVEN UNREACHABLE under shipped config (2026-06-29 audit, verified): no caller of
+  `set_gap_feedback` outside the harness. Maintainer decision 2026-07-01: prune DEFERRED to the
+  second pass**, same conditions as D2.
+- **D4 — `_LAZY_GATE`/`_LAZY_THRESH`** — **PREMISE INVERTED (2026-06-29 audit) — DO NOT prune as
+  originally written; needs a fresh decision.** This entry previously said "(False for UNet):
+  embedding-relevant; keep for embeddings, prune only the UNet-dead branch after proving" — the audit
+  PROVED the wiring is the opposite: `_LAZY_GATE` is a shipped, **GUI-exposed UNet feature**
+  (GUI 'Lazy Update Gate' OptimizerParamsWindow.py:144 → TrainConfig.py:88/:234 → the UNet
+  `ConcordController`: concord_ot.py:83 `pick("lazy_gate", …)` + concord_ot.py:229
+  `set_lazy_gate(self.config.lazy_gate)` — the ONLY production setter), while the embedding production
+  modules (concord_embedding*.py) never call `set_lazy_gate` at all. Default off
+  (optimizer_util.py:435) — a deliberately-kept off-by-default flag; the UNet path is its only
+  production consumer. Any future D4 action must be re-decided from this wiring, not the old premise.
 - **D5 — DissipationAutoTuner (PB:3493-3649):** doc says EpochDissipationServo supersedes it, but the
   shipped default has a populated table AND `autotune_servo=False` → the TABLE path is default-active.
   Resolve the table-vs-servo redundancy (which supersedes which is ambiguous today). NOT a clean removal.
-- **D6 — `_denom_diagnostic` + `_DENOM_DIAG` (PB:1183-1266):** gated `enabled=False`, no setter,
+- **D6 — `_denom_diagnostic` + `_DENOM_DIAG` (PB:1198-1284):** gated `enabled=False`, no setter,
   unreachable except by hand-edit, BUT CALLED at PB:1913 inside the launcher (a host sync if enabled).
   This pass MOVES it to kernels.py with the gate INTACT (do not delete yet).
 - **(extra, kept for completeness)** **D7** `_GRADW_DIAG` eager block (PB:1832-1864) + `read_gradw_diag`:
@@ -663,8 +683,10 @@ Created by the setup task (NEW files only; no Concord code moved):
 Verified against the live source (read-only): `prototype_packed_b.py` = **4176 lines** (was 4150);
 `concord/__init__.py` = 0 bytes; the SF1 writer exists at
 `modules/modelSetup/StableDiffusionXLFineTuneSetup.py:149` (filter @147, env mirror @143/145) — re-confirmed
-2026-06-29; `concord/tests/test_autotuner_cpu.py:450,459` (re-verify); `test_doc_kernel.py` `PPB_SRC` at
-lines 116-117 with the kernel-string asserts at ~162-173 matched **by content** (`in`/`.index`), not by line.
+2026-06-29; `concord/tests/test_autotuner_cpu.py:450,459` (re-verify); `test_doc_kernel.py` is TO-BE-CREATED —
+NOTE there is **no `test_doc_kernel.py` in the tree** (same status as `test_doc_config.py`, §6): the specced
+layout is `PPB_SRC` at lines 116-117 with the kernel-string asserts at ~162-173 matched **by content**
+(`in`/`.index`), not by line.
 
 **2026-06-29 reconcile pass (run-UP, read-only + harness authoring):** all §3 line ranges re-derived from
 the 4176-line source; M6a / 6-wide-boil / coh_evap-`[3]` / servo-ceiling-removal / `concord_m6a_meter` drift

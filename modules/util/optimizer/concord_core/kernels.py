@@ -23,9 +23,11 @@ RESPONSIBILITY
             class; must be S.-live, never `from state import _REB_STATS`).
 
 DOC-CONTRACT (R3 / STEP 9 / L2 — the kernel BODY text is the contract):
-    test_doc_kernel.py greps these byte-identical strings AND their order from the
-    file that holds the kernel (currently concord/prototype_packed_b.py:116-117 via
-    PPB_SRC; repointed in STEP 9 to wherever the kernel text physically lives):
+    test_doc_kernel.py (TO-BE-CREATED — NOTE there is **no test_doc_kernel.py in the
+    tree**, same status as test_doc_config.py; the :116-117 PPB_SRC layout is the
+    spec, not an existing file) greps these byte-identical strings AND their order
+    from the file that holds the kernel (concord/prototype_packed_b.py via PPB_SRC;
+    repointed in STEP 9 to wherever the kernel text physically lives):
         "noise = d_fs - drift_cancel_C * d_sv"
         "noise_in_w = noise * scale_fwd"
         "v_proxy = noise_in_w * noise_in_w"            (i_noise)
