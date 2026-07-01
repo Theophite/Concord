@@ -124,7 +124,7 @@ class ConcordController:
         from concord_winner import swap_unet_to_winner, GatedRebalance, swap_text_encoder_to_anchor, \
             swap_text_encoder_to_winner, \
             set_lazy_gate, set_lazy_thresh, set_min_leak, set_evap_build_min, set_lamb_trust, \
-            set_coh_vhat, set_coh_kappa, set_evap_slack
+            set_coh_vhat, set_coh_kappa, set_evap_slack, set_ratio_coh
         self.config = make_concord_config(learning_rate, optimizer_config)
         # D3 guard: step_cap and gf_trust_delta_sq are the two step bounds (hard clamp vs the
         # rank-1-Adam denominator). With BOTH <= 0 the denom collapses to eps and step_cap=0
@@ -241,6 +241,12 @@ class ConcordController:
         set_coh_vhat(self.config.coh_vhat)
         set_coh_kappa(self.config.coh_kappa)
         set_evap_slack(float(getattr(self.config, "concord_evap_slack", 0.25)))   # EVAP clamp: kill on min(coh, coh_raw+slack)
+        # ratio_coh: swap_unet_to_winner hardcodes set_ratio_coh(True) (winner behavior), which
+        # silently ignored the documented config knob (2026-06-29 audit U8). Re-assert from config
+        # here like the flags above -- appended LAST so the pre-existing setter order/values are
+        # unchanged; shipped default is True, so this is a no-op unless the user actually sets False
+        # (a debug state: the gate IS the dissipation mechanism).
+        set_ratio_coh(bool(self.config.ratio_coh))
         # Dissipation autotuner (probe-then-commit), opt-in via optimizer.autotune_table.
         # Built LAZILY on the first before_step(): total_steps here is a placeholder —
         # the trainer finalizes the horizon at train start.
