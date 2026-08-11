@@ -20,6 +20,7 @@ from modules.util.config.TrainConfig import TrainConfig
 from modules.util.conv_util import apply_circular_padding_to_conv2d
 from modules.util.dtype_util import create_autocast_context, disable_fp16_autocast_context
 from modules.util.enum.LossWeight import LossWeight
+from modules.util.enum.TimestepDistribution import TimestepDistribution
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.quantization_util import quantize_layers
 from modules.util.torch_util import torch_gc
@@ -27,6 +28,13 @@ from modules.util.TrainProgress import TrainProgress
 
 import torch
 from torch import Tensor
+
+import os
+
+# Hook: when CONCORD_CSNR_SHAPE=1, the CONSTANT_SNR draw sources the CSNR meter's measured
+# gradient-SNR curve from the concord controller (_csnr_curve) instead of the schedule proxy.
+# OFF by default; evaluated at import (the fresh-process relaunch re-reads the env var).
+_CSNR_SHAPE_HOOK = os.environ.get("CONCORD_CSNR_SHAPE", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 class BaseStableDiffusionXLSetup(
@@ -152,8 +160,8 @@ class BaseStableDiffusionXLSetup(
         # sampler, so this is consistent across both by construction. Stock OneTrainer
         # still uses train=False embeddings (frozen, via the wrapper), so the skip is
         # Concord-only; output embeddings inject at the TE output and always keep theirs.
-        from modules.util.enum.Optimizer import Optimizer
-        _concord = config.optimizer.optimizer == Optimizer.CONCORD
+        from modules.util.enum.Optimizer import Optimizer, is_concord_family
+        _concord = is_concord_family(config.optimizer.optimizer)
 
         def _tokenizer_embeddings(encoder_embeddings):
             kept = []
@@ -211,15 +219,40 @@ class BaseStableDiffusionXLSetup(
 
     @staticmethod
     def _concord_token_only_dropout(model, config, batch, generator):
-        """With probability p (config.concord_token_only_dropout), rewrite an
-        eligible example's caption to ONLY its trainable tokens. Gated to fire
-        only AFTER the embedding divot releases (controller.step_idx past the
-        delay) and only for examples that actually contain a trainable token
-        (else token-only = empty caption, which is not the intent). The
-        trainable id set is read per-TE from the control plane's routing
-        (kind == 2). No-op unless Concord packed embeddings are active."""
-        p = float(getattr(config, "concord_token_only_dropout", 0.0) or 0.0)
-        if p <= 0.0:
+        """Caption-composition dropout, one draw per eligible example:
+        u < p1 (config.concord_token_only_dropout) -> caption rewritten to
+        ONLY its trainable tokens; p1 <= u < p1+p2
+        (config.concord_words_only_dropout) -> trainable tokens STRIPPED,
+        context words kept; else untouched. p1 = p2 = 1/3 is the thirds
+        scheme (full / tokens-only / words-only): it separates the
+        embedding-attributable stream from the caption stream so the gate
+        certifies two coherent components instead of taxing one standing
+        mixture forever (2026-07-12 audit: velocity-telescope
+        anti-alignment at flat loss; exp 68's irreducible-conflict regime).
+        Gated to fire only AFTER the embedding divot releases
+        (controller.step_idx past the delay) and only for examples that
+        actually contain a trainable token (else token-only = empty
+        caption, and words-only = no-op). The trainable id set is read
+        per-TE from the control plane's routing (kind == 2). One shared
+        draw decides the mode, so both TEs always see the same
+        composition. When caption-vocab training is on, kind == 2 includes
+        the surrounding caption words; concord_dropout_injected_only scopes
+        both modes to the INJECTED (added-placeholder) tokens by
+        subtracting the plane's caption_tids -- tokens-only then keeps just
+        the placeholders and words-only strips just them (no-op when
+        caption vocab is off). No-op unless Concord packed embeddings are
+        active."""
+        # Contrastive arms (concord_contrast_arms): the trainer sets
+        # _concord_contrast_mode per micro so the SAME batch is full-caption
+        # on the arm-L micro and token-dropped on the arm-H micro. 'full' =>
+        # no dropout; 'dropped' => token-only on ALL eligible (deterministic,
+        # overriding the stochastic p1/p2); None => the stochastic thirds.
+        cmode = getattr(model, "_concord_contrast_mode", None)
+        if cmode == "full":
+            return batch
+        p1 = float(getattr(config, "concord_token_only_dropout", 0.0) or 0.0)
+        p2 = float(getattr(config, "concord_words_only_dropout", 0.0) or 0.0)
+        if cmode != "dropped" and p1 <= 0.0 and p2 <= 0.0:
             return batch
         ctrl = getattr(model, "concord_controller", None)
         planes = getattr(model, "concord_control_planes", None)
@@ -230,12 +263,21 @@ class BaseStableDiffusionXLSetup(
         t1, t2 = batch.get("tokens_1"), batch.get("tokens_2")
         if t1 is None or t2 is None:
             return batch
-        from modules.util.optimizer.concord.token_dropout import token_only_keep
+        from modules.util.optimizer.concord.token_dropout import (
+            token_only_keep, token_strip_keep, token_clause_keep)
+
+        inj_only = bool(getattr(config, "concord_dropout_injected_only", False))
 
         def _train_ids(te_idx):
             for pl in planes:
                 if pl.get("te_idx") == te_idx and pl.get("cp") is not None:
-                    return (pl["cp"].kind == 2).nonzero(as_tuple=True)[0]
+                    ids = (pl["cp"].kind == 2).nonzero(as_tuple=True)[0]
+                    cap = pl.get("caption_tids") or []
+                    if inj_only and len(cap):
+                        cap_t = torch.tensor(sorted({int(x) for x in cap}),
+                                             dtype=ids.dtype, device=ids.device)
+                        ids = ids[~torch.isin(ids, cap_t)]
+                    return ids
             return None
         ti1, ti2 = _train_ids(1), _train_ids(2)
         elig = torch.zeros(t1.shape[0], dtype=torch.bool, device=t1.device)
@@ -243,14 +285,40 @@ class BaseStableDiffusionXLSetup(
             elig |= torch.isin(t1, ti1.to(t1.device)).any(dim=1)
         if ti2 is not None and ti2.numel():
             elig |= torch.isin(t2, ti2.to(t2.device)).any(dim=1)
-        r = torch.rand(t1.shape[0], generator=generator, device=generator.device).to(t1.device)
-        drop = (r < p) & elig
-        if not bool(drop.any()):
+        if cmode == "dropped":
+            only = elig                       # arm H: deterministic token-only
+            strip = torch.zeros_like(elig)
+        else:
+            r = torch.rand(t1.shape[0], generator=generator,
+                           device=generator.device).to(t1.device)
+            only = (r < p1) & elig
+            strip = (r >= p1) & (r < p1 + p2) & elig
+        if not bool(only.any()) and not bool(strip.any()):
             return batch
         b1, e1 = model.tokenizer_1.bos_token_id, model.tokenizer_1.eos_token_id
         b2, e2 = model.tokenizer_2.bos_token_id, model.tokenizer_2.eos_token_id
-        batch["tokens_1"] = token_only_keep(t1, ti1, b1, e1, drop)
-        batch["tokens_2"] = token_only_keep(t2, ti2, b2, e2, drop)
+        if bool(only.any()):
+            if cmode == "dropped":
+                # Contrastive dropped arm (arm H): keep trainable words + ONE
+                # comma-delimited clause -- a PARTIAL real conditioning, not a
+                # full strip. The cross-arm gap vs the full-caption arm L is then
+                # only the OTHER clauses, so the coherence gate keeps the retained
+                # clause's context instead of evaporating the whole caption.
+                def _comma_id(_tok):
+                    try:
+                        _ids = _tok(",", add_special_tokens=False)["input_ids"]
+                        return int(_ids[0]) if _ids else None
+                    except Exception:
+                        return None
+                cid1, cid2 = _comma_id(model.tokenizer_1), _comma_id(model.tokenizer_2)
+                batch["tokens_1"] = token_clause_keep(batch["tokens_1"], ti1, cid1, b1, e1, only, generator)
+                batch["tokens_2"] = token_clause_keep(batch["tokens_2"], ti2, cid2, b2, e2, only, generator)
+            else:
+                batch["tokens_1"] = token_only_keep(batch["tokens_1"], ti1, b1, e1, only)
+                batch["tokens_2"] = token_only_keep(batch["tokens_2"], ti2, b2, e2, only)
+        if bool(strip.any()):
+            batch["tokens_1"] = token_strip_keep(batch["tokens_1"], ti1, e1, strip)
+            batch["tokens_2"] = token_strip_keep(batch["tokens_2"], ti2, e2, strip)
         return batch
 
     def predict(
@@ -265,7 +333,14 @@ class BaseStableDiffusionXLSetup(
             return_raw_inputs: bool = False,
     ) -> dict:
         with model.autocast_context:
-            batch_seed = 0 if deterministic else train_progress.global_step * multi.world_size() + multi.rank()
+            # Contrastive arms: the arm-H (dropped) micro reuses the arm-L
+            # micro's seed so both see the SAME image at the SAME timestep and
+            # noise -- the cross-arm gap is then purely the caption difference,
+            # not a timestep-noise mismatch (which would swamp it in diffusion
+            # and make the gap floor evaporate on noise, not context).
+            _cseed = getattr(model, "_concord_contrast_seed", None)
+            _seed_step = train_progress.global_step if _cseed is None else int(_cseed)
+            batch_seed = 0 if deterministic else _seed_step * multi.world_size() + multi.rank()
             generator = torch.Generator(device=config.train_device)
             generator.manual_seed(batch_seed)
             rand = Random(batch_seed)
@@ -307,8 +382,14 @@ class BaseStableDiffusionXLSetup(
                         'text_encoder_2_hidden_state'] if not config.train_text_encoder_2_or_embedding() else None,
                     pooled_text_encoder_2_output=batch[
                         'text_encoder_2_pooled_state'] if not config.train_text_encoder_2_or_embedding() else None,
-                    text_encoder_1_dropout_probability=config.text_encoder.dropout_probability if not deterministic else None,
-                    text_encoder_2_dropout_probability=config.text_encoder_2.dropout_probability if not deterministic else None,
+                    # Contrastive arms DEFERS the CFG dropout: _contrast_step
+                    # draws ONE shared mask and applies it to both arms (so the
+                    # two arms differ by caption alone, not by which examples
+                    # the mask zeroed). None/False here when a contrast mode is
+                    # set; normal otherwise.
+                    text_encoder_1_dropout_probability=(None if getattr(model, "_concord_contrast_mode", None) is not None else (config.text_encoder.dropout_probability if not deterministic else None)),
+                    text_encoder_2_dropout_probability=(None if getattr(model, "_concord_contrast_mode", None) is not None else (config.text_encoder_2.dropout_probability if not deterministic else None)),
+                    couple_dropout=(False if getattr(model, "_concord_contrast_mode", None) is not None else bool(getattr(config, "concord_couple_te_dropout", False))),
                 ))
 
             latent_image = batch['latent_image']
@@ -331,7 +412,48 @@ class BaseStableDiffusionXLSetup(
                 ) if (config.concord_antithetic_timesteps
                       and config.loss_weight_fn == LossWeight.MIN_SNR_GAMMA
                       and not config.resolution_aware_loss_weight) else None,
+                accum_snr_ctx=(
+                    model.noise_scheduler.alphas_cumprod,
+                    model.noise_scheduler.config.prediction_type == 'v_prediction',
+                    config.loss_weight_strength,
+                    # measured gradient-SNR curve for the draw. HOOK OFF by default -> None ->
+                    # schedule proxy. CONCORD_CSNR_SHAPE=1 sources the meter's curve from the
+                    # controller so it shapes the draw; else the legacy model attr (None today).
+                    (getattr(getattr(model, "concord_controller", None), "_csnr_curve", None)
+                     if _CSNR_SHAPE_HOOK else getattr(model, "_concord_csnr_curve", None)),
+                ) if config.timestep_distribution == TimestepDistribution.CONSTANT_SNR else None,
             )
+
+            # Timestep BANDING (OFF by default; sentinel CONCORD_TS_BANDS.on, live-tunable --
+            # see concord_ts_bands). Contrast pairs certify at VERY LOW noise (both arms in the
+            # same basin -> the caption difference is a small consistent differential the
+            # cross-arm gate can bank); ordinary windows write at MID noise (max conditioning
+            # leverage). Only the FULL arm samples the timestep (_concord_contrast_mode is set
+            # around each arm's prep and None on ordinary micros; the dropped arm reuses the
+            # full arm's seed/tensors), so one remap here covers the pair, and it covers eager,
+            # bridge, and graph_te paths alike (all branch after this point). The remap is
+            # affine from the configured [min,max) noising range into the band: it consumes NO
+            # generator draws (noise below stays bit-identical at fixed seed) and preserves the
+            # distribution's shape within the band. Same shape/dtype/device tensor (value-only)
+            # -> the graph's static["timestep"].copy_ stays valid. Never on deterministic
+            # (validation/sampling) calls.
+            if not deterministic:
+                from modules.util.optimizer.concord_graph import concord_ts_bands
+                _ctl = concord_ts_bands()
+                # Per-band off (contrast=off / main=off in the file) -> that window class
+                # passes through unbanded, for clean A/B of each half of the scheme. The
+                # same file also carries the fire=/uncond= rate overrides, consumed inside
+                # _contrast_fire/_uncond_fire in concord_graph.
+                _band = (_ctl["contrast"] if getattr(model, "_concord_contrast_mode", None) is not None
+                         else _ctl["main"]) if _ctl is not None else None
+                if _band is not None:
+                    _T = model.noise_scheduler.config['num_train_timesteps']
+                    _slo = int(_T * config.min_noising_strength)
+                    _shi = max(_slo + 1, int(_T * config.max_noising_strength))
+                    _lo = int(_T * _band[0])
+                    _hi = max(_lo + 1, int(_T * _band[1]))
+                    _frac = (timestep.to(torch.float32) - _slo) / float(_shi - _slo)
+                    timestep = (_lo + _frac * (_hi - _lo)).floor().clamp_(_lo, _hi - 1).to(timestep.dtype)
 
             latent_noise = self._create_noise(
                 scaled_latent_image,

@@ -2,8 +2,8 @@ import modules.util.multi_gpu_util as multi
 from modules.model.BaseModel import BaseModel
 from modules.util import create
 from modules.util.config.TrainConfig import TrainConfig, TrainOptimizerConfig
-from modules.util.enum.Optimizer import Optimizer
-from modules.util.NamedParameterGroup import NamedParameterGroupCollection
+from modules.util.enum.Optimizer import Optimizer, is_concord_family
+from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
 from modules.util.optimizer.muon_util import build_muon_adam_key_fn
 from modules.util.torch_util import optimizer_to_device_
 
@@ -55,6 +55,22 @@ def init_model_parameters(
         train_device: torch.device,
 ):
     model.parameters = parameters
+
+    # Concord can leave the parameter-group collection EMPTY: every trainable weight is
+    # managed outside the base optimizer (UNet/TE are packed self-stepping BUFFERS, packed
+    # embeddings self-step, aux norms/biases frozen). The base SGD, the LR scheduler, and
+    # the tensorboard LR report all assume >=1 group and crash (empty-optimizer / zip
+    # mismatch). Add ONE throwaway trainable group so the whole pipeline stays consistent
+    # end-to-end (collection == optimizer == scheduler == report); it never receives a
+    # gradient (not in the graph), so its SGD step is a no-op. Concord-only: a genuinely
+    # empty collection for any other optimizer is a real "nothing to train" error.
+    if is_concord_family(model.train_config.optimizer.optimizer) and not parameters.parameters():
+        _ph = torch.nn.Parameter(torch.zeros(1, device=train_device))
+        model._concord_placeholder_param = _ph      # keep a reference alive
+        parameters.add_group(NamedParameterGroup(
+            unique_name="concord_placeholder", parameters=[_ph],
+            learning_rate=model.train_config.learning_rate))
+
     #random (LoRA) initialisation can differ, broadcast from GPU #0 to all others
     #to be safe, do that before the optimizer is created because the optimizer could take copies
     multi.broadcast_parameters(parameters.parameters(), train_device)
@@ -423,9 +439,10 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
     # swapped UNet layers self-step in backward. lr comes from the main learning_rate field.
     # The winner knobs default to the validated sf_060 configuration.
     # The panel shows only the live physical knobs. gf_consol (kappa, subsumed by
-    # the dimensionless dissipation), ratio_coh (the gate IS the mechanism; off is
-    # a debug state), and the probe-gated beta1 pair (one-task-validated, off)
-    # remain config-file keys with engine defaults, not panel entries.
+    # the dimensionless dissipation) and ratio_coh (the gate IS the mechanism; off
+    # is a debug state) remain config-file keys with engine defaults, not panel
+    # entries. The probe-gated beta1 pair (autotune_beta1_on / _coh) IS now a panel
+    # entry -- experimental, off by default, autotuner-mediated.
     Optimizer.CONCORD: {
         "momentum": 0.9,
         "weight_decay": 0,
@@ -439,8 +456,58 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
         "gf_trust_delta_sq": 1.0,
         "min_leak": 0.1,
         "evap_build_min": 128.0,
+        "lamb_trust": False,
+        "lamb_cap": 0.0025,
+        "lamb_clip": 4.0,
+        "beta2": 0.999,
+        "beta2_epoch_window": True,
+        "vhat_warmstart": True,
+        "bias_correct_v": False,
+        "coh_vhat": True,
+        "coh_kappa": 1.0,
         "dissipation_fill_ramp": True,
         "telescope_epoch_window": True,
+        # Concord 2-fast (split-tick bracket): OFF by default -- the default
+        # config IS the validated winner (byte-identical kernel path). When
+        # on, the fine field runs as two int8 arms at bracketed friction
+        # lam*(1-/+d); arm gap/sum are read-only meters in v1.
+        "two_fast": False,
+        "bracket_d": 0.25,
+        # Eviction valve (both formats): on sign disagreement between the
+        # fine mass and the position, demote position mass to the arms at
+        # the forward chase rate -- evidence-gated weight decay by
+        # detailed balance (positions persist only under >2/3 sign-
+        # agreement; converged weights pay nothing). Fixes the monotone
+        # norm growth. Delta-gated (exp 26): fires on disagreement with the
+        # LEARNED DELTA s_slow-v_slow, so the pretrained PRIOR (common mode)
+        # is protected -- raw-gating eroded it (fine-tune sample scramble).
+        # Rate = evict_gain (exp-26d knee 0.66). ON by default now that the
+        # delta fix is validated (CPU exp 25-26f: prior retention 31->49% vs
+        # raw at ~unchanged fine-tune). NOT yet on-GPU-A/B-validated.
+        "evict_valve": True,
+        "evict_gain": 0.66,
+        "evict_cf_gate": False,  # high-gain enabler (exp 26f); ON locks gain to 1.0
+        "heldout_router": False,  # 2fast held-out arm router: alternate micros -> alternate arms; needs accum>=2 (guarded); the routed gap is a data meter, not a dissipation derivative
+        "router_coh_noise": False,  # under heldout_router: routed gap^2 -> coherence noise floor after the cf discount (exp47b)
+        "perfcoh_partition": False,  # soft CF gate: leak commits *= exp(-(1-coh)/tau), evict reverts *= complement (probation for marginal admissions)
+        "perfcoh_tau": 0.5,  # nats knee of the perfcoh partition (smaller = stricter commit)
+        "noise_seed_servo": False,  # set-don't-hunt: per-layer kappa seeded from measured gradient NSR (exp50); the only dissipation controller
+        "nsr_per_row": True,  # per-row whitened lam from the arm meter (R_row); residue-masked rows keep layer lam; exp56 closed-loop verdict pending (fix-forward)
+        "kaiming_init": False,
+        "kaiming_scale": 0.05,
+        "chase_epoch_window": False,
+        "chase_alpha": 0.0,
+        "alpha_v_fast": 0.001,
+        # Ratio-coh gate FLOORS (rate granted at coh=0), cosine-decayed start->min over
+        # floor_horizon (~1 epoch) by winner_step. chase = evidence bar for consolidation
+        # (exps 31-35: fine-tune optimum ~0.3). The LEAK floors are deliberately absent:
+        # DERIVED from the chase in make_concord_config (leak_min = chase_min, the
+        # winner's ratio-0.9 pairing at any scale; leak_start = 0.999) -- exp73 showed
+        # the leak gate is the chase gate's calibration partner and a mis-RATIOED leak
+        # floor deadlocks certification globally. NO override exists (the env hatch was
+        # removed 2026-07-18; mis-ratio ablations live on the CPU reference only).
+        "ratio_chase_floor": 0.9,
+        "ratio_chase_floor_min": 0.1,
         # Dimensionless mode ON by default: lam = lr*kappa = 0.025 (the nanoGPT
         # winner; ~kappa 333 at lr 7.5e-5 -- "kappa at diffusion lr needs to be
         # higher"). Clearing the field falls back to the engine kappa default
@@ -453,7 +520,18 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
         "dissipation": 0.025,
         "autotune_table": "[[0.387,0],[0.314,0.1],[0.288,0.2],[0.274,0.4],[0.256,0.4]]",
         "autotune_reprobe_band": 0.02,
+        "autotune_gamma_snr_on": True,
         "autotune_gamma_snr": None,
+        # Coherence-gated momentum (beta1), probe-selected -- experimental, off by
+        # default. Surfaced as panel knobs so the gated-beta1 A/B doesn't need a
+        # hand-edited config. Only fires with a non-empty Autotune Table (the tuner
+        # must be built) and only on layers whose probed coherence clears the threshold.
+        "autotune_beta1_on": 0.0,
+        "autotune_beta1_coh": 0.35,
+        "autotune_servo_per_epoch": 3,
+        "concord_conv_full_vhat": False,
+        "concord_evap_slack": 0.25,
+        "concord_train_cond_embed": False,
     },
     Optimizer.LION: {
         "beta1": 0.9,
@@ -676,3 +754,10 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
         "eps": 1e-3,
     },
 }
+
+# CONCORD_STEPLESS shares CONCORD's whole panel/param surface (same knobs, same
+# tooltips via KEY_DETAIL_MAP): the lineages differ only in which kernel module
+# kernel_select binds. A live dict copy keeps the two entries in sync by
+# construction (and the AST-parsing doc/leak-floor tests see only the literal).
+OPTIMIZER_DEFAULT_PARAMETERS[Optimizer.CONCORD_STEPLESS] = dict(
+    OPTIMIZER_DEFAULT_PARAMETERS[Optimizer.CONCORD])

@@ -9,6 +9,7 @@ class TimestepDistribution(Enum):
     COS_MAP = 'COS_MAP'
     INVERTED_PARABOLA = 'INVERTED_PARABOLA'
     BETA = 'BETA'
+    CONSTANT_SNR = 'CONSTANT_SNR'
 
     def __str__(self):
         return self.value

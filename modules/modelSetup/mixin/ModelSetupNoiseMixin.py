@@ -152,6 +152,68 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
         self._tw_mean_w = float(w.mean())
         return cdf
 
+    def _constant_snr_cdf(self, alphas_cumprod, v_prediction, gamma, min_t, max_t, floor, device, measured=None):
+        """CDF of the constant-accumulated-SNR draw p(t) ~ 1/SNR_eff(t), cached per run.
+
+        Concord consolidates the gradient over an accumulation interval and gates on the
+        ACCUMULATED coherence, not the per-step gradient. Over that interval a timestep drawn
+        N_t times accumulates SNR ~ N_t*SNR(t), so holding the accumulated SNR CONSTANT across
+        timesteps -- nothing starved, nothing over-resolved -- wants N_t ~ 1/SNR(t).
+
+        The relevant SNR is the RESOLVABLE (gradient) SNR, which is bounded: past a mastery level
+        gamma extra data-SNR buys no gradient signal (this is the min-SNR-gamma assumption, and
+        exp 36 confirms the empirical gradient SNR is bounded and same-ordered, unlike the raw
+        schedule SNR abar/(1-abar), which is monotone and singular at t->0). So the effective SNR
+        is the resolvable SNR clamped into [floor*gamma, gamma]: capped at gamma (mastered
+        low-noise timesteps get baseline sampling, not near-zero), floored at floor*gamma at the
+        noisy end (the 'true SNR' guard -- do not pour the interval into genuinely dead timesteps).
+        The oversampling ratio is bounded at 1/floor. gamma is the min-SNR cap (loss_weight_strength).
+
+        SNR source: `measured` = (per-timestep SNR tensor of length num_train_timesteps, gen:int)
+        is the LIVE gradient-SNR cashed out by the epilogue collector (exp 36/39); when present it
+        drives the draw (self-adapting -- mastered timesteps decay). Absent (no cash-out yet) the
+        schedule SNR abar/(1-abar) is the static proxy (+1 in the denom for v-prediction)."""
+        gen = int(measured[1]) if measured is not None else -1
+        key = (int(min_t), int(max_t), float(floor), float(gamma), bool(v_prediction),
+               int(alphas_cumprod.shape[0]), gen)
+        if getattr(self, "_csnr_cdf_key", None) == key and self._csnr_cdf.device == device:
+            return self._csnr_cdf
+        if measured is not None:
+            snr = measured[0][min_t:max_t].to(device=device, dtype=torch.float32)
+        else:
+            ac = alphas_cumprod[min_t:max_t].to(device=device, dtype=torch.float32)
+            snr = ac / (1.0 - ac)
+            if v_prediction:
+                snr = snr + 1.0
+        snr_eff = torch.clamp(snr, min=floor * gamma, max=gamma)
+        p = 1.0 / snr_eff
+        cdf = torch.cumsum(p / p.sum(), dim=0)                            # ascending -> 1.0
+        self._csnr_cdf_key = key
+        self._csnr_cdf = cdf
+        return cdf
+
+    def _sample_constant_snr_stratified(self, batch_size, generator, cdf, accum_interval):
+        """Systematic (low-discrepancy) inverse-CDF draw LOCKED to the accumulation interval.
+
+        The consolidation-constant-SNR property must hold PER realized interval, not just in
+        expectation -- an i.i.d. draw over a short interval leaves the balance to chance, so a
+        given consolidation could under-sample the hard timesteps. Instead the interval's
+        N = accum_interval samples are the systematic grid u_k = (k + xi)/N, k = 0..N-1, drawn
+        batch_size at a time across the micro-batches that make up one optimizer step; xi is
+        rejittered once per interval. The union over the interval is exactly the stratified grid,
+        so each consolidation sees the intended N_t ~ N/SNR(t) allocation. State persists on the
+        setup instance; the deterministic path returns earlier and never advances it."""
+        device = generator.device
+        n = max(int(accum_interval), int(batch_size))
+        pos = getattr(self, "_csnr_pos", None)
+        if pos is None or pos >= n:                                      # start of a new interval
+            self._csnr_offset = float(torch.rand(1, generator=generator, device=device).item())
+            pos = 0
+        k = torch.arange(pos, pos + batch_size, device=device, dtype=torch.float32)
+        u = ((k + self._csnr_offset) / n) % 1.0
+        self._csnr_pos = pos + batch_size
+        return torch.searchsorted(cdf, u.to(cdf.dtype)).clamp(max=cdf.numel() - 1)
+
     def _draw_quantile_antithetic(self, n, generator, device):
         """n quantiles in [0,1) as antithetic pairs: second half = 1 - first half (straddle u=0.5)."""
         h = (n + 1) // 2
@@ -211,6 +273,7 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
             config: TrainConfig,
             shift: float = None,
             snr_weight_ctx: tuple | None = None,
+            accum_snr_ctx: tuple | None = None,
     ) -> Tensor:
         if shift is None:
             shift = config.timestep_shift
@@ -226,6 +289,32 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
             min_timestep = int(num_train_timesteps * config.min_noising_strength)
             max_timestep = int(num_train_timesteps * config.max_noising_strength)
             num_timestep = max_timestep - min_timestep
+
+            # Constant-accumulated-SNR sampling (opt-in via timestep_distribution). Draws
+            # t ~ 1/SNR(t) so the gradient's accumulated SNR is held CONSTANT across timesteps
+            # over the accumulation interval -- the draw the consolidation wants (see
+            # _constant_snr_cdf / _sample_constant_snr_stratified). Meant to run with
+            # loss_weight_fn = CONSTANT (the draw IS the SNR shaping; a min-SNR loss weight on
+            # top double-shapes). alphas_cumprod comes from the model scheduler via accum_snr_ctx;
+            # absent (UI preview / no-scheduler caller) it falls back to the standard linear-beta
+            # schedule so the preview still renders the target shape.
+            if config.timestep_distribution == TimestepDistribution.CONSTANT_SNR:
+                measured = None
+                if accum_snr_ctx is not None:
+                    alphas_cumprod, v_prediction, gamma, measured = accum_snr_ctx
+                else:
+                    betas = torch.linspace(1e-4, 2e-2, num_train_timesteps, device=generator.device)
+                    alphas_cumprod = torch.cumprod(1.0 - betas, dim=0)
+                    v_prediction = False
+                    gamma = float(getattr(config, "loss_weight_strength", 5.0))
+                gamma = max(1e-2, float(gamma))
+                floor = float(getattr(config, "constant_snr_floor", 0.1))
+                cdf = self._constant_snr_cdf(
+                    alphas_cumprod, v_prediction, gamma, min_timestep, max_timestep, floor,
+                    generator.device, measured=measured)
+                accum_interval = max(1, int(getattr(config, "gradient_accumulation_steps", 1))) * batch_size
+                idx = self._sample_constant_snr_stratified(batch_size, generator, cdf, accum_interval)
+                return (min_timestep + idx).to(torch.long).int()
 
             # Weighted-antithetic timestep sampling (opt-in; SDXL wires snr_weight_ctx). Importance-
             # sample t proportional to the min-SNR loss weight, antithetically in quantile space.

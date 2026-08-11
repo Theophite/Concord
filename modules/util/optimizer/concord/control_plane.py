@@ -66,6 +66,7 @@ class ControlPlaneEmbedding(nn.Module):
         self.register_buffer("idx", torch.zeros(self.V0, dtype=torch.long, device=d))
         self.register_buffer("static_vals", torch.zeros(1, self.dim, dtype=base.weight.dtype, device=d))
         self.trainable = None                               # ConcordPackedEmbedding (lazily)
+        self.train_tids = []                                # row -> token id (set by attach_trainable)
 
     @property
     def weight(self):
@@ -100,9 +101,41 @@ class ControlPlaneEmbedding(nn.Module):
         self.trainable = ConcordPackedEmbedding(len(tids), self.dim, device=self.kind.device,
                                                 lr=lr, target_norm=target_norm)
         self.trainable.init_tokens(init=inits, anchor=anchor)
+        self.train_tids = [int(t) for t in tids]            # row order is the plane's ground truth
         with torch.no_grad():
             for row, tid in enumerate(tids):
                 self._grow(tid); self.kind[tid] = 2; self.idx[tid] = row
+
+    @torch.no_grad()
+    def arm_common_mode_gate(self, comps, gamma):
+        """Wire the common-mode CONCENTRATION gate through the plane's own id->row routing.
+        comps = [{'v': [dim] component direction, 'owners_tid': [token ids]}]. Owner rows keep
+        their component (shrink 0); every other row loses `gamma` of its projection. Owners are
+        resolved via train_tids -- row order is a per-plane, per-segment artifact, token ids are
+        stable -- so a sidecar written by any segment (or the other plane's ordering) arms
+        correctly here. Returns the number of owner rows matched; 0 -> disarmed."""
+        tr = self.trainable
+        if tr is None:
+            return 0
+        if not comps:
+            tr.set_common_mode_gate(None, None)
+            return 0
+        row_of = {t: r for r, t in enumerate(self.train_tids)}
+        K = tr.K
+        Q = torch.stack([torch.as_tensor(c["v"], dtype=torch.float32) for c in comps], dim=1)
+        S = torch.full((K, len(comps)), float(gamma), dtype=torch.float32)
+        matched = 0
+        for j, c in enumerate(comps):
+            for t in (c.get("owners_tid") or []):
+                r = row_of.get(int(t))
+                if r is not None and r < K:
+                    S[r, j] = 0.0
+                    matched += 1
+        if matched == 0:                                    # unmappable owners -> refuse to arm
+            tr.set_common_mode_gate(None, None)
+            return 0
+        tr.set_common_mode_gate(Q, S)
+        return matched
 
     def forward(self, input_ids):
         # Branch-free + static-shape so this is CUDA-graph capturable: compute every

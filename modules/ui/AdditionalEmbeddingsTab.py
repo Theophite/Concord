@@ -128,6 +128,22 @@ class EmbeddingWidget(ctk.CTkFrame):
                          tooltip="The initial embedding text used when creating a new embedding")
         components.entry(bottom_frame, 0, 7, self.ui_state, "initial_embedding_text")
 
+        # concord group-subspace label
+        components.label(bottom_frame, 1, 0, "Concord group:",
+                         tooltip="Concord group-subspace label (e.g. \"character\", \"style\"). Ties this "
+                                 "embedding's trainable rows into a subspace group for between-group "
+                                 "separation and within-group flatten. Empty = ungrouped. Inert unless the "
+                                 "Concord group-subspace toggles are enabled.")
+        components.entry(bottom_frame, 1, 1, self.ui_state, "group")
+
+        # concord output-space (CLIP-inversion) init -- own row so it is not crowded off
+        components.label(bottom_frame, 2, 0, "Concord invert init:",
+                         tooltip="Output-space (CLIP-inversion) init: when the initial embedding text is "
+                                 "LONGER than token count, optimize the token vectors so their contextualized "
+                                 "output matches the full phrase's (instead of truncating the tail), renormed "
+                                 "to the vocab scale. Input embeddings only. Default off = truncate.")
+        components.switch(bottom_frame, 2, 1, self.ui_state, "concord_invert_init")
+
     def __randomize_uuid(self, embedding_config: TrainEmbeddingConfig):
         embedding_config.uuid = TrainEmbeddingConfig.default_values().uuid
         return embedding_config

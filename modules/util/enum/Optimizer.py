@@ -82,6 +82,13 @@ class Optimizer(Enum):
     # SGD over the non-swapped (aux) params; the Concord half is driven by a controller.
     CONCORD = 'CONCORD'
 
+    # Concord STEPLESS lineage (2026-07-23, docs/STEPLESS_PLAN.md in the research
+    # repo): identical wiring/controller/graph stack, but the kernel module is the
+    # prototype_packed_stepless.py CLONE, bound once per process by
+    # concord/kernel_select.py. Starts byte-identical to CONCORD; diverges only per
+    # the stepless plan's phases. Selecting it never touches the CONCORD kernel.
+    CONCORD_STEPLESS = 'CONCORD_STEPLESS'
+
     @property
     def is_adaptive(self):
         return self in [
@@ -133,3 +140,11 @@ class Optimizer(Enum):
 
     def __str__(self):
         return self.value
+
+
+# Concord-family membership: nearly every wiring site (swap, controller, graph,
+# resume heals, packed embeddings, caption vocab) treats the two lineages
+# identically -- they differ ONLY in which kernel module kernel_select binds.
+# Sites needing lineage-SPECIFIC behavior must check the exact member instead.
+def is_concord_family(optimizer) -> bool:
+    return optimizer in (Optimizer.CONCORD, Optimizer.CONCORD_STEPLESS)

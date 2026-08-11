@@ -205,6 +205,35 @@ class GenericTrainer(BaseTrainer):
             fun()
         self.sample_queue = []
 
+    def _cuda_census(self, tag, threshold_gb=2.0):
+        """WHO holds CUDA memory: when allocations stay high where they should be ~0 (e.g.
+        after the pre-sample offload), walk gc for live CUDA tensors and report the top
+        groups by (dtype, ndim). Signatures: int32 2D = packed_w storages (pinned by a stale
+        reference if the module's buffers already moved); bfloat16 2D = _bf16_weight_buf
+        plain-attr caches (model.to() can NEVER move those). Diagnostic only, runs once per
+        sample event and only above threshold."""
+        try:
+            a = torch.cuda.memory_allocated() / 2 ** 30
+            if a < threshold_gb:
+                return
+            import gc as _gc
+            from collections import Counter
+            by = Counter()
+            seen = set()
+            for o in _gc.get_objects():
+                try:
+                    if torch.is_tensor(o) and o.is_cuda and o.storage().data_ptr() not in seen:
+                        seen.add(o.storage().data_ptr())
+                        by[(str(o.dtype).replace('torch.', ''), o.dim())] += o.numel() * o.element_size()
+                except Exception:
+                    continue
+            top = by.most_common(8)
+            print(f"[cuda-census] {tag}: alloc={a:.2f}G; top holders by (dtype,ndim):", flush=True)
+            for (dt, nd), b in top:
+                print(f"   {dt} {nd}D: {b / 2 ** 30:.2f}G", flush=True)
+        except Exception as e:
+            print(f"[cuda-census] failed: {e}", flush=True)
+
     def _graphmem(self, tag):
         # Memory probe -- ON BY DEFAULT (disable with CONCORD_GRAPHMEM=0). torch_alloc/reserved =
         # PyTorch's view; device_committed/free (mem_get_info) = the driver's dedicated-VRAM view.
@@ -273,6 +302,8 @@ class GenericTrainer(BaseTrainer):
                 self.model.to(self.temp_device)
                 self.model.eval()
                 self._graphmem(f"image {i} entry")
+                if i == 0:
+                    self._cuda_census("image 0 post-offload")
 
                 sample_config = copy.copy(sample_config)
                 sample_config.from_train_config(self.config)
@@ -289,6 +320,17 @@ class GenericTrainer(BaseTrainer):
             except Exception:
                 traceback.print_exc()
                 print("Error during sampling, proceeding without sampling")
+                # A mid-sample exception aborts __sample_base BEFORE its inline device
+                # housekeeping (text_encoder_to(temp_device) etc.), stranding the TEs +
+                # pipeline residue on the train device -- repeated failures then bind
+                # gigabytes into the post-sample/post-restore window (observed: 27 aborted
+                # images -> post-sample 10.77G vs the healthy ~0.1G, device_free 1.71G).
+                # Best-effort offload on the failure path; same crash-unwind class as the
+                # restore_unet_deploy interrupt fix.
+                try:
+                    self.model.to(self.temp_device)
+                except Exception as _e:
+                    print(f"[concord] post-failure offload failed too ({type(_e).__name__}: {_e})")
 
             torch_gc()
 
@@ -310,6 +352,13 @@ class GenericTrainer(BaseTrainer):
         self._graphmem("pre-release")
         if _v2 is not None:
             _v2.release()
+            # The captured graph (which forced zero_grad(set_to_none=False) each step so the backward
+            # writes static .grad addresses) is now gone -> those grads are dead weight for the whole
+            # sample loop. FREE them so the sampler gets that VRAM (~1x the eager TE/embedding grad set;
+            # the big resident block release() doesn't touch). The next training step's recapture warmup
+            # (fresh fwd+bwd, concord_graph.py _warmup_and_capture) re-establishes every .grad before it
+            # re-captures, so this is a true-recapture-safe reclaim, not a replay hazard.
+            self.model.optimizer.zero_grad(set_to_none=True)
         self._graphmem("post-release")
         torch_gc()
         self._graphmem("post-gc")
@@ -324,6 +373,24 @@ class GenericTrainer(BaseTrainer):
         # and the consolidated weight is ~zero — the chase fills s_slow within
         # ~1/alpha steps. The pre-training baseline sample is the live model.)
         _ctrl = getattr(self.model, "concord_controller", None)
+        # PRE-SAMPLE backup (restart-wrapper runs): the boundary's
+        # checkpoint+exit(42) fires AFTER the full sample loop, which is
+        # the segment's most fragile phase (fragmentation / WDDM spill) --
+        # a process death mid-sampling used to rewind the relaunch to the
+        # PREVIOUS backup, silently discarding the whole trained segment
+        # (observed 2026-07-04: ~330 steps lost to a churned sampling
+        # pass). Checkpoint BEFORE sampling too, so a mid-sampling death
+        # costs only the sampling attempt; the post-sample backup + prune
+        # then replaces this one on the happy path (disk stays flat).
+        # Default ON under CONCORD_RESTART_ON_SAMPLE; opt out with
+        # CONCORD_BACKUP_BEFORE_SAMPLE=0.
+        if (getattr(self.model, "concord_graph_v2", None) is not None
+                and os.environ.get("CONCORD_RESTART_ON_SAMPLE")
+                and os.environ.get("CONCORD_BACKUP_BEFORE_SAMPLE", "1") != "0"
+                and getattr(_ctrl, "step_idx", 0) > 0):
+            print("[concord-restart] pre-sample checkpoint (segment is safe "
+                  "even if sampling dies)", flush=True)
+            self.__backup(train_progress, True, print)
         _deploy_stash = (_ctrl.materialize_unet_deploy()
                          if _ctrl is not None
                          and getattr(self.config, "concord_sample_deploy", True)
@@ -419,9 +486,25 @@ class GenericTrainer(BaseTrainer):
                   flush=True)
             self.__backup(train_progress, True, print)
             self.__prune_backups(1)   # resume only ever needs the latest -> keep exactly one, no pile-up
+            self._kill_tensorboard_for_restart()
             sys.stdout.flush()
             sys.stderr.flush()
             sys.exit(42)
+
+    def _kill_tensorboard_for_restart(self):
+        """The exit-42 relaunch is NOT a clean exit, so _stop_tensorboard never runs and the TB
+        subprocess is orphaned -- it keeps port 6006 and tails the live event file, and its
+        no-TensorFlow fallback CRC (tensorflow_stub) occasionally access-violates on a half-written
+        record. Kill it before relaunching so each segment owns at most one TB instead of piling up
+        orphans (the "could not bind to 6006" errors + the periodic access-violation dumps). Guarded:
+        TB may not be running (tensorboard off, tensorboard_always_on skips _start_tensorboard, or it
+        already crashed)."""
+        proc = getattr(self, "tensorboard_subprocess", None)
+        if proc is not None and proc.poll() is None:
+            try:
+                self._stop_tensorboard()
+            except Exception:
+                pass
 
     def __validate(self, train_progress: TrainProgress):
         if self.__needs_validate(train_progress):
@@ -563,11 +646,40 @@ class GenericTrainer(BaseTrainer):
                 try:
                     with open(os.path.join(backup_path, "concord_clock.json"),
                               "w", encoding="utf-8") as f:
+                        # Loss smoothers ride the clock: without them every
+                        # resume reseeds the EMAs from the first post-restart
+                        # batch (which logs ~0.05 low), stamping a fake dip
+                        # (median -0.0055) on the smooth tags at all 49
+                        # boundaries -- two "loss cliffs" were called on that
+                        # artifact before the 2026-07-12 telemetry audit
+                        # caught it (docs/TELEMETRY_AUDIT_2026-07-12.md).
+                        _es = getattr(self, "_ema_state", None) or {}
                         json.dump({
                             "update_steps": int(_ctrl.step_idx),
                             "global_step": int(train_progress.global_step),
                             "accum": int(max(1, self.config.gradient_accumulation_steps)),
+                            "ema_loss": _es.get("ema_loss"),
+                            "ema_deploy": _es.get("ema_deploy"),
+                            "ema_loss_steps": _es.get("ema_loss_steps"),
                         }, f)
+                    # Per-backup metrics for the across-backup trajectory console
+                    # (meter-only): per-layer velocity + state-economy, appended to
+                    # a JSONL in workspace_dir so the layer/econ panels accumulate
+                    # as the run backs up. Own try; never aborts a backup.
+                    try:
+                        _ctrl.log_console_snapshot(int(train_progress.global_step),
+                                                   int(_ctrl.step_idx))
+                    except Exception:
+                        pass
+                    # Kalman loss meter: PER-RUN state, backup-scoped like the clock.
+                    # (Living in the generic workspace_dir let its frozen baseline
+                    # survive config changes and score against a regime the run no
+                    # longer trains -- stale skill/trend. Own try; never abort backup.)
+                    try:
+                        if getattr(self, "_kloss", None) is not None:
+                            self._kloss.save(os.path.join(backup_path, "concord_kloss.json"))
+                    except Exception as _ke:
+                        print(f"[concord] could not write kloss sidecar ({_ke})", flush=True)
                 except OSError as e:
                     print(f"[concord] could not write backup clock ({e}); a "
                           f"resume with a different accum will mis-seed", flush=True)
@@ -601,6 +713,7 @@ class GenericTrainer(BaseTrainer):
             import sys
             print("[concord-restart] backup written -> exit(42) for fresh-process "
                   "relaunch (skipping the in-process recommit)", flush=True)
+            self._kill_tensorboard_for_restart()
             sys.stdout.flush()
             sys.stderr.flush()
             sys.exit(42)
@@ -663,6 +776,116 @@ class GenericTrainer(BaseTrainer):
                 self.model.ema.copy_temp_to(self.parameters)
 
         torch_gc()
+
+    def __concord_batch_emb_ids(self, batch):
+        """Per-example TRAINABLE-EMBEDDING TOKEN IDS (ids past the tokenizer's base vocab --
+        added tokens are appended there, so the threshold needs no model introspection).
+        The examples' identity key for hard-negative telemetry: numeric, always present in
+        the batch, and the mining unit anyway (the packed embedding rows) -- concept-name
+        strings stay out of logs and sidecars. None when tokens are absent."""
+        _tok = batch.get("tokens_1", None) if isinstance(batch, dict) else None
+        if _tok is None or not torch.is_tensor(_tok):
+            return None
+        _base = int(getattr(getattr(self.model, "tokenizer_1", None), "vocab_size", 0) or 0)
+        if _base <= 0:
+            return None
+        _tb = _tok.reshape(_tok.shape[0], -1)
+        return [sorted(set(int(t) for t in row[row >= _base].tolist())) for row in _tb]
+
+    def __concord_hardneg_audit(self, batch, train_progress):
+        """Gap-guarded hard-negative mining TELEMETRY (meter only -- zero sampler effect).
+        Re-runs the CURRENT batch's forward under three weight views (deploy / arm-L / arm-H,
+        deterministic noise so the views differ ONLY in weights) and logs per-example deploy
+        loss, branch disagreement, and the would-be-mined set. The mining rule this meters:
+        mined = high loss among examples whose branch views AGREE (low |loss_L - loss_H|) --
+        agreement is what separates hard-informative from suspect (a corrupted/unique example
+        is corroborated by only one data half). CPU receipts: guarded mining strictly
+        dominates the router+floor best (+1.1pp gen / -1.3pp mem, exp48 [epic-williamson];
+        exps 33/34 [mechanics]); UNGUARDED mining self-destructs (selects ~77% corruption ->
+        the duplication attack). The mined-set purity statistic this logs is the
+        safety-critical number to validate on GPU BEFORE any sampler actuation."""
+        _ctrl = getattr(self.model, "concord_controller", None)
+        # One-time AUDIT CACHE capture (needs no weight views, so it works under fused matmul
+        # too): the exact replayable UNet inputs + target for this batch, for the OFFLINE
+        # auditor (scripts/concord_hardneg_audit.py), which materializes the branch views from
+        # a BACKUP's packed state instead of the live process -- no fused/capture/OOM
+        # constraints, and a FIXED audit set measured against every backup gives longitudinal
+        # per-example curves the streaming meter cannot.
+        _cache_path = os.path.join(self.config.workspace_dir, "concord_hardneg_audit.pt")
+        if not os.path.exists(_cache_path):
+            with torch.no_grad():
+                _cap = self.model_setup.predict(self.model, batch, self.config, train_progress,
+                                                deterministic=True, return_unet_inputs=True)
+            torch.save({
+                "latent_input": _cap["latent_input"].detach().cpu(),
+                "timestep": _cap["timestep"].detach().cpu(),
+                "encoder_hidden_states": _cap["encoder_hidden_states"].detach().cpu(),
+                "added_cond_kwargs": {k: (v.detach().cpu() if torch.is_tensor(v) else v)
+                                      for k, v in (_cap.get("added_cond_kwargs") or {}).items()},
+                "target": _cap["target"].detach().cpu(),
+                "emb_ids": self.__concord_batch_emb_ids(batch),
+                "captured_step": int(train_progress.global_step),
+            }, _cache_path)
+            print(f"[concord-hardneg] audit cache captured -> {_cache_path} "
+                  f"(B={int(_cap['target'].shape[0])}, step {train_progress.global_step}); replay it "
+                  "against any backup with scripts/concord_hardneg_audit.py", flush=True)
+        per_view = {}
+        with torch.no_grad():
+            for _which in ("deploy", "L", "H"):
+                # set_branch_view INSIDE the try: an OOM mid-swap must still hit the
+                # finally, or some layers keep serving a branch view to training
+                try:
+                    _n = _ctrl.set_branch_view(_which)
+                    if _n == 0:
+                        self._hardneg_dead = True
+                        print(f"[concord-hardneg] no viewable layers ({_ctrl.branch_view_diag()}) -> "
+                              "live meter disabled for this run. fused_matmul=True is the usual cause "
+                              "(inline dequant leaves no per-layer cache to swap). The audit cache "
+                              "above still works: run scripts/concord_hardneg_audit.py against each "
+                              "backup for the same telemetry offline.", flush=True)
+                        return
+                    _out = self.model_setup.predict(
+                        self.model, batch, self.config, train_progress, deterministic=True)
+                    _pred, _tgt = _out.get("predicted"), _out.get("target")
+                    if _pred is None or _tgt is None:
+                        self._hardneg_dead = True
+                        print("[concord-hardneg] predict() returned no predicted/target -> "
+                              "meter disabled for this run", flush=True)
+                        return
+                    _d = (_pred.float() - _tgt.float()).pow(2)
+                    per_view[_which] = _d.reshape(_d.shape[0], -1).mean(dim=1)
+                finally:
+                    _ctrl.restore_branch_views()
+        _ld = per_view["deploy"]
+        _dis = (per_view["L"] - per_view["H"]).abs()
+        _B = int(_ld.numel())
+        _q75 = _dis.quantile(0.75)
+        _trusted = _dis <= _q75            # branch-agreement guard (no label-agreement analog here)
+        _thr = _ld[_trusted].quantile(2.0 / 3.0) if int(_trusted.sum()) > 0 else _ld.quantile(2.0 / 3.0)
+        _mined = _trusted & (_ld >= _thr)  # high AGREED loss: hard AND corroborated by both halves
+        _eids = self.__concord_batch_emb_ids(batch)
+        _mtag = ""
+        if _eids is not None:
+            try:
+                _picked = [str(_eids[i]) for i in _mined.nonzero().flatten().tolist()[:6]]
+                _mtag = " mined_emb_ids=" + ";".join(_picked)
+            except Exception:
+                pass
+        _rel = float((_dis / _ld.clamp_min(1e-12)).median())
+        print(f"[concord-hardneg] step {train_progress.global_step} B={_B} "
+              f"loss(dep) p50={float(_ld.median()):.4f} p90={float(_ld.quantile(0.9)):.4f} | "
+              f"branch-disagree p50={float(_dis.median()):.2e} p75={float(_q75):.2e} "
+              f"rel(p50)={_rel:.3f} | trusted={int(_trusted.sum())}/{_B} "
+              f"mined={int(_mined.sum())}{_mtag}", flush=True)
+        if self.tensorboard is not None:
+            self.tensorboard.add_scalar("hardneg/loss_deploy_p50", float(_ld.median()),
+                                        train_progress.global_step)
+            self.tensorboard.add_scalar("hardneg/branch_disagree_rel_p50", _rel,
+                                        train_progress.global_step)
+            self.tensorboard.add_scalar("hardneg/trusted_frac", float(_trusted.float().mean()),
+                                        train_progress.global_step)
+            self.tensorboard.add_scalar("hardneg/mined_frac", float(_mined.float().mean()),
+                                        train_progress.global_step)
 
     def __needs_sample(self, train_progress: TrainProgress):
         return self.single_action_elapsed(
@@ -751,7 +974,104 @@ class GenericTrainer(BaseTrainer):
             torch.clear_autocast_cache()
             self.model.optimizer.eval()
 
+    def _concord_setup_capture(self):
+        """Capture the run's console + a structured per-step telemetry stream.
+
+        Two artifacts under workspace_dir, both meter-only (no training effect):
+          concord_console_<ts>.log  -- a tee of stdout+stderr: the [concord]
+              banners, warnings, tracebacks and the [loss] health lines, so a
+              post-mortem does not depend on terminal scrollback surviving.
+              tqdm bars animate on the REAL console unchanged (isatty/fileno/
+              encoding delegate through); the file keeps only the final
+              \\r-collapsed segment of each line (no progress-bar spam).
+          concord_telemetry_<ts>.jsonl -- one JSON record per health-line print
+              (step/loss/smooth/deploy/gap/boil/waste/boil_cf/armgap): diffable,
+              plottable, immune to the console log's reformatting.
+        Timestamped so each process (incl. resumes) gets its own pair, never
+        clobbering. Master-rank only -- a shared file across ranks would
+        interleave. Default on; CONCORD_CAPTURE=0 disables. FAIL-SAFE: any error
+        here (or in the tee) leaves training untouched; logging must never crash
+        the run or corrupt the console (the real stream always gets every write
+        verbatim -- the file side is best-effort)."""
+        import os
+        import sys
+        self._telemetry_fh = None                    # read by the health-line emit
+        if getattr(self, "_capture_installed", False):
+            return
+        self._capture_installed = True
+        if os.environ.get("CONCORD_CAPTURE", "1") == "0":
+            return
+        try:
+            if not multi.is_master():
+                return
+        except Exception:
+            pass
+        try:
+            ts = get_string_timestamp()
+            d = self.config.workspace_dir
+            os.makedirs(d, exist_ok=True)
+            con_path = os.path.join(d, f"concord_console_{ts}.log")
+            tel_path = os.path.join(d, f"concord_telemetry_{ts}.jsonl")
+            con_fh = open(con_path, "a", encoding="utf-8", errors="replace")
+            self._telemetry_fh = open(tel_path, "a", encoding="utf-8", errors="replace")
+
+            class _Tee:
+                # Mirror a console stream to a file. Console side is untouched
+                # (every write passes straight through; isatty/fileno/encoding
+                # delegate, so tqdm still animates). File side buffers to a
+                # newline and collapses \r refreshes to the final segment so the
+                # log is not progress-bar spam. NEVER raises -- a file error
+                # drops the file side and keeps the console.
+                def __init__(self, stream, fh):
+                    self._stream = stream
+                    self._fh = fh
+                    self._buf = ""
+
+                def write(self, s):
+                    try:
+                        n = self._stream.write(s)
+                    except Exception:
+                        n = len(s)
+                    try:
+                        self._buf += s
+                        while True:
+                            i = self._buf.find("\n")
+                            if i < 0:
+                                break
+                            line, self._buf = self._buf[:i + 1], self._buf[i + 1:]
+                            if "\r" in line:
+                                line = line.rsplit("\r", 1)[-1]
+                                if not line.endswith("\n"):
+                                    line += "\n"
+                            self._fh.write(line)
+                        self._fh.flush()
+                    except Exception:
+                        pass
+                    return n
+
+                def flush(self):
+                    for t in (self._stream, self._fh):
+                        try:
+                            t.flush()
+                        except Exception:
+                            pass
+
+                def __getattr__(self, name):
+                    return getattr(self._stream, name)
+
+            sys.stdout = _Tee(sys.stdout, con_fh)
+            sys.stderr = _Tee(sys.stderr, con_fh)
+            print(f"[capture] console   -> {con_path}", flush=True)
+            print(f"[capture] telemetry -> {tel_path}", flush=True)
+        except Exception as e:
+            try:
+                print(f"[capture] disabled (setup failed: {e})", flush=True)
+            except Exception:
+                pass
+            self._telemetry_fh = None
+
     def train(self):
+        self._concord_setup_capture()
         train_device = torch.device(self.config.train_device)
 
         train_progress = self.model.train_progress
@@ -864,13 +1184,37 @@ class GenericTrainer(BaseTrainer):
                 # ONLY -- dividing by batch_size too halved the horizon on every run
                 # before 2026-06-11: cosine ended mid-run, divot released mid-epoch-1.
                 if getattr(self.model, "concord_controller", None) is not None:
+                    # Contrast pairing = 2 arm-ticks per step (both arms consolidate on
+                    # the same image). With a fraction f of steps paired, the effective
+                    # tick rate is (1+f)x the loader-batch rate, and the clock advances
+                    # by the tick count per step (concord_ot.after_step). Scale the
+                    # horizon by the SAME (1+f) so the cosine ends at the true last epoch
+                    # and steps_per_epoch (= total_steps/epochs, below) keeps chase / leak
+                    # / beta2 / divot / lam_lo calibrated to ticks, not batches.
+                    _tick_mult = 1.0
+                    if bool(getattr(self.config, "concord_contrast_arms", False)):
+                        _cf = max(0.0, min(1.0, float(getattr(self.config, "concord_contrast_fraction", 1.0) or 1.0)))
+                        _accum_h = int(self.config.gradient_accumulation_steps)
+                        if _accum_h == 1:
+                            # accum==1: the pair IS the update (1 update = 2 ticks) -> (1+f) scaling.
+                            _tick_mult = 1.0 + _cf
+                        elif _accum_h % 2 == 0:
+                            # EVEN accum (pair-as-2-microsteps balance): a contrast cycle spends
+                            # accum-1 batches (pair = 1 batch counted as 2 slots + accum-2 ordinary)
+                            # but is a FULL optimizer step, so an epoch has B/(accum-f) steps, not
+                            # B/accum. Scale by accum/(accum-f) so total_steps = epochs*B/(accum-f)
+                            # and the cosine + epoch-window timescales stay calibrated (step_idx
+                            # lands exactly at total_steps). accum==2 -> 2/(2-f); accum==4 -> 4/(4-f).
+                            _tick_mult = _accum_h / (_accum_h - _cf)
+                        # odd accum>=3 (old pair-as-micro-0 path, unbalanced 2:1): standard horizon.
                     self.model.concord_controller.total_steps = max(1, int(
                         self.config.epochs * self.data_loader.get_data_set().approximate_length()
-                        / max(1, self.config.gradient_accumulation_steps)))
+                        * _tick_mult / max(1, self.config.gradient_accumulation_steps)))
                     print(f"[concord] schedule horizon = {self.model.concord_controller.total_steps} "
                           f"steps ({self.config.epochs} epochs, "
                           f"len~{self.data_loader.get_data_set().approximate_length()} batches, "
-                          f"accum={self.config.gradient_accumulation_steps})")
+                          f"accum={self.config.gradient_accumulation_steps}"
+                          + (f", contrast tick x{_tick_mult:g}" if _tick_mult != 1.0 else "") + ")")
                     # Telescope epoch window (exp-20 freshness law): pin the
                     # anchor's integration window to the dataset revisit period
                     # now that the horizon (and so steps-per-epoch) is known.
@@ -886,8 +1230,17 @@ class GenericTrainer(BaseTrainer):
                     # count, accum-change-proof); fall back to deriving from
                     # micro-steps, which silently assumes accum never changed.
                     _resumed_updates = None
+                    # Only adopt a persisted controller clock when this process is
+                    # actually resuming (backup-continue or the restart-on-sample
+                    # wrapper, both of which set continue_last_backup). On a fresh
+                    # start get_last_backup_path() still returns the most recent
+                    # backup on disk -- without this gate a clean run reads that
+                    # stale clock (global_step 32) against its own train_progress=0,
+                    # prints the spurious "resume is at 0" fallback. Gate it.
                     _bk = (self.config.get_last_backup_path()
-                           if hasattr(self.config, "get_last_backup_path") else None)
+                           if (getattr(self.config, "continue_last_backup", False)
+                               and hasattr(self.config, "get_last_backup_path"))
+                           else None)
                     if _bk:
                         try:
                             with open(os.path.join(_bk, "concord_clock.json"),
@@ -899,6 +1252,20 @@ class GenericTrainer(BaseTrainer):
                                 print(f"[concord] controller clock restored from the "
                                       f"backup: update-step {_resumed_updates} "
                                       f"(accum-change-proof)", flush=True)
+                                # restore the loss smoothers so the smooth tags
+                                # continue instead of reseeding from the first
+                                # post-restart batch (the fake-dip artifact;
+                                # see the backup-write comment). Old backups
+                                # lack these keys -- skip gracefully.
+                                if _clk.get("ema_loss") is not None:
+                                    ema_loss = float(_clk["ema_loss"])
+                                    ema_loss_steps = int(_clk.get("ema_loss_steps")
+                                                         or 100)
+                                    if _clk.get("ema_deploy") is not None:
+                                        ema_deploy = float(_clk["ema_deploy"])
+                                    print("[concord] loss smoothers restored from "
+                                          "the backup clock (no EMA reseed divot)",
+                                          flush=True)
                             else:
                                 print(f"[concord] backup clock is for global_step "
                                       f"{_clk.get('global_step')} but resume is at "
@@ -906,6 +1273,11 @@ class GenericTrainer(BaseTrainer):
                                       f"falling back to micro-step derivation", flush=True)
                         except (OSError, ValueError, KeyError, TypeError):
                             pass
+                        _kp = os.path.join(_bk, "concord_kloss.json")
+                        if os.path.exists(_kp):
+                            self._kloss_resume_path = _kp
+                            print("[concord] kloss sidecar found in backup; meter "
+                                  "restores on the first update", flush=True)
                     if _resumed_updates is None:
                         _resumed_updates = int(getattr(train_progress, "global_step", 0)
                                                // max(1, self.config.gradient_accumulation_steps))
@@ -938,18 +1310,27 @@ class GenericTrainer(BaseTrainer):
                 if self.commands.get_stop_command():
                     multi.warn_parameter_divergence(self.parameters, train_device)
 
-                if os.environ.pop("CONCORD_RESUMING", None):
-                    # Resumed right after a Concord sample-triggered checkpoint-restart: the sample at
-                    # THIS restored step already ran in the prior process. Skip it once (one-shot via
-                    # env pop) -- otherwise we'd re-sample, re-checkpoint and exit again at the same
-                    # step forever, since the "already sampled" state doesn't survive a restart. The
-                    # training step at this step still runs (only the duplicate sample is skipped).
-                    print("[concord-restart] resumed -> skipping the already-done sample at this step", flush=True)
+                _concord_resumed_step = bool(os.environ.pop("CONCORD_RESUMING", None))
+                if _concord_resumed_step:
+                    # Resumed right after a Concord checkpoint-restart. Two things at THIS restored
+                    # step already happened in the prior process and must NOT be redone, or the
+                    # segment exit(42)s before any training step runs and livelocks at the boundary:
+                    #   (1) the sample at this step already ran; the "already sampled" flag doesn't
+                    #       survive a restart, so re-sampling would re-checkpoint + re-exit.
+                    #   (2) under CONCORD_RESTART_ON_BACKUP the per-epoch backup we resumed FROM is
+                    #       this exact (epoch, epoch_step==0) boundary. __needs_backup is STATELESS
+                    #       for the EPOCH unit (fires whenever epoch_step==0 and epoch>0), so it
+                    #       re-fires here and re-exits(42) at the same step forever -- every backup
+                    #       pinned to <step>-<epoch>-0, zero steps trained.
+                    # Skip BOTH once (one-shot via the env pop): the training step still runs, so
+                    # epoch_step advances past 0 and the next backup fires at the NEXT epoch boundary.
+                    print("[concord-restart] resumed -> skipping the already-done sample + redundant "
+                          "boundary backup at this step", flush=True)
                 elif (not self.commands.get_stop_command() and self.__needs_sample(train_progress)) or self.commands.get_and_reset_sample_default_command():
                     self.__enqueue_sample_during_training(
                         lambda: self.__sample_during_training(train_progress, train_device)
                     )
-                if self.__needs_backup(train_progress):
+                if self.__needs_backup(train_progress) and not _concord_resumed_step:
                     self.commands.backup()
 
                 if self.__needs_save(train_progress):
@@ -973,6 +1354,26 @@ class GenericTrainer(BaseTrainer):
                     backup = self.commands.get_and_reset_backup_command()
                     save = self.commands.get_and_reset_save_command()
                     if multi.is_master() and (backup or save):
+                        # Graph-mode hard-neg audit: eager forwards are only safe here, where
+                        # the graph is about to be released for the boundary work anyway. The
+                        # release frees the private pool (idempotent -- __backup/__save's own
+                        # release no-ops after this) and the model is still on the train
+                        # device; under restart-on-backup the process exits after the backup,
+                        # so the recapture this forces costs nothing.
+                        _hn_v2 = getattr(self.model, "concord_graph_v2", None)
+                        if (_hn_v2 is not None
+                                and not getattr(self, "_hardneg_dead", False)
+                                and bool(getattr(self.config, "concord_hardneg_meter", False))
+                                and getattr(self, "_hn_batch", None) is not None
+                                and getattr(self.model, "concord_controller", None) is not None):
+                            _hn_v2.release()
+                            try:
+                                self.__concord_hardneg_audit(self._hn_batch, train_progress)
+                            except torch.cuda.OutOfMemoryError:
+                                self._hardneg_dead = True
+                                torch.cuda.empty_cache()
+                                print("[concord-hardneg] boundary audit OOM -> meter disabled "
+                                      "for this run", flush=True)
                         self.model.to(self.temp_device)
                         if backup:
                             # restart-per-segment: when the wrapper set
@@ -1006,15 +1407,60 @@ class GenericTrainer(BaseTrainer):
                     # the gradient into s_fast (weights frozen). __is_update_step is True only
                     # on the cycle's last micro-step — the same condition that gates
                     # optimizer.step() below. accum==1 -> always True -> unchanged behavior.
+                    # Contrast whole-step routing (accum==2 only): when the pair fires it IS the
+                    # whole 2-tick cycle -- arm L (tick) + arm H (tick + CONSOLIDATE) in one
+                    # _contrast_step call -- so force the update here and count it as 2 micros
+                    # (global_step += 2 at end of iter). _contrast_fire is a pure hash of
+                    # global_step, so this matches step()'s own decision exactly. INERT unless
+                    # accum==2 with contrast on in bridge mode -> the accum=3 run is untouched
+                    # until the config is switched. See ManualUNetGraph._contrast_step.
+                    # EVEN accum: count the pair as 2 microsteps so the arms fill 1:1. At accum==2
+                    # the pair IS the whole cycle (it consolidates -> forced update); at accum>=4 it
+                    # is micros 0-1 (tick-only, both arms) and the cycle's last ordinary micro
+                    # consolidates as usual. INERT at odd accum (old unbalanced pair-micro-0 path).
+                    _contrast_pair = False
+                    _v2c = getattr(self.model, "concord_graph_v2", None)
+                    _accum_c = int(self.config.gradient_accumulation_steps)
+                    if (_v2c is not None and getattr(self.config, "concord_contrast_arms", False)
+                            and _accum_c % 2 == 0
+                            and not getattr(_v2c, "graph_te", False)):
+                        _contrast_pair = bool(_v2c._contrast_fire(train_progress))
+                    _contrast_whole = _contrast_pair and _accum_c == 2   # pair == whole cycle only at accum==2
                     if getattr(self.model, "concord_controller", None) is not None:
-                        from modules.util.optimizer.concord.prototype_packed_b import set_consolidate
-                        set_consolidate(train_device, self.__is_update_step(train_progress))
+                        from modules.util.optimizer.concord.prototype_packed_b import set_consolidate, set_arm_sel
+                        # A contrast whole-step consolidates on the pair's arm H, so force the
+                        # consolidate flag on even though this micro is the cycle's first.
+                        set_consolidate(train_device, self.__is_update_step(train_progress) or _contrast_whole)
+                        # Held-out arm router selector: alternate every micro (parity of the
+                        # 0-indexed micro counter; next_step() runs later in this iteration).
+                        # Same in-place-fill discipline as consolidate -> propagates into a
+                        # captured graph's replays. Read only when the router flag is on.
+                        # (On a contrast whole-step the pair overrides arm_sel internally.)
+                        set_arm_sel(train_device, (train_progress.global_step & 1) == 0)
+
+                    # NOTE (2026-07-12): loader-level contrastive-arms (yield each
+                    # batch twice + per-micro caption/seed) is INCOMPATIBLE with
+                    # the CUDA graph -- re-running the same batch through the
+                    # eager-prep -> graph pipeline twice disturbs the graph's
+                    # memory pool and segfaults (0xC0000005) at capture. Reverted
+                    # to inert. The graph-compatible design pairs INSIDE the graph
+                    # step() as a second replay with the dropped ehs (the
+                    # uncond_pass pattern, concord_graph.py:510) -- deferred to a
+                    # GPU-validated build; concord_contrast_arms is a no-op until.
 
                     _v2 = getattr(self.model, "concord_graph_v2", None)
                     if _v2 is not None:
                         # Stage 3 v2: the manual graph does predict-prep (eager) + a captured
                         # UNet -> loss -> backward replay; loss.backward() happens inside.
                         loss = _v2.step(self.model, batch, self.config, train_progress)
+                        # timestep-stratified loss recorder (opt-in; sentinel CONCORD_LOSS_TS.on):
+                        # the graph stashed THIS step's timesteps in static["timestep"] -> pair with
+                        # the returned loss. Gated + buffered in the controller; no-op otherwise.
+                        _lt_ctrl = getattr(self.model, "concord_controller", None)
+                        if _lt_ctrl is not None and getattr(_lt_ctrl, "_loss_ts_on", False):
+                            _lt_ts = (getattr(_v2, "static", None) or {}).get("timestep")
+                            if _lt_ts is not None:
+                                _lt_ctrl._maybe_log_loss_ts(_lt_ts, loss)
                     else:
                         prior_pred_indices = [i for i in range(self.config.batch_size)
                                               if ConceptType(batch['concept_type'][i]) == ConceptType.PRIOR_PREDICTION]
@@ -1055,7 +1501,7 @@ class GenericTrainer(BaseTrainer):
                     multi.reduce_tensor_mean(detached_loss)
                     accumulated_loss += detached_loss
 
-                    if self.__is_update_step(train_progress):
+                    if self.__is_update_step(train_progress) or _contrast_whole:
                         if self.config.fused_gradient_reduce:
                             multi.finish_async(self.config.gradient_reduce_precision)
                         else:
@@ -1109,6 +1555,7 @@ class GenericTrainer(BaseTrainer):
                             # by the batch-fitted transient riding in s_fast.
                             _ctrl = getattr(self.model, "concord_controller", None)
                             _gap = None
+                            _boil = _waste = _boil_prot = _armgap = None
                             if _ctrl is not None:
                                 _gap = _ctrl.read_memorization_gap()
                                 _deploy = accumulated_loss_cpu + _gap
@@ -1122,6 +1569,10 @@ class GenericTrainer(BaseTrainer):
                                     "loss/deploy_est", _deploy, train_progress.global_step)
                                 self.tensorboard.add_scalar(
                                     "smooth_loss/deploy_est", ema_deploy, train_progress.global_step)
+                            # stash for the backup clock (smoothers survive restarts)
+                            self._ema_state = {"ema_loss": ema_loss,
+                                               "ema_deploy": ema_deploy,
+                                               "ema_loss_steps": ema_loss_steps}
                             # Plain stdout loss line: the tqdm postfix is transient
                             # (overwritten in place, lost on redirect); this survives in
                             # console scrollback and piped logs. tqdm.write keeps the
@@ -1130,9 +1581,26 @@ class GenericTrainer(BaseTrainer):
                             # logger is disabled; see modules/util/spike_log.py)
                             from modules.util import spike_log as _spike_log
                             _spike_log.SPIKE_LOG.set_step(train_progress.global_step)
+                            # Kalman loss meter: timestep-conditional baseline + [skill, trend]
+                            # filter -> a READABLE convergence number with a confidence interval
+                            # (see modules/util/kalman_loss.py). Timesteps come from the concord
+                            # controller's on_timesteps stash; None degrades to unconditioned mode.
+                            if not hasattr(self, "_kloss"):
+                                from modules.util.kalman_loss import KalmanLossMeter
+                                _spe = float(getattr(_ctrl, "steps_per_epoch", 0) or 0) if _ctrl else 0.0
+                                _krp = getattr(self, "_kloss_resume_path", None)
+                                # backup-scoped: restore from the resumed backup, else fresh.
+                                self._kloss = (KalmanLossMeter.load(_krp, _spe if _spe > 0 else 514.0)
+                                               if _krp else KalmanLossMeter(_spe if _spe > 0 else 514.0))
+                            _kt = getattr(_ctrl, "_last_timesteps", None) if _ctrl else None
+                            _kline = self._kloss.update(
+                                accumulated_loss_cpu,
+                                _kt.tolist() if _kt is not None else None)
                             _msg = (f"[loss] step {train_progress.global_step}"
                                     f"  loss={accumulated_loss_cpu:.5f}"
                                     f"  smooth={ema_loss:.5f}")
+                            if _kline:
+                                _msg += f"  | {_kline}"
                             if _gap is not None:
                                 _msg += (f"  gap={_gap:+.2e}"
                                          f"  deploy_smooth={ema_deploy:.5f}")
@@ -1145,7 +1613,139 @@ class GenericTrainer(BaseTrainer):
                                     self.tensorboard.add_scalar(
                                         "loss/concord_waste", _waste, train_progress.global_step)
                                     _msg += f"  waste={_waste:.3f}"
+                                _boil_prot = getattr(_ctrl, "_last_boil_protected", None)
+                                if _boil_prot is not None:
+                                    self.tensorboard.add_scalar(
+                                        "loss/concord_boil_protected", _boil_prot, train_progress.global_step)
+                                    _msg += f"  boil_cf={_boil_prot:.3f}"
+                                # Direct contrast meter: L_dropped - L_full on the
+                                # SAME latent/timestep/noise (arms differ by caption
+                                # alone). Positive => caption context lowers the loss
+                                # = the arms are differentiating. Stashed by
+                                # concord_graph._contrast_step; None when contrast off.
+                                _cf = getattr(_ctrl, "_last_contrast_full", None)
+                                _cd = getattr(_ctrl, "_last_contrast_drop", None)
+                                if _cf is not None and _cd is not None:
+                                    try:
+                                        import torch as _tt2
+                                        _fv = _cf.item() if _tt2.is_tensor(_cf) else float(_cf)
+                                        _dv = _cd.item() if _tt2.is_tensor(_cd) else float(_cd)
+                                        _armgap = _dv - _fv
+                                        self.tensorboard.add_scalar(
+                                            "loss/concord_arm_gap", _armgap, train_progress.global_step)
+                                        _msg += f"  armgap={_armgap:+.2e}"
+                                    except Exception:
+                                        pass
+                                _m6a = getattr(_ctrl, "_last_m6a", None)
+                                if _m6a is not None and getattr(self.config, "concord_m6a_meter", False):
+                                    self.tensorboard.add_scalar(
+                                        "loss/concord_m6a", _m6a, train_progress.global_step)
+                                    _msg += f"  m6a={_m6a:.3e}"
+                                _csnr = getattr(_ctrl, "_csnr_curve", None)
+                                if _csnr is not None and getattr(self, "_kloss", None) is not None:
+                                    # CSNR loss-prediction readout (the meter's acceptance gate): does the
+                                    # recovered per-timestep gradient-SNR curve predict the t-conditional
+                                    # loss baseline (_kloss.f)? Rank-corr over seen loss buckets.
+                                    try:
+                                        import torch as _tt
+                                        from modules.util.kalman_loss import N_BUCKETS as _NB, T_MAX as _TM
+                                        _cv = _csnr[0].float().cpu().flatten(); _tn = _cv.numel()
+                                        _bi = (_tt.arange(_tn).float() / _TM * _NB).clamp(max=_NB - 1).long()
+                                        _snrb = (_tt.zeros(_NB).scatter_add_(0, _bi, _cv)
+                                                 / _tt.zeros(_NB).scatter_add_(0, _bi, _tt.ones(_tn)).clamp_min(1.0))
+                                        _fb = _tt.tensor(self._kloss.f, dtype=_tt.float32)
+                                        _seen = _tt.tensor(self._kloss.f_seen) >= 5
+                                        if int(_seen.sum()) >= 4:
+                                            _rx = _snrb[_seen].argsort().argsort().float()
+                                            _ry = _fb[_seen].argsort().argsort().float()
+                                            _rx -= _rx.mean(); _ry -= _ry.mean()
+                                            _rho = float((_rx @ _ry) / (_rx.norm() * _ry.norm() + 1e-30))
+                                            _msg += f"  csnr~loss={_rho:+.2f}(g{_csnr[1]})"
+                                            self.tensorboard.add_scalar("loss/concord_csnr_vs_loss",
+                                                                        _rho, train_progress.global_step)
+                                    except Exception:
+                                        pass
                             step_tqdm.write(_msg)
+                            # Structured per-line mirror (meter only; see
+                            # _concord_setup_capture). One JSON record per health
+                            # line -> diffable/plottable, immune to console
+                            # reformatting. Fail-safe: a logging error never
+                            # touches training.
+                            _tfh = getattr(self, "_telemetry_fh", None)
+                            if _tfh is not None:
+                                try:
+                                    import time as _time
+                                    _rec = {"t": _time.time(),
+                                            "step": train_progress.global_step,
+                                            "loss": accumulated_loss_cpu,
+                                            "smooth": ema_loss}
+                                    if _gap is not None:
+                                        _rec["gap"] = _gap
+                                        _rec["deploy_smooth"] = ema_deploy
+                                    if _boil is not None:
+                                        _rec["boil"] = _boil
+                                    if _waste is not None:
+                                        _rec["waste"] = _waste
+                                    if _boil_prot is not None:
+                                        _rec["boil_cf"] = _boil_prot
+                                    if _armgap is not None:
+                                        _rec["armgap"] = _armgap
+                                    _tfh.write(json.dumps(_rec) + "\n")
+                                    _tfh.flush()
+                                except Exception:
+                                    pass
+                                # Drain buffered contrast pairs (armgap x SNR meter): one JSON
+                                # line per pair carrying its timestep vector + arm losses, so the
+                                # offline harness can bin armgap by schedule / live-gradient SNR.
+                                # Independent try so a drain error never blocks the _rec write.
+                                try:
+                                    _pend = getattr(_ctrl, "_contrast_pending", None)
+                                    if _pend:
+                                        _drained = _pend
+                                        _ctrl._contrast_pending = []
+                                        import torch as _tt3, time as _time2
+                                        for _pts, _pf, _pd in _drained:
+                                            _pfv = _pf.item() if _tt3.is_tensor(_pf) else float(_pf)
+                                            _pdv = _pd.item() if _tt3.is_tensor(_pd) else float(_pd)
+                                            _tfh.write(json.dumps({
+                                                "t": _time2.time(),
+                                                "step": train_progress.global_step,
+                                                "contrast_full": _pfv, "contrast_drop": _pdv,
+                                                "armgap": _pdv - _pfv,
+                                                "contrast_ts": [int(x) for x in
+                                                                _pts.detach().flatten().cpu().tolist()],
+                                            }) + "\n")
+                                        _tfh.flush()
+                                except Exception:
+                                    pass
+
+                            # Concord hard-negative mining telemetry (meter only; see
+                            # __concord_hardneg_audit). Runs at an UPDATE boundary by
+                            # construction (this block is update-gated), which the branch-view
+                            # swap requires. Self-disables on OOM or missing prerequisites.
+                            if _ctrl is not None and not getattr(self, "_hardneg_dead", False) \
+                                    and bool(getattr(self.config, "concord_hardneg_meter", False)):
+                                # keep a reference to the freshest batch for the BOUNDARY audit
+                                # (the graph-mode path: eager forwards are only safe there)
+                                self._hn_batch = batch
+                                _hn_every = max(1, int(getattr(self.config,
+                                                               "concord_hardneg_every", 128) or 128))
+                                self._hn_updates = getattr(self, "_hn_updates", 0) + 1
+                                if self._hn_updates % _hn_every == 0 \
+                                        and getattr(self.model, "concord_graph_v2", None) is None:
+                                    # cadence audits are EAGER-mode only: under the graph the
+                                    # pool holds the VRAM an eager forward needs; the audit
+                                    # instead fires once per backup boundary (below), where the
+                                    # release frees the pool -- and under restart-on-backup the
+                                    # recapture cost is zero (the process exits right after).
+                                    try:
+                                        self.__concord_hardneg_audit(batch, train_progress)
+                                    except torch.cuda.OutOfMemoryError:
+                                        self._hardneg_dead = True
+                                        torch.cuda.empty_cache()
+                                        print("[concord-hardneg] audit OOM -> meter disabled for "
+                                              "this run (raise concord_hardneg_every or lower "
+                                              "batch)", flush=True)
 
                         accumulated_loss = 0.0
                         self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
@@ -1169,6 +1769,14 @@ class GenericTrainer(BaseTrainer):
                     self.__validate(train_progress)
 
                 train_progress.next_step(self.config.batch_size)
+                if _contrast_pair:
+                    # The pair does BOTH arms in one call, so count it as 2 microsteps: advance
+                    # global_step by one more. Keeps gs % accum cycle-aligned and gs // accum =
+                    # update count correct (how the router parity and resume both read it), and
+                    # makes the ordinary-micro count per cycle EVEN so the arms fill 1:1 (accum==2:
+                    # 0 ordinary; accum==4: 2 ordinary). Raw bump: no extra batch/sample consumed
+                    # (the pair reused one image across both arms) -> epoch_step stays on 1 batch.
+                    train_progress.global_step += 1
                 self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 
                 if self.commands.get_stop_command():

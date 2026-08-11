@@ -211,6 +211,7 @@ class StableDiffusionXLModel(BaseModel):
             text_encoder_1_dropout_probability: float | None = None,
             text_encoder_2_dropout_probability: float | None = None,
             pooled_text_encoder_2_output: Tensor = None,
+            couple_dropout: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor]:
         if tokens_1 is None and text is not None:
             tokenizer_output = self.tokenizer_1(
@@ -269,19 +270,38 @@ class StableDiffusionXLModel(BaseModel):
             text_encoder_2_output,
         )
 
-        # apply dropout
-        if text_encoder_1_dropout_probability is not None and text_encoder_1_dropout_probability > 0.0:
-            dropout_text_encoder_1_mask = (torch.tensor(
-                [rand.random() > text_encoder_1_dropout_probability for _ in range(batch_size)],
-                device=train_device)).float()
-            text_encoder_1_output = text_encoder_1_output * dropout_text_encoder_1_mask[:, None, None]
+        # apply dropout.
+        p1 = text_encoder_1_dropout_probability
+        p2 = text_encoder_2_dropout_probability
+        if couple_dropout:
+            # LOCKED coupled dropout: ONE shared per-example mask drives BOTH
+            # encoders at a SINGLE rate (max of the two configured), so a
+            # "dropped" example is genuinely unconditional and there are ZERO
+            # partial-conditioning states. Fixes the independent-draw footgun
+            # where true-uncond collapses to p1*p2 (0.09 at 0.3/0.3) while
+            # 2*p*(1-p)=0.42 of examples get ONE encoder zeroed -- inference-
+            # nonexistent half-conditioned states that shred CFG training.
+            p = max(p1 or 0.0, p2 or 0.0)
+            if p > 0.0:
+                m = (torch.tensor([rand.random() for _ in range(batch_size)],
+                                  device=train_device) > p).float()
+                text_encoder_1_output = text_encoder_1_output * m[:, None, None]
+                pooled_text_encoder_2_output = pooled_text_encoder_2_output * m[:, None]
+                text_encoder_2_output = text_encoder_2_output * m[:, None, None]
+        else:
+            # Legacy independent draws (unchanged; bit-identical when off).
+            if p1 is not None and p1 > 0.0:
+                dropout_text_encoder_1_mask = (torch.tensor(
+                    [rand.random() > p1 for _ in range(batch_size)],
+                    device=train_device)).float()
+                text_encoder_1_output = text_encoder_1_output * dropout_text_encoder_1_mask[:, None, None]
 
-        if text_encoder_2_dropout_probability is not None and text_encoder_2_dropout_probability > 0.0:
-            dropout_text_encoder_2_mask = (torch.tensor(
-                [rand.random() > text_encoder_2_dropout_probability for _ in range(batch_size)],
-                device=train_device)).float()
-            pooled_text_encoder_2_output = pooled_text_encoder_2_output * dropout_text_encoder_2_mask[:, None]
-            text_encoder_2_output = text_encoder_2_output * dropout_text_encoder_2_mask[:, None, None]
+            if p2 is not None and p2 > 0.0:
+                dropout_text_encoder_2_mask = (torch.tensor(
+                    [rand.random() > p2 for _ in range(batch_size)],
+                    device=train_device)).float()
+                pooled_text_encoder_2_output = pooled_text_encoder_2_output * dropout_text_encoder_2_mask[:, None]
+                text_encoder_2_output = text_encoder_2_output * dropout_text_encoder_2_mask[:, None, None]
 
         return text_encoder_1_output, text_encoder_2_output, pooled_text_encoder_2_output
 

@@ -161,7 +161,7 @@ def create_optimizer(
         # optimizer is a plain SGD over the REMAINING (aux) params -- norms, biases, and
         # any trained embeddings/text-encoder params. The Concord schedule + rebalance are
         # driven by the controller via before_step()/after_step().
-        case Optimizer.CONCORD:
+        case Optimizer.CONCORD | Optimizer.CONCORD_STEPLESS:
             optimizer = torch.optim.SGD(
                 params=parameters,
                 lr=config.learning_rate,

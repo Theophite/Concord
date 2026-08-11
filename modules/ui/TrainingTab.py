@@ -539,6 +539,31 @@ class TrainingTab:
         components.entry(frame, row, 1, self.ui_state, f"text_encoder{suffix}.learning_rate")
         row += 1
 
+        # Concord frozen-anchor TE training (SDXL CLIP-L / CLIP-G; inert under other
+        # optimizers/models). Field names don't follow the _n suffix: i=1 -> concord_te_anchor,
+        # i=2 -> concord_te2_anchor. The anchor strength (kernel wd_anchor) is shared across both.
+        _concord_te_anchor_field = {1: "concord_te_anchor", 2: "concord_te2_anchor"}.get(i)
+        if _concord_te_anchor_field is not None:
+            components.label(frame, row, 0, f"Concord: Freeze TE {i} to Anchor (opt-in)",
+                             tooltip=f"Concord text-encoder {i} training MODE (SDXL + Concord only; inert "
+                                     "otherwise). OFF (default): train this CLIP via the same WINNER recipe "
+                                     "as the UNet -- live coherence gate, dissipation, rebalance, full "
+                                     "per-step/per-epoch scheduling, NO pull-to-pretrained. ON (opt-in): "
+                                     "frozen-v_slow anchor -- pretrained pinned in v_slow, wd_anchor pulls "
+                                     "the delta back toward pretrained, low-drift, no dissipation. Uses the "
+                                     f"Text Encoder {i} Learning Rate above.")
+            components.switch(frame, row, 1, self.ui_state, _concord_te_anchor_field)
+            row += 1
+
+            if i == 1:
+                components.label(frame, row, 0, "Concord: Anchor Strength",
+                                 tooltip="Elastic pull of the TE delta back toward the pretrained anchor "
+                                         "(kernel wd_anchor). ~0.5 = gentle (validated); lower = more reach "
+                                         "toward the concept (more drift / sharper conditioning); 0 = no "
+                                         "anchor (plain packed drift). Shared across both anchored text encoders.")
+                components.entry(frame, row, 1, self.ui_state, "concord_te_wd_anchor")
+                row += 1
+
         if supports_layer_skip:
             # text encoder layer skip (clip skip)
             components.label(frame, row, 0, f"Text Encoder {i} Clip Skip",
@@ -607,7 +632,9 @@ class TrainingTab:
                                  "its trainable tokens -- all context words dropped -- so the token "
                                  "must carry the concept itself instead of leaning on the caption. "
                                  "Active only AFTER the divot releases, only on examples that contain "
-                                 "a trainable token, never on validation/sampling. 0 = off.")
+                                 "a trainable token, never on validation/sampling. 0 = off. Set this "
+                                 "AND Words-Only Dropout to 0.33 each for the thirds scheme "
+                                 "(full / tokens-only / words-only).")
         components.entry(frame, 7, 1, self.ui_state, "concord_token_only_dropout")
 
         components.label(frame, 8, 0, "Concord: Quality-Tag Shield",
@@ -633,6 +660,240 @@ class TrainingTab:
                                  "leaving a subject free to move away (toward good). Default hard.")
         components.options(frame, 10, 1, ["hard", "one_sided"], self.ui_state,
                            "concord_embedding_quality_mode")
+
+        components.label(frame, 11, 0, "Concord: Style-Tag Embeddings",
+                         tooltip="Comma/newline-separated placeholders or caption words to treat as "
+                                 "STYLE tags. They train freely as the style sink; every other "
+                                 "trainable row (quality tags included) is HARD-projected -- two-"
+                                 "sided -- off their learned span each step, enforcing style/subject "
+                                 "factorization symmetrically (a subject can neither absorb a style "
+                                 "nor become anti-style; the style stays promptable via its tag). "
+                                 "Independent list from the quality tags; a token in both lists is "
+                                 "treated as quality. Needs the Quality-Tag Shield switch ON (shared "
+                                 "plumbing) and the style tag present in captions bearing the style. "
+                                 "Keep the list modest: each style direction is a rank subtracted "
+                                 "from what subjects can learn. Empty = off.")
+        components.entry(frame, 11, 1, self.ui_state, "concord_embedding_style_tags")
+
+        components.label(frame, 12, 0, "Concord: Train Caption Vocab",
+                         tooltip="Train the base-vocabulary tokens that appear in your captions via the "
+                                 "packed per-token Concord path + the 'emb' dissipation servo, instead of "
+                                 "leaving them frozen. Concord only; separate from training added "
+                                 "embeddings. Seeded from the pretrained base vectors; default off.")
+        components.switch(frame, 12, 1, self.ui_state, "concord_train_caption_vocab")
+
+        components.label(frame, 13, 0, "Concord: Caption-Vocab Anchor",
+                         tooltip="Freeze each caption token's base-row init in v_slow (deploy = init + "
+                                 "gated delta). Default OFF: anchoring zeroes the leak so the emb servo's "
+                                 "adaptive kappa climb never engages -- leave off to let the servo work.")
+        components.switch(frame, 13, 1, self.ui_state, "concord_caption_vocab_anchor")
+
+        components.label(frame, 14, 0, "Concord: Caption-Vocab Content-Only",
+                         tooltip="Default ON: separate content from function-word glue -- drop whole-word "
+                                 "STOPWORDS (the/of/and...) + punctuation/digits, but KEEP sub-word fragments "
+                                 "(the/oph/ite compose 'theophite') and content words. Trains meaning-bearing "
+                                 "vocab, not glue; fragments still carry named concepts.")
+        components.switch(frame, 14, 1, self.ui_state, "concord_caption_vocab_content_only")
+
+        components.label(frame, 15, 0, "Concord: Caption-Vocab Min Count",
+                         tooltip="Drop caption tokens appearing fewer than N times across all training "
+                                 "captions (incidental-token frequency floor). Default 1 = keep all.")
+        components.entry(frame, 15, 1, self.ui_state, "concord_caption_vocab_min_count")
+
+        components.label(frame, 16, 0, "Concord: Embedding Preserve Norm",
+                         tooltip="Default ON: pin each trained token's deploy norm to its OWN seeded base "
+                                 "norm. OFF = legacy pin to the vocab MEDIAN (homogenizes token norms -- cuts "
+                                 "high-norm, boosts low-norm -- a norm-identity rewrite). Leave ON to preserve.")
+        components.switch(frame, 16, 1, self.ui_state, "concord_embedding_preserve_norm")
+
+        components.label(frame, 17, 0, "Concord: Emb Common-Mode Deflate",
+                         tooltip="Concentration gate: each epoch the attribution meter names the accumulator's "
+                                 "top shared components; OWNER tokens (affinity >= 0.6) keep theirs, passenger "
+                                 "rows have Gamma of their projection removed -- components migrate to their "
+                                 "owners instead of smearing across co-occurring tokens. Stable+owned components "
+                                 "only; survives restarts via the concord_commonmode.json sidecar. "
+                                 "OFF = bit-exact legacy. Needs the bridge TE path (concord_graph_te off).")
+        components.switch(frame, 17, 1, self.ui_state, "concord_emb_deflate")
+
+        components.label(frame, 18, 0, "Concord: Emb Deflate Gamma",
+                         tooltip="Fraction of an owned common-mode component removed from NON-owner rows "
+                                 "(owners always keep 100%). 0.5 = passengers lose half their shared "
+                                 "projection; 1.0 = hard orthogonalization for passengers.")
+        components.entry(frame, 18, 1, self.ui_state, "concord_emb_deflate_gamma")
+
+        components.label(frame, 19, 0, "Concord: Emb Deflate Modes",
+                         tooltip="How many owned common-mode components to shrink per epoch (cap on the "
+                                 "armed count). The meter still examines/logs the top 8; only the top-N "
+                                 "eligible (energetic+stable+owned, in energy order) are gated. 1 = only "
+                                 "the strongest owned mode; 8 = all that qualify. To disable, use the switch.")
+        components.entry(frame, 19, 1, self.ui_state, "concord_emb_deflate_modes")
+
+        # Concord group-subspace (exp61): between-group separation + within-group flatten, keyed
+        # by each additional embedding's `group` label. Own rows -- the panel grid only lays out
+        # cols 0-1, so packed higher columns were unreachable.
+        components.label(frame, 20, 0, "Concord: Grp Separate",
+                         tooltip="Group-subspace BETWEEN-group separation: project each embedding group's "
+                                 "update off the OTHER groups' span (needs >=2 groups, set via each "
+                                 "additional embedding's `group` label). Eager/bridge TE path only.")
+        components.switch(frame, 20, 1, self.ui_state, "concord_emb_group_separate")
+        components.label(frame, 21, 0, "Concord: Grp Sep Gamma",
+                         tooltip="Fraction of the cross-group projection removed (0.5 = half, 1.0 = hard). "
+                                 "Only active when Grp Separate is on.")
+        components.entry(frame, 21, 1, self.ui_state, "concord_emb_group_separate_gamma")
+        components.label(frame, 22, 0, "Concord: Grp Flatten",
+                         tooltip="Group-subspace WITHIN-group flatten: Newton-Schulz across a group's member "
+                                 "rows so members stay distinct and the group common-mode is demoted (needs a "
+                                 "group with >=2 members). Eager/bridge TE path only.")
+        components.switch(frame, 22, 1, self.ui_state, "concord_emb_group_flatten")
+        components.label(frame, 23, 0, "Concord: Grp Flat Gamma",
+                         tooltip="Interpolation toward the flattened update (0.5 = halfway, 1.0 = full reshape). "
+                                 "Only active when Grp Flatten is on.")
+        components.entry(frame, 23, 1, self.ui_state, "concord_emb_group_flatten_gamma")
+
+        components.label(frame, 24, 0, "Concord: Uncond-Mean Sampling",
+                         tooltip="When the negative prompt is EMPTY, sample with the DATASET-MEAN "
+                                 "conditioning as the uncond (workspace/concord_uncond_mean.safetensors, "
+                                 "made by scripts/concord_uncond_mean.py). CFG then guides away from the "
+                                 "dataset-typical image -- the cond-uncond differential excludes the "
+                                 "dataset-mean shift (brown-mud fix). Explicit negatives always win.")
+        components.switch(frame, 24, 1, self.ui_state, "concord_uncond_mean")
+
+        components.label(frame, 25, 0, "Concord: Uncond-Pass Partition",
+                         tooltip="Training (graph path): trains the CFG uncond branch via an extra "
+                                 "tick-only zeroed-conditioning UNet replay that accumulates into s_fast "
+                                 "WITHOUT taxing the embeddings (they keep 100% of their gradient events, "
+                                 "unlike caption dropout). Use INSTEAD of caption dropout (set that to 0). "
+                                 "Works in BOTH graph modes (TE bridge and TE-in-graph) via an in-graph "
+                                 "conditioning gate; the fire pattern is a deterministic hash of the "
+                                 "global step (A/B- and resume-stable). Still needs live validation. "
+                                 "OFF = bit-identical.")
+        components.switch(frame, 25, 1, self.ui_state, "concord_uncond_pass")
+
+        components.label(frame, 26, 0, "Concord: Uncond-Pass Rate",
+                         tooltip="Fraction of micro-steps firing the extra uncond replay (~ the effective "
+                                 "uncond weight vs cond, like a caption-dropout rate). 0.15 default. Each "
+                                 "fire costs one extra graph replay (in TE-in-graph mode that includes a "
+                                 "zero-gradient TE pass). The pass is additive (~(1+rate) gradient "
+                                 "mass); to match a caption-dropout rate r, use r/(1-r).")
+        components.entry(frame, 26, 1, self.ui_state, "concord_uncond_pass_rate")
+
+        components.label(frame, 27, 0, "Concord: Antithetic Timesteps",
+                         tooltip="Variance reduction on the timestep draw: importance-sample t proportional "
+                                 "to the min-SNR weight, ANTITHETICALLY in quantile space (pairs straddle "
+                                 "u=0.5). The loss side folds the weight into a scalar mean-weight rescale, so "
+                                 "the expected gradient AND the effective LR are unchanged -- pure variance "
+                                 "reduction on WHERE timesteps land. Needs Loss Weight Function = MIN_SNR_GAMMA "
+                                 "and no resolution-aware loss weight, else inert. OFF = bit-identical.")
+        components.switch(frame, 27, 1, self.ui_state, "concord_antithetic_timesteps")
+
+        components.label(frame, 28, 0, "Concord: Antithetic Noise",
+                         tooltip="Variance reduction on the noise draw: pair sample i with i+B/2 using "
+                                 "eps / -eps so each pair carries both signs, cancelling the odd-in-eps "
+                                 "cross-term (-2<eps, eps_pred>) variance. The noise is marginally still "
+                                 "N(0,I), so the objective is unchanged. Composes with Antithetic Timesteps. "
+                                 "OFF = bit-identical.")
+        components.switch(frame, 28, 1, self.ui_state, "concord_antithetic_noise")
+
+        components.label(frame, 29, 0, "Concord: Antithetic Same-Example",
+                         tooltip="Maximal variance reduction: copy each batch's first half over its second "
+                                 "half so example i and i+B/2 are the SAME example -- the antithetic "
+                                 "timestep/noise pairing then pairs each example WITH ITSELF, maximizing the "
+                                 "cross-term cancellation. Needs an even batch size and Antithetic Timesteps "
+                                 "ON (no-op otherwise). OFF = bit-identical.")
+        components.switch(frame, 29, 1, self.ui_state, "concord_antithetic_same_example")
+
+        components.label(frame, 30, 0, "Concord: Hard-Neg Meter",
+                         tooltip="Gap-guarded hard-negative mining TELEMETRY (meter ONLY -- never touches "
+                                 "sampling). Every Nth update, re-runs the current batch under three weight "
+                                 "views (deploy / arm-L / arm-H, matched noise) and logs per-example deploy "
+                                 "loss, branch disagreement, and the would-be-mined set: HIGH loss among "
+                                 "examples the two data halves AGREE about (agreement separates "
+                                 "hard-informative from suspect -- a memorized/unique example is corroborated "
+                                 "by only one half). Needs 2-fast + the Held-out Arm Router; self-disables "
+                                 "under fused matmul or OOM. Validate the [concord-hardneg] purity stats "
+                                 "BEFORE any future sampler actuation. OFF = bit-identical.")
+        components.switch(frame, 30, 1, self.ui_state, "concord_hardneg_meter")
+
+        components.label(frame, 31, 0, "Concord: Hard-Neg Every",
+                         tooltip="Audit cadence in UPDATE steps for the hard-negative meter. Each audit costs "
+                                 "3 extra no-grad forwards of one batch (eager, at the update boundary). "
+                                 "Default 128.")
+        components.entry(frame, 31, 1, self.ui_state, "concord_hardneg_every")
+
+        components.label(frame, 32, 0, "Concord: Emb Noise-Seed",
+                         tooltip="Per-row NSR seeding for the trainable embedding token rows (set-don't-hunt, "
+                                 "exp52): each row's dissipation is seeded from its OWN evidence-clocked "
+                                 "noise-to-signal ratio, read at epoch boundaries from the accumulators the "
+                                 "cores already keep. Rare-but-consistent tokens get LOW lam so single-sighting "
+                                 "evidence survives to consolidate; confused tokens get the ceiling (lam 1.5). "
+                                 "The MEDIAN row anchors at the configured emb dissipation -- this redistributes "
+                                 "your knob across tokens, it does not change its level. Converged rows drift to "
+                                 "the ceiling by construction (harmless; not a noise readout). Watch the "
+                                 "[concord-emb-nsr] lines: the per-token NSR spread doubles as the "
+                                 "embedding-learning diagnostic. Refuses to run with the dissipation servos. "
+                                 "OFF = bit-identical.")
+        components.switch(frame, 32, 1, self.ui_state, "concord_emb_noise_seed")
+
+        components.label(frame, 33, 0, "Concord: Words-Only Dropout",
+                         tooltip="Probability (0..1) that an example's caption has its trainable "
+                                 "tokens STRIPPED, context words kept -- the complement of Token-Only "
+                                 "Dropout. One shared draw per example picks the mode (both text "
+                                 "encoders always see the same composition); same divot / eligibility "
+                                 "/ never-on-validation gating. Both at 0.33 = the thirds scheme, "
+                                 "which separates the embedding-attributable gradient stream from the "
+                                 "caption stream so the optimizer's gate certifies two coherent "
+                                 "components instead of taxing a standing mixture (2026-07-12 "
+                                 "telemetry audit). 0 = off.")
+        components.entry(frame, 33, 1, self.ui_state, "concord_words_only_dropout")
+
+        components.label(frame, 34, 0, "Concord: Dropout Injected Only",
+                         tooltip="Scope both dropout modes to the INJECTED (added-placeholder) "
+                                 "tokens. When Train Caption Vocab is on, the trainable set includes "
+                                 "surrounding caption words -- token-only would then keep half the "
+                                 "caption and words-only would strip ordinary words. ON subtracts the "
+                                 "caption-vocab ids: tokens-only keeps just the placeholders, "
+                                 "words-only strips just them. No-op when caption vocab is off; "
+                                 "recommended ON whenever it is on.")
+        components.switch(frame, 34, 1, self.ui_state, "concord_dropout_injected_only")
+
+        components.label(frame, 35, 0, "Concord: Couple TE Dropout",
+                         tooltip="Couple the two text-encoder CFG dropout masks (the Caption Dropout "
+                                 "Probability set per encoder above). ONE shared per-example mask "
+                                 "drives BOTH encoders at a single rate (max of the two), so a dropped "
+                                 "example is genuinely UNCONDITIONAL and there are ZERO partial-"
+                                 "conditioning states. Fixes the independent-draw footgun: with both "
+                                 "probabilities set (e.g. 0.3/0.3), independent masks make true-uncond "
+                                 "collapse to p1*p2 (0.09) while 0.42 of examples get ONE encoder "
+                                 "zeroed -- inference-nonexistent half-conditioned states that shred "
+                                 "CFG training. ON => a clean max(p1,p2) fraction fully-unconditional. "
+                                 "Recommended ON whenever caption dropout is used. OFF = legacy "
+                                 "independent draws.")
+        components.switch(frame, 35, 1, self.ui_state, "concord_couple_te_dropout")
+
+        components.label(frame, 36, 0, "Concord: Contrastive Arms",
+                         tooltip="CONTRASTIVE (paired) arms (exp 71/72), GRAPH-NATIVE. Pairs each "
+                                 "image across the two held-out arms as two replays of the one "
+                                 "captured graph: FULL caption -> arm L (tick), token-DROPPED -> arm "
+                                 "H (consolidate), same timestep/noise. The gap floor reads the "
+                                 "token's context as cross-arm disagreement and evaporates it, "
+                                 "banking the token's context-invariant core. REQUIRES: CUDA graph "
+                                 "ON (concord_cuda_graph; inert without it), gradient_accumulation_"
+                                 "steps == 1 (the paired step IS the update), Held-Out Router ON, and "
+                                 "a nonzero Caption Dropout (forces the TE bridge). Cost ~2x TE + 2x "
+                                 "replay per update, NOT epoch-doubled. NOT YET GPU-VALIDATED -- test "
+                                 "on a throwaway run. Arm Couple TE Dropout FIRST and confirm "
+                                 "recovery before enabling this. OFF = unchanged.")
+        components.switch(frame, 36, 1, self.ui_state, "concord_contrast_arms")
+
+        components.label(frame, 37, 0, "Concord: Contrast Fraction",
+                         tooltip="Fraction of steps that run the paired same-image contrast (B). "
+                                 "1.0 = every step is paired (default, unchanged); <1.0 interleaves "
+                                 "ordinary held-out-router steps on the remainder, so only that "
+                                 "fraction of image-batches get the paired differently-conditioned "
+                                 "contrast. Cheaper (fewer 2x-replay steps) and lets the ordinary "
+                                 "steps bank normally. Deterministic per-step hash (same-seed A/B "
+                                 "safe). No-op unless Contrastive Arms is ON.")
+        components.entry(frame, 37, 1, self.ui_state, "concord_contrast_fraction")
 
     def __create_unet_frame(self, master, row):
         frame = ctk.CTkFrame(master=master, corner_radius=5)

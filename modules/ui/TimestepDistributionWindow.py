@@ -27,6 +27,7 @@ class TimestepGenerator(ModelSetupNoiseMixin):
             noising_weight: float,
             noising_bias: float,
             timestep_shift: float,
+            constant_snr_floor: float = 0.1,
     ):
         super().__init__()
 
@@ -36,6 +37,7 @@ class TimestepGenerator(ModelSetupNoiseMixin):
         self.noising_weight = noising_weight
         self.noising_bias = noising_bias
         self.timestep_shift = timestep_shift
+        self.constant_snr_floor = constant_snr_floor
 
     def generate(self) -> Tensor:
         generator = torch.Generator()
@@ -48,6 +50,7 @@ class TimestepGenerator(ModelSetupNoiseMixin):
         config.noising_weight = self.noising_weight
         config.noising_bias = self.noising_bias
         config.timestep_shift = self.timestep_shift
+        config.constant_snr_floor = self.constant_snr_floor
 
 
         return self._get_timestep_discrete(
@@ -97,7 +100,7 @@ class TimestepDistributionWindow(ctk.CTkToplevel):
         frame.grid_columnconfigure(1, weight=0)
         frame.grid_columnconfigure(2, weight=0)
         frame.grid_columnconfigure(3, weight=1)
-        frame.grid_rowconfigure(7, weight=1)
+        frame.grid_rowconfigure(9, weight=1)
 
         # timestep distribution
         components.label(frame, 0, 0, "Timestep Distribution",
@@ -130,6 +133,12 @@ class TimestepDistributionWindow(ctk.CTkToplevel):
         components.label(frame, 5, 0, "Timestep Shift",
                          tooltip="Shift the timestep distribution. Use the preview to see more details.")
         components.entry(frame, 5, 1, self.ui_state, "timestep_shift")
+
+        # constant-SNR floor
+        components.label(frame, 7, 0, "Constant SNR Floor",
+                         tooltip="Only for the CONSTANT_SNR distribution. The draw samples t proportional to 1/clamp(SNR, floor*gamma, gamma), where gamma is the min-SNR mastery cap (Loss Weight Strength). This floor clamps the effective SNR up at the near-pure-noise end, capping how hard the noisiest timesteps are oversampled (max oversampling ratio ~1/floor). Lower = flatter accumulated SNR but more compute on near-dead timesteps; higher = safer. Use with Loss Weight Function = CONSTANT.",
+                         wide_tooltip=True)
+        components.entry(frame, 7, 1, self.ui_state, "constant_snr_floor")
 
         # dynamic timestep shifting
         components.label(frame, 6, 0, "Dynamic Timestep Shifting",
@@ -176,6 +185,7 @@ class TimestepDistributionWindow(ctk.CTkToplevel):
             noising_weight=self.config.noising_weight,
             noising_bias=self.config.noising_bias,
             timestep_shift=self.config.timestep_shift,
+            constant_snr_floor=getattr(self.config, "constant_snr_floor", 0.1),
         )
 
         self.ax.cla()
