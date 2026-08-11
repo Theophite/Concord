@@ -41,3 +41,22 @@ pixi.toml
 train.bat
 debug_report.log
 config_diff.txt
+
+# machine-local runtime state (Concord)
+/CONCORD_*.on
+*.selftest-ok
+/NSR_VALVE_ON
+
+# scratch / debug-repro scripts and logs at the repo root
+/_repro*
+/scratch_*.py
+/test_evap_slack.py
+/test_full_v_conv.py
+/*.log
+
+# GPU overfit rig (24 GB of local data/images)
+/overfit_test
+
+# stale snapshot of the kernel reorganization -- the authoritative, further-evolved
+# copy lives in the dedicated reorg clone (isolate-refactor-from-production)
+/modules/util/optimizer/concord_core/
