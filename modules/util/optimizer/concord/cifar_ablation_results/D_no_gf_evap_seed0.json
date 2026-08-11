@@ -1,0 +1,57 @@
+{
+  "arm": "D_no_gf_evap",
+  "args": {
+    "arm": "D_no_gf_evap",
+    "optimizer": "concord",
+    "coh_vhat": 0,
+    "coh_kappa": 1.0,
+    "lam": 0.0,
+    "ratio_coh": 0,
+    "disable_cohpre": 0,
+    "sigmag_peak": 0.0,
+    "longtail": 0.0,
+    "epochs": 80,
+    "lr": 0.05,
+    "adamw_lr": 0.001,
+    "warmup": 200,
+    "bias_correct": 1,
+    "lr_min_frac": 0.01,
+    "batch_size": 32,
+    "alpha": 0.1,
+    "seed": 0,
+    "num_workers": 4,
+    "data_dir": "C:\\fisher\\foliated_sgd\\cifar_data",
+    "rebalance_every": 8,
+    "results_json": "C:\\fisher\\OneTrainer-clean\\modules\\util\\optimizer\\concord\\cifar_ablation_results\\D_no_gf_evap_seed0.json",
+    "max_steps": 60
+  },
+  "nan": false,
+  "best_deploy_acc": 0.1131,
+  "best_live_acc": 0.1,
+  "best_worst_class": 0.0,
+  "final_deploy_acc": 0.1131,
+  "history": [
+    {
+      "epoch": 0,
+      "lr": 0.014999991842215633,
+      "train_loss": 38.02950231631597,
+      "live_acc": 0.1,
+      "deploy_acc": 0.1131,
+      "deploy_loss": 2.301256358718872,
+      "deploy_worst_class": 0.0,
+      "deploy_per_class": [
+        0.0,
+        0.004999999888241291,
+        0.8949999809265137,
+        0.004000000189989805,
+        0.006000000052154064,
+        0.017999999225139618,
+        0.0,
+        0.0,
+        0.2029999941587448,
+        0.0
+      ],
+      "sec": 24.286945104599
+    }
+  ]
+}

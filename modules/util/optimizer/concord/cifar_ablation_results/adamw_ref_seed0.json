@@ -1,0 +1,46 @@
+{
+  "arm": "adamw_ref",
+  "args": {
+    "arm": "adamw_ref",
+    "optimizer": "adamw",
+    "coh_vhat": 1,
+    "coh_kappa": 1.0,
+    "lam": 0.025,
+    "ratio_coh": 0,
+    "disable_cohpre": 0,
+    "sigmag_peak": 0.0,
+    "longtail": 0.0,
+    "epochs": 80,
+    "lr": 0.05,
+    "adamw_lr": 0.001,
+    "warmup": 200,
+    "bias_correct": 1,
+    "lr_min_frac": 0.01,
+    "batch_size": 32,
+    "alpha": 0.1,
+    "seed": 0,
+    "num_workers": 4,
+    "data_dir": "C:\\fisher\\foliated_sgd\\cifar_data",
+    "rebalance_every": 8,
+    "results_json": "C:\\fisher\\OneTrainer-clean\\modules\\util\\optimizer\\concord\\cifar_ablation_results\\adamw_ref_seed0.json",
+    "max_steps": 60
+  },
+  "nan": false,
+  "best_deploy_acc": 0.1825,
+  "best_live_acc": 0.1825,
+  "best_worst_class": NaN,
+  "final_deploy_acc": 0.1825,
+  "history": [
+    {
+      "epoch": 0,
+      "lr": 0.00029999983684431266,
+      "train_loss": 2.2875487486521404,
+      "live_acc": 0.1825,
+      "deploy_acc": 0.1825,
+      "deploy_loss": 2.2262820026397705,
+      "deploy_worst_class": NaN,
+      "deploy_per_class": null,
+      "sec": 19.75898241996765
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "arm": "B_cf_on_k1",
+  "args": {
+    "arm": "B_cf_on_k1",
+    "optimizer": "concord",
+    "coh_vhat": 1,
+    "coh_kappa": 1.0,
+    "lam": 0.025,
+    "ratio_coh": 0,
+    "disable_cohpre": 0,
+    "sigmag_peak": 0.0,
+    "longtail": 0.0,
+    "epochs": 1,
+    "lr": 0.05,
+    "adamw_lr": 0.001,
+    "warmup": 200,
+    "bias_correct": 1,
+    "lr_min_frac": 0.01,
+    "batch_size": 32,
+    "alpha": 0.1,
+    "seed": 0,
+    "num_workers": 4,
+    "data_dir": "C:\\fisher\\foliated_sgd\\cifar_data",
+    "rebalance_every": 8,
+    "results_json": "cifar_ablation_results/diag_B_lr05.json",
+    "max_steps": 0,
+    "log_every": 250
+  },
+  "nan": false,
+  "best_deploy_acc": 0.1001,
+  "best_live_acc": 0.1001,
+  "best_worst_class": 0.0,
+  "final_deploy_acc": 0.1001,
+  "history": [
+    {
+      "epoch": 0,
+      "lr": 0.0005000499950320048,
+      "train_loss": 3.330664614562988,
+      "live_acc": 0.1001,
+      "deploy_acc": 0.1001,
+      "deploy_loss": 2.3026018241882324,
+      "deploy_worst_class": 0.0,
+      "deploy_per_class": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.9990000128746033,
+        0.0020000000949949026,
+        0.0
+      ],
+      "sec": 37.32733154296875
+    }
+  ]
+}

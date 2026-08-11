@@ -1,0 +1,53 @@
+
+>>> C:\fisher\OneTrainer-clean\venv\Scripts\python.exe C:\fisher\OneTrainer-clean\modules\util\optimizer\concord\train_cifar_cf.py --epochs 80 --seed 0 --results_json C:\fisher\OneTrainer-clean\modules\util\optimizer\concord\cifar_ablation_results\adamw_ref_seed0.json --max_steps 60 --arm adamw_ref --optimizer adamw
+[adamw_ref] opt=adamw coh_vhat=1 kappa=1.0 lam=0.025 gf_consol=0 ratio_coh=0 disable_cohpre=0 sigmag=0.0 longtail=0.0 epochs=80 lr=0.05 bs=32 seed=0 steps/epoch=1563 total_steps=125040
+[adamw_ref] ep0 lr=0.0500 tl=56.8482 live_acc=0.1000 deploy_acc=0.1000 (22.4s)
+[adamw_ref] DONE best_deploy=0.1000 best_live=0.1000 best_worst_cls=nan final_deploy=0.1000 nan=False
+[adamw_ref] wrote C:\fisher\OneTrainer-clean\modules\util\optimizer\concord\cifar_ablation_results\adamw_ref_seed0.json
+
+>>> C:\fisher\OneTrainer-clean\venv\Scripts\python.exe C:\fisher\OneTrainer-clean\modules\util\optimizer\concord\train_cifar_cf.py --epochs 80 --seed 0 --results_json C:\fisher\OneTrainer-clean\modules\util\optimizer\concord\cifar_ablation_results\A_cf_off_seed0.json --max_steps 60 --arm A_cf_off --optimizer concord --coh_vhat 0 --lam 0.025
+[A_cf_off] opt=concord coh_vhat=0 kappa=1.0 lam=0.025 gf_consol=0.5 ratio_coh=0 disable_cohpre=0 sigmag=0.0 longtail=0.0 epochs=80 lr=0.05 bs=32 seed=0 steps/epoch=1563 total_steps=125040
+[A_cf_off] ep0 lr=0.0500 tl=872091.8849 live_acc=0.1000 deploy_acc=0.1000 (32.7s)
+[A_cf_off] DONE best_deploy=0.1000 best_live=0.1000 best_worst_cls=0.0000 final_deploy=0.1000 nan=False
+[A_cf_off] wrote C:\fisher\OneTrainer-clean\modules\util\optimizer\concord\cifar_ablation_results\A_cf_off_seed0.json
+
+>>> C:\fisher\OneTrainer-clean\venv\Scripts\python.exe C:\fisher\OneTrainer-clean\modules\util\optimizer\concord\train_cifar_cf.py --epochs 80 --seed 0 --results_json C:\fisher\OneTrainer-clean\modules\util\optimizer\concord\cifar_ablation_results\B_cf_on_k1_seed0.json --max_steps 60 --arm B_cf_on_k1 --optimizer concord --coh_vhat 1 --coh_kappa 1.0 --lam 0.025
+[concord] coh cf-modulation ON (discount = kappa/(cf+kappa), cf=d_sv^2/v_hat, kappa=1): coherent-admission residual protected, noise still killed
+[B_cf_on_k1] opt=concord coh_vhat=1 kappa=1.0 lam=0.025 gf_consol=0.5 ratio_coh=0 disable_cohpre=0 sigmag=0.0 longtail=0.0 epochs=80 lr=0.05 bs=32 seed=0 steps/epoch=1563 total_steps=125040
+[B_cf_on_k1] ep0 lr=0.0500 tl=872091.8849 live_acc=0.1000 deploy_acc=0.1000 (28.8s)
+[B_cf_on_k1] DONE best_deploy=0.1000 best_live=0.1000 best_worst_cls=0.0000 final_deploy=0.1000 nan=False
+[B_cf_on_k1] wrote C:\fisher\OneTrainer-clean\modules\util\optimizer\concord\cifar_ablation_results\B_cf_on_k1_seed0.json
+
+>>> C:\fisher\OneTrainer-clean\venv\Scripts\python.exe C:\fisher\OneTrainer-clean\modules\util\optimizer\concord\train_cifar_cf.py --epochs 80 --seed 0 --results_json C:\fisher\OneTrainer-clean\modules\util\optimizer\concord\cifar_ablation_results\C_cf_k0p25_seed0.json --max_steps 60 --arm C_cf_k0p25 --optimizer concord --coh_vhat 1 --coh_kappa 0.25 --lam 0.025
+[concord] coh cf-modulation ON (discount = kappa/(cf+kappa), cf=d_sv^2/v_hat, kappa=1): coherent-admission residual protected, noise still killed
+[C_cf_k0p25] opt=concord coh_vhat=1 kappa=0.25 lam=0.025 gf_consol=0.5 ratio_coh=0 disable_cohpre=0 sigmag=0.0 longtail=0.0 epochs=80 lr=0.05 bs=32 seed=0 steps/epoch=1563 total_steps=125040
+[C_cf_k0p25] ep0 lr=0.0500 tl=871665.2182 live_acc=0.1000 deploy_acc=0.1000 (24.7s)
+[C_cf_k0p25] DONE best_deploy=0.1000 best_live=0.1000 best_worst_cls=0.0000 final_deploy=0.1000 nan=False
+[C_cf_k0p25] wrote C:\fisher\OneTrainer-clean\modules\util\optimizer\concord\cifar_ablation_results\C_cf_k0p25_seed0.json
+
+>>> C:\fisher\OneTrainer-clean\venv\Scripts\python.exe C:\fisher\OneTrainer-clean\modules\util\optimizer\concord\train_cifar_cf.py --epochs 80 --seed 0 --results_json C:\fisher\OneTrainer-clean\modules\util\optimizer\concord\cifar_ablation_results\C_cf_k4_seed0.json --max_steps 60 --arm C_cf_k4 --optimizer concord --coh_vhat 1 --coh_kappa 4.0 --lam 0.025
+[concord] coh cf-modulation ON (discount = kappa/(cf+kappa), cf=d_sv^2/v_hat, kappa=1): coherent-admission residual protected, noise still killed
+[C_cf_k4] opt=concord coh_vhat=1 kappa=4.0 lam=0.025 gf_consol=0.5 ratio_coh=0 disable_cohpre=0 sigmag=0.0 longtail=0.0 epochs=80 lr=0.05 bs=32 seed=0 steps/epoch=1563 total_steps=125040
+[C_cf_k4] ep0 lr=0.0500 tl=871665.2182 live_acc=0.1000 deploy_acc=0.1000 (24.3s)
+[C_cf_k4] DONE best_deploy=0.1000 best_live=0.1000 best_worst_cls=0.0000 final_deploy=0.1000 nan=False
+[C_cf_k4] wrote C:\fisher\OneTrainer-clean\modules\util\optimizer\concord\cifar_ablation_results\C_cf_k4_seed0.json
+
+>>> C:\fisher\OneTrainer-clean\venv\Scripts\python.exe C:\fisher\OneTrainer-clean\modules\util\optimizer\concord\train_cifar_cf.py --epochs 80 --seed 0 --results_json C:\fisher\OneTrainer-clean\modules\util\optimizer\concord\cifar_ablation_results\D_no_gf_evap_seed0.json --max_steps 60 --arm D_no_gf_evap --optimizer concord --coh_vhat 0 --lam 0.0
+[D_no_gf_evap] opt=concord coh_vhat=0 kappa=1.0 lam=0.0 gf_consol=0 ratio_coh=0 disable_cohpre=0 sigmag=0.0 longtail=0.0 epochs=80 lr=0.05 bs=32 seed=0 steps/epoch=1563 total_steps=125040
+[D_no_gf_evap] ep0 lr=0.0500 tl=871955.3516 live_acc=0.1000 deploy_acc=0.1000 (24.4s)
+[D_no_gf_evap] DONE best_deploy=0.1000 best_live=0.1000 best_worst_cls=0.0000 final_deploy=0.1000 nan=False
+[D_no_gf_evap] wrote C:\fisher\OneTrainer-clean\modules\util\optimizer\concord\cifar_ablation_results\D_no_gf_evap_seed0.json
+
+=== CIFAR cf-discount ablation (epochs=80 seeds=[0] sigmag=0.0 ratio_coh=0) ===
+arm                    deploy_acc          live_acc     worst_cls   nan
+adamw_ref          0.1000+-0.0000    0.1000+-0.0000             - False
+A_cf_off           0.1000+-0.0000    0.1000+-0.00000.0000+-0.0000 False
+B_cf_on_k1         0.1000+-0.0000    0.1000+-0.00000.0000+-0.0000 False
+C_cf_k0p25         0.1000+-0.0000    0.1000+-0.00000.0000+-0.0000 False
+C_cf_k4            0.1000+-0.0000    0.1000+-0.00000.0000+-0.0000 False
+D_no_gf_evap       0.1000+-0.0000    0.1000+-0.00000.0000+-0.0000 False
+
+cf-discount effect (paired per-seed, DEPLOY weight):
+  dense  B-A deploy_acc: +0.0000 +- 0.0000  (n=1 seeds)
+
+Note: dense CIFAR is a regression/stability check (expect B~=A). The long-tail arms (--longtail 0.01) are where a real cf benefit, if any, should appear.
